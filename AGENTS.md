@@ -618,3 +618,41 @@ drivers dominate, and they are exactly where auto-merge is unsafe:
    the bug, not just the repro?
 
 These map directly onto §7.2–7.3; a reviewer walks those bullets in order.
+
+---
+
+## 8. Upstream Sync Procedure
+
+**Reference**: [`UPSTREAM_SYNC.md`](UPSTREAM_SYNC.md) — Complete procedure for periodically syncing this fork with upstream (billion-context/billion-context) while preserving fork-specific features (English dashboard, metrics API, SQLite analytics, OpenCode V2 plugin).
+
+> **Lazy-loaded**: This document is NOT inline in AGENTS.md to avoid context bloat. Load `UPSTREAM_SYNC.md` only when performing upstream synchronization work.
+
+### Quick Summary
+
+| Branch | Purpose |
+|--------|---------|
+| `upstream-sync` | Integration branch: upstream/master + fork features |
+| `upstream-baseline` | Fork point (upstream v0.1.99) |
+| `fork-baseline` | Current fork state checkpoint |
+
+### Periodic Workflow (Monthly)
+
+```bash
+git fetch upstream
+git checkout upstream-sync
+git rebase upstream/master  # rerere auto-resolves repeated conflicts
+git checkout main
+# cherry-pick HIGH priority commits (stability, correctness, kernel bumps)
+git tag upstream-sync-$(date +%Y-%m-%d)
+```
+
+### Fork Features to Preserve (Never Drop)
+
+- English dashboard UI (`src/web/page.ts`, `src/web/client.ts`)
+- Metrics API: `/__bili/api/stats`, `/__bili/api/metrics` (`src/metrics.ts`, `src/web/api.ts`)
+- SQLite analytics (`src/analytics.ts`, `src/config-env.ts`)
+- Admin endpoint fix: API handlers before origin check (`src/server.ts`)
+- OpenCode V2 plugin (`src/agent/opencode.ts`, `src/agent/shared.ts`)
+- Docker support (`Dockerfile`, `.dockerignore`)
+
+See `UPSTREAM_SYNC.md` for full procedure, conflict resolution guide, cherry-pick log template, and verification checklist.
