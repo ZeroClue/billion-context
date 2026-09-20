@@ -68,7 +68,7 @@ import { applyRanges } from "./stream.js";
 import { buildSessionCacheReport } from "./cache-ledger.js";
 import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, type PreflightResult } from "./preflight.js";
 import { imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, type ResolvedImageBilling } from "./image-tokens.js";
-import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
+import { renderUI, handleConfigGet, handleConfigPut, handleDashboardStats, handlePrometheusMetrics } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./logger.js";
@@ -683,6 +683,9 @@ async function handle(
         res.end(JSON.stringify({ error: "management endpoints are not reachable through the bili tunnel" }));
         return;
     }
+    // Read-only stats/metrics endpoints — allow without origin check (curl-friendly)
+    if (req.method === "GET" && req.url?.startsWith("/__bili/api/stats")) return handleDashboardStats(req, res);
+    if (req.method === "GET" && req.url?.startsWith("/__bili/api/metrics")) return handlePrometheusMetrics(req, res);
     if (isAdminPath && !isLoopbackAddress(req.socket.remoteAddress)) {
         res.writeHead(403, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "management endpoints are loopback-only; access denied for " + (req.socket.remoteAddress ?? "unknown") }));

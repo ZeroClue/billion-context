@@ -17,6 +17,8 @@ import {
 } from "../config.js";
 import { log } from "../logger.js";
 import { validateHttpProxy } from "../upstream-proxy.js";
+import { collectMetrics } from "../metrics.js";
+import { isAnalyticsEnabled, getHourlyActivity as getAnalyticsHourly } from "../analytics.js";
 
 type ConfigShape = Record<string, unknown> & {
     providers?: Record<string, unknown>;
@@ -223,4 +225,97 @@ function readJsonBody(req: IncomingMessage): Promise<unknown> {
         });
         req.on("error", () => resolve(undefined));
     });
+}
+
+export async function handleDashboardStats(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    try {
+        const url = new URL(req.url || "/", "http://localhost");
+        const fresh = url.searchParams.get("fresh") === "1";
+        const metrics = await collectMetrics(fresh);
+        
+        // Add historical data if analytics enabled
+        let history: any[] = [];
+        if (isAnalyticsEnabled()) {
+            const since = Date.now() - 24 * 60 * 60 * 1000; // last 24 hours
+            history = getAnalyticsHourly(since);
+        }
+        
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+            ok: true,
+            ...metrics,
+            history,
+        }));
+    } catch (error) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: String(error) }));
+    }
+}
+
+export async function handlePrometheusMetrics(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    try {
+        const url = new URL(req.url || "/", "http://localhost");
+        const fresh = url.searchParams.get("fresh") === "1";
+        const metrics = await collectMetrics(fresh);
+        
+        const lines = [
+            `# HELP bili_sessions_total Total number of active sessions`,
+            `# TYPE bili_sessions_total gauge`,
+            `bili_sessions_total ${metrics.totalSessions}`,
+            ``,
+            `# HELP bili_requests_total Total requests processed`,
+            `# TYPE bili_requests_total counter`,
+            `bili_requests_total ${metrics.totalRequests}`,
+            ``,
+            `# HELP bili_tokens_input_total Total input tokens`,
+            `# TYPE bili_tokens_input_total counter`,
+            `bili_tokens_input_total ${metrics.totalInputTokens}`,
+            ``,
+            `# HELP bili_tokens_cached_total Total cached tokens`,
+            `# TYPE bili_tokens_cached_total counter`,
+            `bili_tokens_cached_total ${metrics.totalCachedTokens}`,
+            ``,
+            `# HELP bili_tokens_output_total Total output tokens`,
+            `# TYPE bili_tokens_output_total counter`,
+            `bili_tokens_output_total ${metrics.totalOutputTokens}`,
+            ``,
+            `# HELP bili_cache_hit_rate Overall cache hit rate`,
+            `# TYPE bili_cache_hit_rate gauge`,
+            `bili_cache_hit_rate ${metrics.overallCacheHitRate}`,
+            ``,
+            `# HELP bili_compression_ratio Overall compression ratio`,
+            `# TYPE bili_compression_ratio gauge`,
+            `bili_compression_ratio ${metrics.overallCompressionRatio}`,
+            ``,
+            `# HELP bili_tokens_saved_total Total tokens saved`,
+            `# TYPE bili_tokens_saved_total counter`,
+            `bili_tokens_saved_total ${metrics.tokensSaved}`,
+            ``,
+            `# HELP bili_cost_savings_usd_total Estimated cost savings in USD`,
+            `# TYPE bili_cost_savings_usd_total counter`,
+            `bili_cost_savings_usd_total ${metrics.estimatedCostSavingsUSD}`,
+            ``,
+            `# HELP bili_avg_latency_ms Average latency in milliseconds`,
+            `# TYPE bili_avg_latency_ms gauge`,
+            `bili_avg_latency_ms ${metrics.avgLatencyMs}`,
+        ];
+        
+        // Per-provider metrics
+        for (const p of metrics.byProvider) {
+            lines.push(``);
+            lines.push(`# HELP bili_provider_requests_total Requests per provider`);
+            lines.push(`# TYPE bili_provider_requests_total counter`);
+            lines.push(`bili_provider_requests_total{provider="${p.provider}"} ${p.requests}`);
+            lines.push(``);
+            lines.push(`# HELP bili_provider_cache_hit_rate Cache hit rate per provider`);
+            lines.push(`# TYPE bili_provider_cache_hit_rate gauge`);
+            lines.push(`bili_provider_cache_hit_rate{provider="${p.provider}"} ${p.cacheHitRate}`);
+        }
+        
+        res.writeHead(200, { "content-type": "text/plain; version=0.0.4" });
+        res.end(lines.join("\n"));
+    } catch (error) {
+        res.writeHead(500, { "content-type": "text/plain" });
+        res.end(`# Error: ${String(error)}\n`);
+    }
 }

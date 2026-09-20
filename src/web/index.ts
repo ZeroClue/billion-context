@@ -8,6 +8,8 @@ export {
     handleConfigPut,
     readProviders,
     readUpstreamSettings,
+    handleDashboardStats,
+    handlePrometheusMetrics,
 } from "./api.js";
 
 function version(): string {

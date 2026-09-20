@@ -15,6 +15,11 @@ const MANIFEST_TIMEOUT_MS = 5000;
 const TOOL_TIMEOUT_MS = 60000;
 const STATUS_TIMEOUT_MS = 5000;
 
+/** Construct the proxy dashboard URL from the proxy base URL. */
+export function getDashboardUrl(proxyBase: string): string {
+    return `${proxyBase}/__bili/`;
+}
+
 /** Detect the proxy from a provider baseUrl's `/bili/` zero-config prefix.
  *  The real prefix embeds the full upstream URL (`/bili/https://…`), so the
  *  check requires `bili` as the first path segment followed by an http(s)
