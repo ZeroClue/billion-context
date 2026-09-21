@@ -360,6 +360,17 @@
   - `toolName: string` — 重命名注入工具（默认 `"absorb"`）；模式、系统提示段与按会话裁决都跟随名称。
   注入跟随线上原生工具面：代理模式在 anthropic/openai/responses 原生工具线上注入工具 + 静态系统提示段，插件模式在插件清单中广告它（MCP shell 自动拾取）。Responses **marker/文本协议**路由不支持（无原生工具面 — 强制的 absorb 指令不可满足），标题生成请求（`max_tokens ≤ 200`）跳过注入如压缩提示一样。吸收配对在重启后保持隐藏（在会话状态持久化）。
 
+#### `store`
+
+- **类型：** `object`（`{ enabled?, minTokens?, maxStoreBytes? }`）
+- **默认值：** *（禁用 — 除非显式设置 `enabled: true`，该特性完全关闭）*
+- **状态：** ACTIVE（v1 — 仅代理模式、仅原生工具线）
+- **说明：** 可选开启的**内容寻址消息存储**/内置 CCR（issue #1097）。超大工具结果不再被强制蒸馏（如 `absorb`）或永远挂在线上：原文在到达时写入按会话的内容存储，线上保留一个确定性、字节稳定的占位符（`📦 [stored #m00423 · shell · 4213 tok] "头部预览" → acp_retrieve("m00423")`）。模型通过注入的 `acp_retrieve` 工具按需取回完整原文；retrieve 是临时的（走请求内工具结果通道，不进入折叠空间，不占用消息 ref）。默认无损：未执行的 retrieve 只花一次廉价工具调用；而被 absorb 蒸馏掉的细节则永久丢失。子字段（按字段最深层级胜出，与其他 CompressSettings 字段一致）：
+  - `enabled: boolean` — 主开关；任何值不为 `true` 时特性完全关闭（无占位符、无工具）。
+  - `minTokens: number` — 仅达到此 token 数的工具结果被 ID 引用（默认 `500`）；更小的结果保持原样。
+  - `maxStoreBytes: number` — 按会话的存储字节上限，按 ref 逻辑累加（默认 `2 MiB`）；超出上限的内容保持原样，而不是发出不可检索的占位符。
+  索引是纯元数据，随会话 JSON 与 `blockContents` 一同持久化；载荷存放在 `storeDir()`（环境变量 `BILI_STORE_DIR`，默认 `<stateDir>/store`）下的哈希键边车文件（`<sha256(sessionId)>/<sha1(text)>.txt`），按内容哈希去重，retrieve 时懒加载。设置 `BILI_ENCRYPTION_KEY` 时，边车文件使用与会话文件相同的静态加密编解码器。只有 `tool` 结果*内部的内容*缩小——与 assistant `tool_calls` 的配对不受影响。v1 范围门控：**仅代理模式**（插件 agent 需要在其插件清单中声明 `acp_retrieve`，否则占位符会造成静默丢失）；且**仅限原生工具线**：responses marker/文本协议路由与 `ACP_NO_INJECT_TOOL` 没有执行 retrieve 的通道，因此存储在这些场景下自动解除武装，而不是丢失内容。按会话统计（已存字节、当前线上节省字节、retrieve 率）在 `acp_status` 中展示；每次 retrieve 记录一条 `[store] retrieve …` 日志。
+
 #### `rules`
 
 - **类型：** `boolean`
