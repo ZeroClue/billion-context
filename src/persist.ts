@@ -104,6 +104,11 @@ interface PersistedSession {
         lastInputTokensSource?: string;
         overflowArmTokens?: number;
         contextTokens?: number;
+        retrieveCalls?: number;
+        retrieveHits?: number;
+        retrieveMisses?: number;
+        storedBytes?: number;
+        storeBytesSaved?: number;
     };
     /** Free-form escape hatch (v2+). */
     metadata?: Record<string, unknown>;
@@ -245,6 +250,13 @@ export class SessionStore {
             legacy: (parsed) => (isValidRecord(parsed) ? { id: parsed.id, payload: parsed, version: parsed.version, savedAt: parsed.savedAt } : null),
             validate: (envelope) => isValidRecord(envelope.payload),
         });
+    }
+
+    /** #1097: the active at-rest codec (undefined when BILI_ENCRYPTION_KEY is
+     *  unset), shared with the content-store sidecar files so they encrypt
+     *  identically to the session JSON. */
+    payloadCodec(): StateStoreCodec | undefined {
+        return this.codec;
     }
 
     /** Bulk-load every persisted session from disk into a map keyed by the
@@ -633,6 +645,11 @@ function buildSession(parsed: PersistedSession): Session {
             // In-memory only — a fresh process has no pending compress fold.
             compressCreditTokens: 0,
             contextTokens: Math.max(0, stats.contextTokens ?? parsed.contextTokens ?? 0),
+            retrieveCalls: stats.retrieveCalls ?? 0,
+            retrieveHits: stats.retrieveHits ?? 0,
+            retrieveMisses: stats.retrieveMisses ?? 0,
+            storedBytes: stats.storedBytes ?? 0,
+            storeBytesSaved: stats.storeBytesSaved ?? 0,
         },
         metadata: parsed.metadata ?? {},
         state: mergeState(parsed.state),
@@ -791,6 +808,12 @@ export function getStore(): SessionStore {
         _store = new SessionStore({ enabled: persistEnabled(), log: defaultLogger });
     }
     return _store;
+}
+
+/** #1097: active at-rest codec for content-store sidecar files (plaintext when
+ *  BILI_ENCRYPTION_KEY is unset) — mirrors the session-JSON encryption. */
+export function storePayloadCodec(): StateStoreCodec | undefined {
+    return getStore().payloadCodec();
 }
 
 /** Test hook: inject a store with a temp dir. */
