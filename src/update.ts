@@ -47,8 +47,17 @@ export function registryUrlFor(packageName: string, tag: string): string {
     return `${REGISTRY_BASE}/${packageName}/${encodeURIComponent(tag)}`;
 }
 const CHECK_INTERVAL_MS = 3 * 60 * 1000;
-const THROTTLE_FILE = path.join(cacheDir(), ".update-check");
-const LOCK_FILE = path.join(cacheDir(), ".update-lock");
+
+// Resolved per call (not at module load) so XDG_CACHE_HOME overrides are
+// honored in tests, and each update lane owns its own throttle record: a
+// dsh-profile-bundle proxy must not be starved behind the global lane's
+// shared file (fixed 3-min phases never re-align, #1196).
+function throttleFile(lane: "global" | "dsh-profile"): string {
+    return path.join(cacheDir(), lane === "dsh-profile" ? ".update-check-dsh-profile" : ".update-check");
+}
+function lockFile(): string {
+    return path.join(cacheDir(), ".update-lock");
+}
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z-.]+)?$/;
 
 /** Age after which a lock is stealable even if kill(pid,0) says the holder is
@@ -153,22 +162,30 @@ export function reportNotNewer(
     return true;
 }
 
-async function readLastCheck(): Promise<number> {
+async function readLastCheck(file: string): Promise<number> {
     try {
-        const data = await readFile(THROTTLE_FILE, "utf-8");
+        const data = await readFile(file, "utf-8");
         return parseInt(data.trim(), 10) || 0;
     } catch {
         return 0;
     }
 }
 
-async function writeLastCheck(ts: number): Promise<void> {
+async function writeLastCheck(file: string, ts: number): Promise<void> {
     try {
-        await mkdir(path.dirname(THROTTLE_FILE), { recursive: true });
-        await writeFile(THROTTLE_FILE, String(ts), "utf-8");
+        await mkdir(path.dirname(file), { recursive: true });
+        await writeFile(file, String(ts), "utf-8");
     } catch {
         // best-effort
     }
+}
+
+let findStartDirOverride: string | undefined;
+
+/** Test seam: redirect findInstallDir's upward walk so checkForUpdate can run
+ *  against a fixture tree instead of this module's real location. */
+export function _setFindInstallDirStartForTest(dir: string | undefined): void {
+    findStartDirOverride = dir;
 }
 
 /**
@@ -177,7 +194,7 @@ async function writeLastCheck(ts: number): Promise<void> {
  * Exported for the pre-re-exec gate (#811).
  */
 export async function findInstallDir(packageName: string): Promise<string | undefined> {
-    let dir = path.dirname(fileURLToPath(import.meta.url));
+    let dir = findStartDirOverride ?? path.dirname(fileURLToPath(import.meta.url));
     for (;;) {
         try {
             const pkg = JSON.parse(await readFile(path.join(dir, "package.json"), "utf-8"));
@@ -232,7 +249,7 @@ export function hostManagedInstall(installDir: string, env: NodeJS.ProcessEnv = 
         if (dir.split(path.sep).some((seg) => seg === ".pnpm")) {
             return {
                 owner: "pnpm",
-                channel: "dsh profiles refresh automatically on the next global bili self-update; a pnpm-global install upgrades via `pnpm add -g billion-context@latest`",
+                channel: "dsh profiles refresh automatically through the dsh plugin channel (their own proxy or a global bili self-update drives it); a pnpm-global install upgrades via `pnpm add -g billion-context@latest`",
             };
         }
     }
@@ -240,7 +257,7 @@ export function hostManagedInstall(installDir: string, env: NodeJS.ProcessEnv = 
     const homes: Array<[string, string, string]> = [
         ["pi", resolvePiHome(env), "`pi update` (pi installs and upgrades the npm:billion-context entry itself)"],
         ["opencode", path.join(xdgData, "opencode"), "opencode's own plugin manager (reload/reinstall the billion-context plugin)"],
-        ["dsh", resolveDshHome(env), "the dsh plugin channel (global bili self-update refreshes profiles; or `dsh plugin add billion-context@latest`)"],
+        ["dsh", resolveDshHome(env), "the dsh plugin channel (each profile's own proxy or a global bili self-update refreshes it; or `dsh plugin add billion-context@latest`)"],
         ["kimi", resolveKimiHome(env), "`bili plugin install kimi` after updating the global bili install"],
         ["omp", resolveOmpHome(env), "the global bili install (the extensions entry points at it)"],
     ];
@@ -251,6 +268,30 @@ export function hostManagedInstall(installDir: string, env: NodeJS.ProcessEnv = 
                 return { owner, channel };
             }
         }
+    }
+    return undefined;
+}
+
+/** #1196: when this install dir IS a dsh profile bundle ($DSH_HOME/profiles/
+ *  <name>/…) — the copy whose own proxy may drive the owner's channel
+ *  (refreshDshProfileBundles) instead of dead-ending on the #991 skip —
+ *  return <name>. undefined for every other layout (pnpm-global store, other
+ *  host homes, bili-owned installs). Exported for tests. */
+export function dshProfileBundleOf(installDir: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+    const home = resolveDshHome(env);
+    if (!home) return undefined;
+    const profilesRoot = path.join(home, "profiles");
+    let real = installDir;
+    try {
+        real = realpathSync(installDir);
+    } catch {
+        // nonexistent or unreadable — evaluate the literal path
+    }
+    for (const dir of [installDir, real]) {
+        const rel = path.relative(profilesRoot, dir);
+        if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) continue;
+        const name = rel.split(path.sep)[0];
+        if (name && name !== "node_modules") return name;
     }
     return undefined;
 }
@@ -368,7 +409,7 @@ async function tryAcquireLock(): Promise<{ release: () => Promise<void> } | null
 
     async function readLock(): Promise<{ pid: number; ts: number } | null> {
         try {
-            const raw = await readFile(LOCK_FILE, "utf-8");
+            const raw = await readFile(lockFile(), "utf-8");
             const data = JSON.parse(raw);
             if (typeof data.pid === "number" && typeof data.ts === "number") {
                 return data;
@@ -408,7 +449,7 @@ async function tryAcquireLock(): Promise<{ release: () => Promise<void> } | null
         // crash during update permanently blocks all future auto-updates.
         loggerLog("info", `[update] stealing lock from pid=${existing.pid} (alive=${holderAlive}, age=${Math.round((now - existing.ts) / 1000)}s)`);
         try {
-            await unlink(LOCK_FILE);
+            await unlink(lockFile());
         } catch (e) {
             const code = (e as NodeJS.ErrnoException).code;
             // ENOENT is fine (someone else already cleaned it). Anything else
@@ -421,9 +462,12 @@ async function tryAcquireLock(): Promise<{ release: () => Promise<void> } | null
         }
     }
 
-    // Write our lock. Use flag "wx" to fail if file already exists.
+    // Write our lock. Use flag "wx" to fail if file already exists. Ensure
+    // the parent dir exists: direct callers may skip the throttle write that
+    // normally creates it, and ENOENT here would be misread as a lost race.
     try {
-        await writeFile(LOCK_FILE, JSON.stringify({ pid, ts: now }), { flag: "wx" });
+        await mkdir(path.dirname(lockFile()), { recursive: true });
+        await writeFile(lockFile(), JSON.stringify({ pid, ts: now }), { flag: "wx" });
     } catch {
         // Lost the race — another process created the lock file first.
         const winner = await readLock();
@@ -444,7 +488,7 @@ async function tryAcquireLock(): Promise<{ release: () => Promise<void> } | null
         release: async () => {
             const current = await readLock();
             if (current?.pid === pid) {
-                await rm(LOCK_FILE, { force: true }).catch(() => {});
+                await rm(lockFile(), { force: true }).catch(() => {});
             }
         },
     };
@@ -522,21 +566,81 @@ export async function fetchRegistryVersion(opts: Pick<UpdateOptions, "resolvePro
     return data.version;
 }
 
+/** #1196: update lane for a running copy that IS a dsh profile bundle. The
+ *  #991 skip stands (bili never overwrites the copy in place) — instead the
+ *  owner's own channel is driven: fetch the configured dist-tag version,
+ *  compare it against this profile's on-disk version, and when newer run
+ *  refreshDshProfileBundles under the shared cross-process update lock so all
+ *  registry-pinned profiles move to the same version. Best-effort by
+ *  contract: any failure logs and retries next cycle; local pins are left
+ *  alone by refreshDshProfileBundles itself. Exported for tests. */
+export async function checkDshProfileBundleUpdate(opts: UpdateOptions, installDir: string): Promise<void> {
+    const tag = normalizeUpdateTag(opts.updateTag);
+    // fetchRegistryVersion handles HTTP errors but propagates fetch
+    // rejections (network down) — this lane must stay best-effort.
+    let latest: string | undefined;
+    try {
+        latest = await fetchRegistryVersion(opts, opts.packageName);
+    } catch {
+        latest = undefined;
+    }
+    if (!latest) {
+        loggerLog("warn", "[update] registry lookup failed for the dsh profile bundle \u2014 will retry next cycle");
+        return;
+    }
+    const diskVersion = await readDiskVersion(installDir);
+    if (reportNotNewer(latest, tag, diskVersion, opts.currentVersion, loggerLog)) {
+        if (diskVersion && staleInstallStatus(diskVersion, opts.currentVersion) === "restart") {
+            notifyStaleInstall(opts, diskVersion);
+        }
+        return;
+    }
+    loggerLog("info", `[update] dsh profile bundle outdated: ${diskVersion ?? opts.currentVersion} \u2192 ${latest}, refreshing via the dsh plugin channel\u2026`);
+    const lock = await tryAcquireLock();
+    if (!lock) {
+        loggerLog("info", "[update] another process is updating, will check next cycle");
+        return;
+    }
+    try {
+        // Re-read under the lock: a sibling profile's proxy may have refreshed
+        // between our registry fetch and the lock handoff.
+        const fresh = await readDiskVersion(installDir);
+        if (fresh !== undefined && !isVersionNewer(latest, fresh)) {
+            loggerLog("info", `[update] dsh profile bundles already at ${fresh} \u2014 nothing to do`);
+            return;
+        }
+        await refreshDshProfileBundles(latest, loggerLog);
+        notifyStaleInstall(opts, latest);
+    } finally {
+        await lock.release();
+    }
+}
+
 /** Run a single check (throttled unless `force`). Safe to call frequently. */
 export async function checkForUpdate(opts: UpdateOptions, force = false): Promise<void> {
     if (!opts.autoUpdate && !force) return;
     if (inFlight) return;
     inFlight = true;
     try {
+        const installDir = await findInstallDir(opts.packageName);
+
+        // #1196: a running copy that IS a dsh profile bundle takes its own
+        // lane (owner-channel refresh), throttled on its OWN file — against
+        // the shared record another always-on lane could starve it forever
+        // (fixed 3-min phases never re-align). Lane detection must precede
+        // the throttle, which is why findInstallDir moved up here.
+        const profile = installDir ? dshProfileBundleOf(installDir) : undefined;
+        const lane: "global" | "dsh-profile" = profile !== undefined ? "dsh-profile" : "global";
+
         const now = Date.now();
-        const lastCheck = await readLastCheck();
+        const lastCheck = await readLastCheck(throttleFile(lane));
         const sinceLastSec = lastCheck ? ((now - lastCheck) / 1000 | 0) : -1;
         if (!force && firstCheckDone && now - lastCheck < CHECK_INTERVAL_MS) {
             const retryIn = ((CHECK_INTERVAL_MS - (now - lastCheck)) / 1000 | 0);
             loggerLog("info", `[update] throttled \u2014 last checked ${sinceLastSec}s ago, retry in ${retryIn}s`);
             return;
         }
-        await writeLastCheck(now);
+        await writeLastCheck(throttleFile(lane), now);
         firstCheckDone = true;
 
         // Source-checkout guard (#580): findInstallDir() walks up from the
@@ -544,7 +648,6 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         // clone (node dist/index.js start). An in-place tarball copy would
         // silently rewrite tracked files (the version pin, READMEs), so refuse
         // to self-update here instead of proceeding.
-        const installDir = await findInstallDir(opts.packageName);
         if (installDir && await isGitWorkingTree(installDir)) {
             loggerLog("info", `[update] running from a source checkout (${installDir}) \u2014 skipping auto-update (use npm install -g ${opts.packageName})`);
             return;
@@ -555,7 +658,14 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         // updated through its owner — never overwritten in place by the
         // global self-updater.
         const managed = installDir ? hostManagedInstall(installDir) : undefined;
-        if (managed) {
+        if (managed && installDir) {
+            // #1196: a dsh profile bundle is host-managed, but its owner's
+            // channel is drivable from here — refresh through dsh instead of
+            // dead-ending on the bare skip.
+            if (profile !== undefined) {
+                await checkDshProfileBundleUpdate(opts, installDir);
+                return;
+            }
             loggerLog("info", `[update] install dir is managed by ${managed.owner} (${installDir}) \u2014 skipping in-place self-update; update it via ${managed.channel} (#991)`);
             return;
         }

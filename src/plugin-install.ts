@@ -1738,7 +1738,7 @@ const UPDATE_CHANNEL: Record<PluginAgent, string> = {
     claude: "the global bili install (hook/MCP point at it)",
     codex: "the global bili install (the mcp launcher shells out to it)",
     opencode: "opencode's own plugin manager (opencode owns the copy)",
-    dsh: "the global bili self-update (profile bundles track it)",
+    dsh: "the dsh plugin channel (profile bundles track it — driven by their own proxy or a global bili self-update)",
     kimi: "the global bili install (plugin points at its dist)",
     hermes: "the global bili install (sidecar points at its dist); `bili plugin update hermes` re-copies the plugin",
     zcode: "the global bili install (hook/MCP point at its dist)",
