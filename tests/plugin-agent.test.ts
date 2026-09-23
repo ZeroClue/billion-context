@@ -215,6 +215,8 @@ async function flush(): Promise<void> {
     await new Promise((r) => setTimeout(r, 20));
 }
 
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
 // Windows CI runners can take seconds on a cold loopback connect, so a fixed
 // 20ms flush races the manifest fetch. Poll for registration instead.
 async function waitForTools(pi: FakePi, count: number, timeoutMs = 15000): Promise<void> {
@@ -338,7 +340,8 @@ test("pi extension registers manifest tools and stamps headers when proxied", as
         biliPlugin(pi as never);
         // The header is only stamped once tools are registered, so register
         // first (a real session does this via session_start before the first
-        // provider request; a one-shot -p run races it and rides wire mode).
+        // provider request; launcher-mode -p wins that race via the load-time
+        // manifest prime — #1217, covered by the dedicated test below).
         await pi.events.get("session_start")!({}, fakeCtx(proxy));
         await waitForTools(pi, 2);
         const headers: Record<string, string> = {};
@@ -398,6 +401,149 @@ test("before_provider_headers stamps after a session_start prewarm too", async (
         assert.equal(late["x-bili-plugin-conversation"], "sess-42");
     } finally {
         await proxy.close();
+    }
+});
+
+test("#1217: launcher-mode manifest fetch is primed at extension load time", async () => {
+    // Correctness of the -p first-request stamp under ANY latency is #1228's
+    // awaited ownership claim; this prime is the latency half: the manifest
+    // fetch must be IN FLIGHT before any event fires (load time, not
+    // session_start), so that awaited claim resolves without waiting on the
+    // network RTT. omp has no header hook at all — for it the prime is the
+    // only way round 1 can carry plugin headers. Assert on observed request
+    // arrival, not wall-clock margins.
+    const manifest = JSON.stringify({ tools: { anthropic: [
+        { name: "compress", description: "c", input_schema: { type: "object", properties: {} } },
+        { name: "acp_status", description: "s", input_schema: { type: "object", properties: {} } },
+    ] } });
+    let manifestHits = 0;
+    const server = http.createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") {
+            manifestHits++;
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(manifest);
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+        const ctx = { sessionManager: { getSessionId: () => "sess-42" }, model: { contextWindow: 1000000, baseUrl: "https://api.example.com/v1" } };
+        await withEnv({ BILLION_CONTEXT_PROXY: origin }, async () => {
+            const pi = makeFakePi();
+            createBiliPlugin("pi")(pi as never);
+            const deadline = Date.now() + 5000;
+            while (manifestHits === 0 && Date.now() < deadline) await sleep(5);
+            assert.ok(manifestHits >= 1, "manifest fetch must already be in flight before any event (load-time prime)");
+            await pi.events.get("session_start")!({}, ctx);
+            await waitForTools(pi, 2);
+            const headers: Record<string, string> = {};
+            await pi.events.get("before_provider_headers")!({ headers }, ctx);
+            assert.equal(headers["x-bili-plugin"], "pi");
+            assert.equal(headers["x-bili-plugin-conversation"], "sess-42");
+            assert.equal(pi.tools.length, 2);
+        });
+    } finally {
+        server.close();
+    }
+});
+
+test("#1217: a failed manifest prime falls back to the event-time fetch and retry throttle", async () => {
+    // A failed prime must degrade to the EXISTING event-time path: one
+    // fallback fetch, then retry-throttled. With #1228's awaited claim, round
+    // 1 rides wire mode while throttled, and the next awaited event performs
+    // the recovery fetch and stamps in the same call. The first two requests
+    // always fail and later ones succeed, so settlement is detected by
+    // observed request arrival — never by wall-clock margins.
+    let manifestRequests = 0;
+    const server = http.createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") {
+            manifestRequests++;
+            if (manifestRequests > 2) {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ tools: { anthropic: [
+                    { name: "compress", description: "c", input_schema: { type: "object", properties: {} } },
+                    { name: "acp_status", description: "s", input_schema: { type: "object", properties: {} } },
+                ] } }));
+                return;
+            }
+            res.writeHead(404);
+            res.end("{}");
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+        const ctx = { sessionManager: { getSessionId: () => "sess-42" }, model: { contextWindow: 1000000, baseUrl: "https://api.example.com/v1" } };
+        await withEnv({ BILLION_CONTEXT_PROXY: origin }, async () => {
+            const pi = makeFakePi();
+            createBiliPlugin("pi", { retryIntervalMs: 500 })(pi as never);
+            // Request #1 = the failed load-time prime; request #2 = the
+            // event-time fallback fetch kicked off by session_start. Wait
+            // until BOTH are observed at the still-failing server, then drain.
+            await pi.events.get("session_start")!({}, ctx);
+            const settleDeadline = Date.now() + 5000;
+            while (manifestRequests < 2 && Date.now() < settleDeadline) await sleep(5);
+            assert.ok(manifestRequests >= 2, "failed prime must fall through to the event-time fetch");
+            await flush();
+            assert.equal(pi.tools.length, 0, "two failed fetches → no tools yet");
+            // Round 1 while throttled: the awaited claim finds retryAt armed →
+            // NO third request, NO stamp — graceful wire-mode degradation.
+            const round1: Record<string, string> = {};
+            await pi.events.get("before_provider_headers")!({ headers: round1 }, ctx);
+            assert.deepEqual(round1, {}, "throttled round 1 rides wire mode");
+            assert.equal(manifestRequests, 2, "throttle window makes no extra fetches");
+            // Recovery: once the throttle expires, the next awaited event does
+            // exactly one recovery fetch and stamps in the same call.
+            let stamped: Record<string, string> | undefined;
+            const recoverDeadline = Date.now() + 5000;
+            while (!stamped && Date.now() < recoverDeadline) {
+                const h: Record<string, string> = {};
+                await pi.events.get("before_provider_headers")!({ headers: h }, ctx);
+                if (h["x-bili-plugin"] === "pi") stamped = h;
+                else await sleep(10);
+            }
+            assert.ok(stamped !== undefined, "recovery fetch succeeds once the throttle expires");
+            assert.equal(stamped["x-bili-plugin-conversation"], "sess-42");
+            assert.equal(pi.tools.length, 2);
+            assert.equal(manifestRequests, 3, "recovery is a single fetch, not a storm");
+        });
+    } finally {
+        server.close();
+    }
+});
+
+test("#1217: kill switch suppresses the load-time manifest prime", async () => {
+    let manifestHits = 0;
+    const server = http.createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") {
+            manifestHits++;
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ tools: { anthropic: [] } }));
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: origin, BILLION_CONTEXT_PLUGIN: "0" }, async () => {
+            const pi = makeFakePi();
+            createBiliPlugin("pi")(pi as never);
+            await sleep(50);
+            assert.equal(manifestHits, 0, "BILLION_CONTEXT_PLUGIN=0 must keep the plugin fully inert at load time");
+        });
+    } finally {
+        server.close();
     }
 });
 
