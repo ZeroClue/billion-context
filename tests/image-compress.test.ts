@@ -357,7 +357,6 @@ test("resetSessionCompression clears image state and caches", async () => {
     resetSessionCompression(s);
     assert.equal(s.state.imageShrinks?.length ?? 0, 0);
     assert.equal(s.state.imageFullRestored?.length ?? 0, 0);
-    assert.equal(s.imageOriginals?.size ?? 0, 0);
     assert.equal(s.imageEncodeCache?.size ?? 0, 0);
     assert.equal(s.imageFingerprintsByRef?.size ?? 0, 0);
 });

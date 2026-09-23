@@ -197,12 +197,6 @@ export type Session = {
      *  executeRetrieve, drained into the next re-request after the tool-result
      *  pair (request-only, same channel as nudges). */
     pendingRetrievals: CoreMessage[];
-    /** #1095 in-memory only (NOT persisted): original image payloads captured
-     *  at downscale time, keyed by message ref (mNNNNN) → per-slot originals.
-     *  image_full restore re-emits from here. Bounded (see image-compress.ts);
-     *  cleared on resetSessionCompression (refs are re-issued there, so stale
-     *  entries would misattribute). */
-    imageOriginals?: Map<string, Array<{ mediaType: string; b64: string }>>;
     /** #1095 in-memory only (NOT persisted): deterministic encode cache keyed
      *  by sha256 of the ORIGINAL base64 → encoded payload. Identical inputs
      *  must yield identical wire bytes across turns/restarts (prefix-cache
@@ -212,9 +206,6 @@ export type Session = {
      *  original payloads shrunk per ref — lets image_full invalidate the exact
      *  encode-cache entries a restored ref contributed. */
     imageFingerprintsByRef?: Map<string, string[]>;
-    /** #1095 in-memory only: running total of bytes held in imageOriginals
-     *  (eviction accounting, not part of any persisted record). */
-    imageOriginalCacheBytes?: number;
     /** Number of in-flight requests using this session. A session with
      *  inFlight > 0 must NOT be LRU-evicted: evicting it mid-stream flushes a
      *  half-mutated snapshot and then a miss reloads a SECOND Session object,
@@ -507,12 +498,10 @@ export function resetSessionCompression(session: Session): void {
     session.contentStore = undefined;
     session.contentStoreDirty = true;
     session.pendingRetrievals.length = 0;
-    // #1095: same ref-reissue rationale as the content store — original-image
-    // cache entries keyed by old refs would misattribute after rebase.
-    session.imageOriginals?.clear();
+    // #1095: same ref-reissue rationale as the content store — encode-cache /
+    // fingerprint entries keyed by old refs would misattribute after rebase.
     session.imageEncodeCache?.clear();
     session.imageFingerprintsByRef?.clear();
-    session.imageOriginalCacheBytes = 0;
     session.stats.lastInputTokens = 0;
     // #857: a zeroed baseline carries no provenance — drop any stale flag.
     delete session.stats.lastInputTokensSource;

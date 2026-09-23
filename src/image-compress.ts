@@ -253,24 +253,7 @@ function syncMirrors(m: BiliMessage, oldB64: string, newB64: string, newMediaTyp
     }
 }
 
-// In-memory original cache backing the image_full restore channel. Bounded:
-// evict oldest refs once the total decoded-byte estimate crosses the cap.
-const MAX_ORIGINAL_CACHE_BYTES = 64 * 1024 * 1024;
 const MAX_ENCODE_CACHE_ENTRIES = 256;
-
-function captureOriginals(session: Session, ref: string, slots: Array<{ mediaType: string; b64: string }>): void {
-    if (!session.imageOriginals) session.imageOriginals = new Map();
-    if (session.imageOriginals.has(ref)) return;
-    session.imageOriginals.set(ref, slots.map((s) => ({ ...s })));
-    session.imageOriginalCacheBytes = (session.imageOriginalCacheBytes ?? 0) + slots.reduce((acc, s) => acc + Math.ceil(s.b64.length * 3 / 4), 0);
-    while ((session.imageOriginalCacheBytes ?? 0) > MAX_ORIGINAL_CACHE_BYTES && session.imageOriginals.size > 0) {
-        const oldest = session.imageOriginals.keys().next().value as string | undefined;
-        if (oldest === undefined) break;
-        const entry = session.imageOriginals.get(oldest);
-        session.imageOriginals.delete(oldest);
-        session.imageOriginalCacheBytes = Math.max(0, (session.imageOriginalCacheBytes ?? 0) - (entry?.reduce((acc, s) => acc + Math.ceil(s.b64.length * 3 / 4), 0) ?? 0));
-    }
-}
 
 function noteFingerprintByRef(session: Session, ref: string, fp: string): void {
     if (!session.imageFingerprintsByRef) session.imageFingerprintsByRef = new Map();
@@ -313,7 +296,6 @@ export async function applyImageCompressionPass(session: Session, messages: Bili
         // Captured pre-loop so records created mid-loop never block siblings.
         const hadRecord = imageShrinksForRef(session.state, ref).length > 0;
         const knownOriginalFps = [...(session.imageFingerprintsByRef?.get(ref) ?? [])];
-        const origSnapshot = slots.map((s) => ({ mediaType: s.mediaType, b64: s.b64 }));
         for (const slot of slots) {
             try {
                 const fp = fingerprint(slot.b64);
@@ -350,7 +332,6 @@ export async function applyImageCompressionPass(session: Session, messages: Bili
                 const origMediaType = slot.mediaType;
                 slot.replace(shrunk.b64, shrunk.mediaType);
                 syncMirrors(m, origB64, shrunk.b64, shrunk.mediaType);
-                captureOriginals(session, ref, origSnapshot);
                 noteFingerprintByRef(session, ref, fp);
                 if (imageShrinksForRef(session.state, ref).length === 0) {
                     const dimBefore = parseImageDimensionsFromBase64(origB64);
