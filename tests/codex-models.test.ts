@@ -56,7 +56,7 @@ test("isCodexClient: UA prefixes codex_cli_rs/ and codex_exec/", () => {
     assert.equal(isCodexClient({}), false);
     assert.equal(isCodexClient({ "user-agent": [CODEX_UA, "node-fetch/3.1"] }), true, "array headers (first entry)");
     assert.equal(isCodexClient({ "user-agent": ["node-fetch/3.1", CODEX_UA] }), false, "array headers use first entry");
-    assert.equal(isCodexClient({ "user-agent": "Codex_CLI_RS/0.53.0" }), false, "case-sensitive");
+    assert.equal(isCodexClient({ "user-agent": "Codex_CLI_RS/0.53.0" }), true, "case-insensitive (#1169)");
 });
 
 test("codexAlignedWindow: min() semantics per acceptance (in-table / not-in-table / user override)", () => {

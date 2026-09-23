@@ -5,7 +5,7 @@ import type { Session } from "./session.js";
 export const CODEX_COMPACT_ID_PREFIX = "fc_bili_";
 export const CODEX_COMPACT_SENTINEL = "bili:acp:";
 
-const CODEX_UA_PREFIXES = ["codex_cli_rs/", "codex_exec/"];
+const CODEX_UA_PREFIXES = ["codex_cli_rs/", "codex_exec/", "codex desktop/"];
 
 export type CodexCompactMode = "intercept" | "pass";
 
@@ -19,15 +19,20 @@ export function codexCompactMode(): CodexCompactMode {
 // The `originator` header is only sent for non-default thread originators, so
 // the UA (DEFAULT_ORIGINATOR in codex's default_client.rs) is the reliable
 // client signal. Codex ships multiple clients with different UA prefixes
-// (codex_cli_rs/, codex_exec/, codex_sdk_ts/, ...), so in addition to the known
-// prefixes match "codex" anywhere in the UA (case-sensitive) — a new client
-// variant must not silently fall out of detection (#645).
+// (codex_cli_rs/, codex_exec/, codex desktop/, ...); known prefixes match
+// case-insensitively because variants like Codex Desktop send an initial
+// capital ("Codex Desktop/x.y.z", #1169). In addition, a lenient fallback
+// matches lowercase "codex" anywhere in the UA for unknown variants (#645).
+// The fallback stays CASE-SENSITIVE on purpose: a case-insensitive substring
+// would pull non-codex relays with "Codex"-shaped UAs into codex treatment and
+// re-fork them mid-conversation (#1106). A new client variant must not silently
+// fall out of detection (#645) — register its prefix above.
 export function isCodexClient(headers: Record<string, string | string[] | undefined>): boolean {
     const ua = headers["user-agent"];
     if (!ua) return false;
     const s = Array.isArray(ua) ? ua[0] : ua;
     if (typeof s !== "string") return false;
-    if (CODEX_UA_PREFIXES.some((p) => s.startsWith(p))) return true;
+    if (CODEX_UA_PREFIXES.some((p) => s.toLowerCase().startsWith(p))) return true;
     return s.includes("codex");
 }
 

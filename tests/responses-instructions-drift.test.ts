@@ -39,8 +39,9 @@ test("instructionsFingerprintApplies: everyone else keys verbatim (#1106)", () =
     assert.equal(instructionsFingerprintApplies({ "x-grok-session-id": "gr-1" }), false);
     assert.equal(instructionsFingerprintApplies({ "x-mavis-session-id": "mc-1" }), false);
     assert.equal(instructionsFingerprintApplies({ "user-agent": "CherryStudio/1.0", "x-session-id": "cs-1" }), false);
-    // codex UA detection stays case-sensitive (isCodexClient convention, #645)
+    // the lenient codex substring fallback stays case-sensitive (#645/#1106),
     // so relays with "Codex"-shaped UAs are not pulled back into the fingerprint
+    // (only known codex prefixes match case-insensitively, #1169)
     assert.equal(instructionsFingerprintApplies({ "user-agent": "CodeXchange/1.0", "x-session-id": "cx-1" }), false);
     assert.equal(instructionsFingerprintApplies({}), false);
 });
