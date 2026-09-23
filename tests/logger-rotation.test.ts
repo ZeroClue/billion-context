@@ -10,14 +10,17 @@ import {
     setLogCapture,
 } from "../src/logger.ts";
 
-/** Poll until the file's size is stable across a few checks (stream flushed). */
+/** Poll until the file exists with a stable non-zero size (open completed,
+ *  line flushed). #1208: a missing file reads like the initial sentinel, so
+ *  without the size>0 gate this returned after ~60ms while the stream open was
+ *  still in flight — the clobber/reopen assertions below then raced it. */
 async function settle(file: string, timeoutMs = 3000): Promise<void> {
     const start = Date.now();
     let last = -1;
     let stable = 0;
     while (Date.now() - start < timeoutMs) {
         const size = fs.existsSync(file) ? fs.statSync(file).size : -1;
-        if (size === last) {
+        if (size > 0 && size === last) {
             stable++;
             if (stable >= 3) return;
         } else {
@@ -26,6 +29,7 @@ async function settle(file: string, timeoutMs = 3000): Promise<void> {
         }
         await new Promise((r) => setTimeout(r, 20));
     }
+    throw new Error(`settle timed out: ${file} never reached a stable non-zero size within ${timeoutMs}ms`);
 }
 
 test("external rename: subsequent lines land in the new file, .old frozen", async () => {
