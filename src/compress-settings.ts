@@ -1,4 +1,4 @@
-import { DEFAULT_ABSORB_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type AbsorbConfig, type Config, type PackSurface, type Prompts } from "acp-kernel";
+import { DEFAULT_ABSORB_CONFIG, DEFAULT_CRUSH_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type AbsorbConfig, type Config, type CrushConfig, type PackSurface, type Prompts } from "acp-kernel";
 import * as path from "node:path";
 import { findRoute, type CompressSettings, type ProviderRoutes } from "./config.js";
 import { configDir } from "./paths.js";
@@ -59,6 +59,16 @@ export function mergeCompress(
     // like `prompts`: a model-level minToolTokens must not discard a
     // provider-level excludeTools.
     const absorbLevels = [global?.absorb, provider?.absorb, model?.absorb].filter(Boolean) as NonNullable<CompressSettings["absorb"]>[];
+    // `crush` merges like `absorb` one level down: scalar fields sub-field-wise,
+    // and its nested `strategies` map id-wise (deepest entry per id wins whole).
+    const crushLevels = [global?.crush, provider?.crush, model?.crush].filter(Boolean) as NonNullable<CompressSettings["crush"]>[];
+    let crushMerged: CompressSettings["crush"];
+    if (crushLevels.length > 0) {
+        const merged = Object.assign({}, ...crushLevels);
+        const stratMaps = crushLevels.map((l) => l.strategies).filter(Boolean) as NonNullable<NonNullable<CompressSettings["crush"]>["strategies"]>[];
+        if (stratMaps.length > 0) merged.strategies = Object.assign({}, ...stratMaps);
+        crushMerged = merged;
+    }
     const reasoningLevels = [global?.reasoning, provider?.reasoning, model?.reasoning].filter(Boolean) as NonNullable<CompressSettings["reasoning"]>[];
     const reasoningGuardLevels = [global?.reasoningGuard, provider?.reasoningGuard, model?.reasoningGuard].filter(Boolean) as NonNullable<CompressSettings["reasoningGuard"]>[];
     return {
@@ -76,6 +86,7 @@ export function mergeCompress(
         prompts: promptLevels.length > 0 ? Object.assign({}, ...promptLevels) : undefined,
         acknowledgePromptsRisk: pick("acknowledgePromptsRisk"),
         absorb: absorbLevels.length > 0 ? Object.assign({}, ...absorbLevels) : undefined,
+        crush: crushMerged,
         rules: pick("rules"),
 
 stripImages: pick("stripImages"),
@@ -210,7 +221,12 @@ export function hasCompressSettings(s: CompressSettings): boolean {
   *    fully). Absent `s.absorb` leaves `base.absorb` untouched — the feature
   *    stays off unless some level enables it.
   *  - `rules` → `rules = { enabled }` (kernel RuleFeatureConfig; limits stay
-  *    at kernel defaults). Absent `s.rules` leaves `base.rules` untouched. */
+  *    at kernel defaults). Absent `s.rules` leaves `base.rules` untouched.
+  *  - `crush` → `crush` (kernel CrushConfig, acp-kernel >= 0.0.84; the kernel
+  *    runs the crush node inside processTurn between absorb-hide and
+  *    absorb-prompt). Unset fields inherit DEFAULT_CRUSH_CONFIG. Absent
+  *    `s.crush` leaves `base.crush` untouched — the feature stays off unless
+  *    some level enables it (and absorb.enabled resolves true). */
 export function applyCompressSettings(base: Config, limit: number, s: CompressSettings): Config {
     const nudge = { ...base.nudge };
     const truncate = { ...base.truncate };
@@ -237,6 +253,15 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
             excludeTools: s.absorb.excludeTools ?? [...d.excludeTools],
         };
     }
+    let crush: CrushConfig | undefined;
+    if (s.crush !== undefined) {
+        const d = DEFAULT_CRUSH_CONFIG;
+        crush = {
+            enabled: s.crush.enabled === true,
+            minReduction: s.crush.minReduction !== undefined ? parsePercent(s.crush.minReduction) : d.minReduction,
+        };
+        if (s.crush.strategies !== undefined) crush.strategies = s.crush.strategies;
+    }
     return {
         ...base,
         modelContextLimit: limit,
@@ -252,6 +277,7 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         protectedLatestTools: s.protectedLatestTools ?? base.protectedLatestTools,
         protectedTools: s.protectedTools ?? base.protectedTools,
         ...(absorb !== undefined ? { absorb } : {}),
+        ...(crush !== undefined ? { crush } : {}),
         ...(s.rules !== undefined ? { rules: { enabled: s.rules === true } } : {}),
     };
 }
