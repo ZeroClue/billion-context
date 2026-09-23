@@ -14,6 +14,8 @@ import {
     TRAE_DEFAULT_MODEL_HOSTS,
     AIDER_DEFAULT_MODEL_HOSTS,
     readZcodeConfig,
+    zcodeDataRoot,
+    zcodeStoreFileFor,
     QODER_DEFAULT_MODEL_HOSTS,
     type ClientConfig,
 } from "../src/client-config.ts";
@@ -143,6 +145,45 @@ test("parseZcodePersonalConfig: defensive — non-object / missing envelope / no
         parseZcodePersonalConfig({ config: { providerConfigRules: { providerRules: [{ providerId: "p", config: { api: { baseUrl: 42 } } }] } } }),
         { providers: {} },
     );
+});
+
+test("zcodeStoreFileFor: upstream derivation — ZCODE_DATA_BASE_DIR is a base dir, personal override wins (#1151)", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-zcroot-"));
+    try {
+        withHome(home, () => {
+            assert.equal(zcodeDataRoot({}), path.join(home, ".zcode"));
+            assert.equal(zcodeStoreFileFor({}, "new"), path.join(home, ".zcode", "v2", "provider_config.json"));
+            assert.equal(zcodeStoreFileFor({}, "legacy"), path.join(home, ".zcode", "v2", "config.json"));
+            assert.equal(zcodeDataRoot({ ZCODE_DATA_BASE_DIR: "/data" }), path.join("/data", ".zcode"));
+            assert.equal(zcodeStoreFileFor({ ZCODE_DATA_BASE_DIR: "/data" }, "legacy"), path.join("/data", ".zcode", "v2", "config.json"));
+            assert.equal(
+                zcodeStoreFileFor({ ZCODE_DATA_BASE_DIR: "/data", ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: "/alt/p.json" }, "new"),
+                "/alt/p.json",
+            );
+            assert.equal(
+                zcodeStoreFileFor({ ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: "/alt/p.json" }, "legacy"),
+                path.join(home, ".zcode", "v2", "config.json"),
+            );
+        });
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("readZcodeConfig: finds the legacy store under upstream env relocation (ZCODE_DATA_BASE_DIR as base dir, #1151)", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-zcenv-"));
+    try {
+        const v2 = path.join(tmp, ".zcode", "v2");
+        fs.mkdirSync(v2, { recursive: true });
+        fs.writeFileSync(
+            path.join(v2, "config.json"),
+            JSON.stringify({ provider: { moved: { options: { baseURL: "https://moved.example.com/api" } } } }),
+        );
+        const cfg = readZcodeConfig(path.join(tmp, ".zcode"), { ZCODE_DATA_BASE_DIR: tmp });
+        assert.equal(cfg.providers.moved.baseURL, "https://moved.example.com/api");
+    } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+    }
 });
 
 test("readZcodeConfig: merges legacy config.json with provider_config.json, personal wins per key (#1151)", () => {
