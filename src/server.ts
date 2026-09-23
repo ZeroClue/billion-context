@@ -1157,7 +1157,7 @@ async function handle(
     let reqSurface: PackSurface = {};
     let reqSurfacePack = "default";
     let wsSourceForLog: string | undefined;
-        // [#1097] host-only CCR policy for this request scope (three-level
+    // [#1097] host-only CCR policy for this request scope (three-level
     // merge); resolved before the session is bound, then stamped onto it below so
     // every view / injection / execution site reads one value.
     let resolvedCcrCfg: CcrSettings | undefined;
