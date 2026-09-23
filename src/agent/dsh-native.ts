@@ -38,7 +38,7 @@ import { defaultLogFile } from "../paths.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, type NativeInterceptState } from "./native-intercept.js";
-import { fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, type ManifestTool } from "./shared.js";
+import { chainPassthroughNotice, chainPassthroughReason, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, type ManifestTool } from "./shared.js";
 
 export const name = "bili-native";
 export const inject = ["tools", "commands", "agents"];
@@ -373,6 +373,13 @@ async function statusOutcome(ctx: PluginContext): Promise<CommandOutcome> {
     const panel = status?.panel;
     if (status && typeof panel === "string" && panel.length > 0) {
         return { kind: "success", text: panel };
+    }
+    // #1218: chain-guard passthrough verdict — more specific than the
+    // pre-first-request runtime info below.
+    const chainReason = chainPassthroughReason(status);
+    if (status !== undefined && chainReason !== undefined) {
+        const version = await fetchProxyVersion(base);
+        return { kind: "success", text: chainPassthroughNotice(version, chainReason) };
     }
     // #955: pre-first-request view — the proxy answers from the runtime-info
     // table this plugin populated at bootstrap, so /acp shows the client's

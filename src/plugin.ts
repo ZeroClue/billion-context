@@ -612,6 +612,61 @@ function disabledOptionalToolNote(tool: string, session: Session, config: Config
     return undefined;
 }
 
+// #1218: last chain/content-fallback passthrough verdict per conversation key.
+// Chain-guard passthroughs create NO local session, so /acp would otherwise
+// render the armed-idle "no model request yet" text for a conversation that
+// DID send requests (#1197 blind spot). Guard sites (server.ts hop marker +
+// ACP-artifact fallback) record their verdict here; handlePluginStatus reports
+// it. Bounded like warnedChainSessions; keys are whatever conversation ids the
+// guard site had on hand (plugin/client headers, proxy sessionId); empty dropped.
+export type ChainVerdictReason = "hop-self-loop" | "hop-chain" | "content-fallback";
+export interface ChainVerdict {
+    reason: ChainVerdictReason;
+    at: number;
+}
+export const CHAIN_VERDICT_CAP = 512;
+const chainVerdicts = new Map<string, ChainVerdict>();
+
+export function recordChainVerdict(key: string | undefined, reason: ChainVerdictReason): void {
+    const k = typeof key === "string" ? key.trim() : "";
+    if (k.length === 0) return;
+    chainVerdicts.set(k, { reason, at: Date.now() });
+    while (chainVerdicts.size > CHAIN_VERDICT_CAP) {
+        let oldestKey: string | undefined;
+        let oldestAt = Infinity;
+        for (const [k2, v] of chainVerdicts) {
+            if (v.at < oldestAt) {
+                oldestAt = v.at;
+                oldestKey = k2;
+            }
+        }
+        if (oldestKey === undefined) break;
+        chainVerdicts.delete(oldestKey);
+    }
+}
+
+function chainVerdictFor(key: string): ChainVerdict | undefined {
+    const k = key.trim();
+    return k.length > 0 ? chainVerdicts.get(k) : undefined;
+}
+
+/** Most recent verdict across all keys — the fallback=latest analogue. */
+function latestChainVerdict(): { key: string; verdict: ChainVerdict } | undefined {
+    let best: { key: string; verdict: ChainVerdict } | undefined;
+    for (const [key, verdict] of chainVerdicts) {
+        if (best === undefined || verdict.at > best.verdict.at) best = { key, verdict };
+    }
+    return best;
+}
+
+export function _resetChainVerdictsForTest(): void {
+    chainVerdicts.clear();
+}
+
+export function _chainVerdictsForTest(): ReadonlyMap<string, ChainVerdict> {
+    return chainVerdicts;
+}
+
 /** Context-level visibility for plugin UIs (status bars / slash commands):
  *  the same usage the nudge decision sees, keyed by conversation id. */
 export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false): void {
@@ -636,6 +691,26 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         }
     }
     if (!session) {
+        // #1218: chain-guard passthrough verdict — more specific than the
+        // pre-first-request runtime info below, so it wins when both exist.
+        // NOTE: `fallback` is deliberately NOT set even when resolved via the
+        // latest scan — that flag is the MCP shim's adoption contract
+        // (src/mcp.ts), and a chain-passthrough conversation has no session to
+        // forward tool calls to; adopting would only add a failing retry.
+        let verdict = chainVerdictFor(conversationId);
+        let verdictKey: string | undefined;
+        if (verdict === undefined && fallbackLatest) {
+            const hit = latestChainVerdict();
+            if (hit !== undefined) {
+                verdict = hit.verdict;
+                verdictKey = hit.key;
+            }
+        }
+        if (verdict !== undefined) {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, phase: "chain-passthrough", conversationId: verdictKey ?? conversationId, chainVerdict: { reason: verdict.reason, at: verdict.at }, panel: null }));
+            return;
+        }
         // Runtime-info protocol (#955): no session exists yet, but the client
         // may have reported its model config at bootstrap — answer from the
         // agent-keyed runtime table so /acp works pre-first-request. Clients

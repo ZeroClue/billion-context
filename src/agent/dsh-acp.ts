@@ -5,7 +5,7 @@
 // discipline as the other agent plugins: no acp-kernel import, every byte of
 // displayed data comes from the proxy's HTTP endpoints.
 
-import { proxyBaseFromEnv, fetchProxyVersion, fetchStatusLatest, forwardTool, armedIdleNotice } from "./shared.js";
+import { proxyBaseFromEnv, fetchProxyVersion, fetchStatusLatest, forwardTool, armedIdleNotice, chainPassthroughNotice, chainPassthroughReason } from "./shared.js";
 
 export const name = "bili-acp";
 export const inject = ["commands"];
@@ -33,6 +33,13 @@ async function statusOutcome(): Promise<CommandOutcome> {
     const panel = status?.panel;
     if (status && typeof panel === "string" && panel.length > 0) {
         return { kind: "success", text: panel };
+    }
+    // #1218: chain-guard passthrough verdict — requests arrived but were never
+    // processed locally; say so instead of the armed-idle text.
+    const chainReason = chainPassthroughReason(status);
+    if (status !== undefined && chainReason !== undefined) {
+        const version = await fetchProxyVersion(base);
+        return { kind: "success", text: chainPassthroughNotice(version, chainReason) };
     }
     const version = await fetchProxyVersion(base);
     if (version) {

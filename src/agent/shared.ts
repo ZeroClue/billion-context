@@ -209,3 +209,27 @@ export function armedIdleNotice(version: string): string {
 export function noSessionWarning(): string {
     return "bili: no ACP session yet (send a model request first, then run /acp)";
 }
+
+/** #1218: reason string when a status read reports a chain/content-fallback
+ *  passthrough verdict instead of a live session — compression is NOT active
+ *  for that conversation, so the armed-idle "no model request yet" text would
+ *  be a lie. */
+export function chainPassthroughReason(status: Record<string, unknown> | undefined): string | undefined {
+    if (status === undefined || status.phase !== "chain-passthrough") return undefined;
+    const cv = status.chainVerdict as { reason?: unknown } | null | undefined;
+    return typeof cv?.reason === "string" ? cv.reason : undefined;
+}
+
+/** #1218 /acp notice for chain-passed sessions. One source of truth for pi /
+ *  dsh / opencode (#883). */
+export function chainPassthroughNotice(version: string | undefined, reason: string | undefined): string {
+    const head = version !== undefined ? `billion-context@${version} — proxy connected, ` : "bili — ";
+    const detail = reason === "hop-self-loop"
+        ? "a request looped back through THIS bili instance (x-bili-hop self-loop) and was passed through untouched — no local compression state exists for this session. Check your upstream config: it likely points back at this bili instance."
+        : reason === "hop-chain"
+            ? "another bili instance already processed this request (x-bili-hop present), so this instance passes it through untouched — keep only one bili instance in the chain."
+            : reason === "content-fallback"
+                ? "the request carried ACP compression artifacts but no local compression state (a middlebox may have stripped x-bili-hop), so it was passed through untouched."
+                : "the request was passed through by a chain guard and no local compression state was created.";
+    return `${head}compression NOT active for this session (chain passthrough): ${detail} See the [chain] warning(s) in bili.log.`;
+}

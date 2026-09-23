@@ -98,7 +98,7 @@ import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConver
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks } from "./fork-adoption.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
-import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRuntimeInfoFor, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
+import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRuntimeInfoFor, recordChainVerdict, recordPluginSession, rememberPluginMessages, takePendingPluginRegister, type ChainVerdictReason } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type WireProtocol } from "./util.js";
@@ -1118,6 +1118,14 @@ async function handle(
         log("warn", selfLoop
             ? `[chain] inbound request carries THIS instance's ${BILI_HOP_HEADER} marker (${hopMarker}) — self-loop detected. Passing through without processing; check your upstream config (it may point back to this instance).`
             : `[chain] inbound request carries ${BILI_HOP_HEADER} from another bili instance (${hopMarker}) — bili→bili chain detected. Passing through without processing to avoid double compression; keep only one bili instance in the chain.`);
+        // #1218: record the verdict for /acp under every conversation id this
+        // site has on hand — identity resolution below is skipped for hop-
+        // marked requests, so headers are all there is (plugin clients stamp
+        // x-bili-plugin-conversation with the same value their /acp queries).
+        const hopReason: ChainVerdictReason = selfLoop ? "hop-self-loop" : "hop-chain";
+        recordChainVerdict(pluginConversationHeader(req.headers), hopReason);
+        recordChainVerdict(clientConversationHeader(req.headers), hopReason);
+        recordChainVerdict(headerValue(req, opts.sessionHeader), hopReason);
     }
     // #1086: byte pre-filter for the ACP-artifact content fallback — the only
     // remaining signal when a middlebox strips x-bili-hop. The DECISION is
@@ -1567,6 +1575,8 @@ async function handle(
         if (artifactSeed) {
             const artifactKind = detectAcpArtifacts(bodyBuffer, parsed);
             if (artifactKind !== null && !hasProcessedState(sessionId, { protocol })) {
+                recordChainVerdict(sessionId, "content-fallback");
+                recordChainVerdict(convHeader, "content-fallback");
                 if (!warnedChainSessions.has(sessionId)) {
                     warnedChainSessions.add(sessionId);
                     if (warnedChainSessions.size > WARNED_CHAIN_SESSION_CAP) {

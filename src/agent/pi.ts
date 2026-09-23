@@ -6,7 +6,7 @@
 // from the host at runtime (the host duck-types us in).
 
 import { wrapCacheReport } from "../acp-panel.js";
-import { detectProxyBase, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, type ManifestTool } from "./shared.js";
+import { detectProxyBase, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, reportRuntimeInfoOnChange, armedIdleNotice, chainPassthroughNotice, chainPassthroughReason, noSessionWarning, type ManifestTool } from "./shared.js";
 
 type Ctx = {
     sessionManager?: { getSessionId?: () => string } | undefined;
@@ -402,6 +402,20 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                         } else {
                             notify(noSessionWarning(), "warning");
                         }
+                        return;
+                    }
+                    // #1218: requests were passed through by the chain guards —
+                    // no session was ever created, so say WHY instead of
+                    // rendering an empty status.
+                    const chainReason = chainPassthroughReason(status);
+                    if (chainReason !== undefined) {
+                        let version: string | undefined;
+                        try {
+                            version = await fetchProxyVersion(proxyBase);
+                        } catch {
+                            version = undefined;
+                        }
+                        notify(chainPassthroughNotice(version, chainReason), "warning");
                         return;
                     }
                     const panel = typeof status.panel === "string" ? status.panel : undefined;

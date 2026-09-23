@@ -9,7 +9,7 @@
 // module load and serves it verbatim.
 
 import { wrapCacheReport } from "../acp-panel.js";
-import { armedIdleNotice, fetchProxyVersion, forwardTool, noSessionWarning } from "./shared.js";
+import { armedIdleNotice, chainPassthroughNotice, chainPassthroughReason, fetchProxyVersion, forwardTool, noSessionWarning } from "./shared.js";
 
 export interface OpencodeCommandConfig {
     template: string;
@@ -112,17 +112,25 @@ export function createAcpCommandHooks(getProxyBase: () => string | undefined, ct
                     const status = (await res.json()) as { ok?: boolean; panel?: string; error?: string };
                     if (typeof status.panel === "string" && status.panel.length > 0) {
                         text = status.panel;
-                    } else if (status.ok === false) {
-                        // zero sessions on the proxy (fresh launch) — friendly idle notice
+                    } else {
                         let version: string | undefined;
                         try {
                             version = await fetchProxyVersion(proxyBase);
                         } catch {
                             version = undefined;
                         }
-                        text = version !== undefined ? armedIdleNotice(version) : noSessionWarning();
-                    } else {
-                        text = "bili: proxy returned no status panel";
+                        // #1218: chain-guard passthrough verdict beats the
+                        // armed-idle notice — requests DID arrive, compression
+                        // just never ran for them.
+                        const chainReason = chainPassthroughReason(status);
+                        if (chainReason !== undefined) {
+                            text = chainPassthroughNotice(version, chainReason);
+                        } else if (status.ok === false) {
+                            // zero sessions on the proxy (fresh launch) — friendly idle notice
+                            text = version !== undefined ? armedIdleNotice(version) : noSessionWarning();
+                        } else {
+                            text = "bili: proxy returned no status panel";
+                        }
                     }
                 } catch (err) {
                     text = `bili: /acp failed (${err instanceof Error ? err.message : String(err)})`;
