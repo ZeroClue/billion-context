@@ -353,6 +353,10 @@ test("resolveClaudeHostPid: full walk over a ps-backed table", () => {
 // ppid chain, real match — everything except /proc itself.
 test("resolveClaudeHostPid: live ps walk finds a spawned claude host", { timeout: 30_000, skip: process.platform === "win32" }, async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-ps-live-"));
+    // The extensionless fixture inherits its module goal from the NEAREST
+    // package.json — pin it to CJS so the require() below survives a TMPDIR
+    // inside a "type":"module" project.
+    fs.writeFileSync(path.join(dir, "package.json"), '{"type":"commonjs"}\n');
     const claudeBin = path.join(dir, "claude");
     const pidFile = path.join(dir, "child.pid");
     // Node-shebang fake claude (argv[0] is `node`, script basename `claude`)
@@ -918,6 +922,9 @@ test("hook e2e: watchdog tracks the claude host, not the transient sh wrapper", 
     // session), then OUTLIVES the hook like a real interactive session.
     const binDir = path.join(home, "bin");
     fs.mkdirSync(binDir, { recursive: true });
+    // Same CJS pin as the live-ps test above: the extensionless fixture must
+    // not inherit "type":"module" from an enclosing project's package.json.
+    fs.writeFileSync(path.join(binDir, "package.json"), '{"type":"commonjs"}\n');
     const claudeBin = path.join(binDir, "claude");
     // A shebang'ed SHELL script would show argv[0]=/bin/sh in /proc and never
     // match; a node shebang mirrors the npm install shape: argv becomes
