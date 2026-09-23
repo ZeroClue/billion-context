@@ -475,6 +475,13 @@ export type ProxyOptions = {
      *  `chainContentDetection: false` in the config file (env wins). The
      *  x-bili-hop signal is unaffected by this switch. */
     chainContentDetection?: boolean;
+    /** #1085: freeze the client's head-system text into a per-session sticky
+     *  anchor and append detected changes to the conversation as trailing
+     *  notes, keeping the forwarded prefix byte-stable for the provider's
+     *  prefix cache when instruction files (AGENTS.md & co.) change mid-
+     *  session. Default OFF; enable with env BILI_STABLE_SYSTEM_ANCHOR=1 or
+     *  `stableSystemAnchor: true` in the config file (env wins). */
+    stableSystemAnchor?: boolean;
 };
 
 /** Re-read ONLY the routes from the current config sources, returning a fresh
@@ -646,6 +653,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         subagentSplit: (env.BILI_SUBAGENT_SPLIT ?? (fileConfig.subagentSplit === false ? "0" : "1")) !== "0",
         forkAdoption: (env.BILI_FORK_ADOPTION ?? (fileConfig.forkAdoption === true ? "1" : "0")) !== "0",
         chainContentDetection: (env.BILI_CHAIN_CONTENT ?? (fileConfig.chainContentDetection === false ? "0" : "1")) !== "0",
+        stableSystemAnchor: (env.BILI_STABLE_SYSTEM_ANCHOR ?? (fileConfig.stableSystemAnchor === true ? "1" : "0")) !== "0",
     };
 }
 
@@ -700,6 +708,9 @@ type FileConfig = {
      *  bili→bili chain detection (#1086); x-bili-hop stays active either way.
      *  Env BILI_CHAIN_CONTENT=0 wins over the file. */
     chainContentDetection?: boolean;
+    /** Set `true` to enable the sticky head-system anchor (#1085, default
+     *  OFF; env BILI_STABLE_SYSTEM_ANCHOR wins). */
+    stableSystemAnchor?: boolean;
     /** Global wire-compat block. `roles` maps message roles to the role name
      *  upstreams accept (e.g. `{"developer":"system"}`) — applied to the
      *  final forwarded body for openai/responses requests (#552). */
