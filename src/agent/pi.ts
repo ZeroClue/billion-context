@@ -185,8 +185,11 @@ function noProxyWarning(agent: string): string {
 }
 
 const RETRY_INTERVAL_MS = 10000;
+// #1214: how long a proxied request may hold up for ACP tool registration
+// before degrading to wire mode (see waitForToolsReady / awaitToolsReadyGate).
+const READY_WAIT_TIMEOUT_MS = 5000;
 
-type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; retryIntervalMs: number };
+type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; retryIntervalMs: number; readyWaiters?: Array<() => void>; readyWaitGivenUp?: boolean };
 
 // omp never emits before_provider_headers, so the x-bili-plugin marker cannot
 // be stamped per request. Register the conversation id once (after tools are
@@ -200,6 +203,56 @@ async function postIdentityRegister(proxyBase: string, conversationId: string, a
         signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) throw new Error(`register HTTP ${res.status}`);
+}
+
+// Resolves when registerTools() flips toolsReady (it drains readyWaiters at
+// that moment), or after timeoutMs — whichever comes first. The timer is NOT
+// unref'd on purpose: while the host awaits the gate nothing else may keep
+// the event loop alive (e.g. a -p boot against a dead proxy — the failed
+// manifest socket is already gone and only this timer holds the process open
+// until the graceful wire-mode fallback kicks in).
+function waitForToolsReady(state: RegisterState, timeoutMs: number): Promise<void> {
+    if (state.toolsReady === true) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+        let finished = false;
+        const finish = () => {
+            if (finished) return;
+            finished = true;
+            clearTimeout(timer);
+            const waiters = state.readyWaiters;
+            if (waiters !== undefined) {
+                const i = waiters.indexOf(finish);
+                if (i >= 0) waiters.splice(i, 1);
+            }
+            resolve();
+        };
+        const timer = setTimeout(finish, timeoutMs);
+        (state.readyWaiters ??= []).push(finish);
+    });
+}
+
+// #1214: bounded readiness gate shared by the per-request hooks. Stamping
+// x-bili-plugin* only when tools were ALREADY registered is the right
+// invariant (never claim native-tool ownership without the tools), but in
+// `-p` one-shot runs round 1 dispatches immediately after session_start and
+// lost the race against the manifest fetch — the headerless request made the
+// proxy bind an anonymous prefix-affinity session in proxy mode. The host
+// awaits these hooks before the request leaves (pi extension runner:
+// `await handler(event, ctx)`), so hold the request instead of skipping the
+// stamp. A permanently failing manifest endpoint still degrades to wire mode
+// after the timeout, and the per-session given-up latch avoids re-waiting on
+// every later request.
+// Readiness query through a call so TS's pre-await narrowing of
+// state.toolsReady cannot invalidate the post-wait re-check below.
+function isToolsReady(state: RegisterState): boolean {
+    return state.toolsReady === true;
+}
+
+async function awaitToolsReadyGate(state: RegisterState, readyTimeoutMs: number, ctx: Ctx | undefined): Promise<void> {
+    if (proxyBaseForCtx(ctx) === undefined) return;
+    if (isToolsReady(state) || state.readyWaitGivenUp === true) return;
+    await waitForToolsReady(state, readyTimeoutMs);
+    if (!isToolsReady(state)) state.readyWaitGivenUp = true;
 }
 
 async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, agent: string): Promise<void> {
@@ -231,6 +284,10 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
                 state.toolsFor = sid;
             }
             state.toolsReady = true;
+            if (state.readyWaiters !== undefined && state.readyWaiters.length > 0) {
+                const waiters = state.readyWaiters.splice(0);
+                for (const wake of waiters) wake();
+            }
             state.retryAt = undefined;
             if (agent === "omp" && sid !== "" && state.identityAt !== sid) {
                 try {
@@ -262,10 +319,11 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
     }
 }
 
-export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalMs?: number }): (pi: ExtensionAPI) => void {
+export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalMs?: number; readyTimeoutMs?: number }): (pi: ExtensionAPI) => void {
     return function biliPlugin(pi: ExtensionAPI): void {
         const agent = agentName(agentOverride);
         const state: RegisterState = { retryIntervalMs: opts?.retryIntervalMs ?? RETRY_INTERVAL_MS };
+        const readyTimeoutMs = opts?.readyTimeoutMs ?? READY_WAIT_TIMEOUT_MS;
         // #535: file-free routing — override provider baseUrls at load from
         // the launcher-passed manifest (see buildPiEnv). registerProvider is
         // queued during initial extension load and applied before any model
@@ -466,19 +524,23 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 },
             });
         }
-        pi.on("before_provider_headers", (event, ctx) => {
+        pi.on("before_provider_headers", async (event, ctx) => {
             try {
-                if (proxyBaseForCtx(ctx) === undefined) return;
                 const headers = (event as unknown as { headers?: Record<string, string> }).headers;
                 if (headers === undefined || typeof headers !== "object" || Array.isArray(headers)) return;
                 // The x-bili-plugin marker tells the proxy "the client owns the
-                // ACP tools natively — skip wire-level injection". Stamping it
+                // ACP tools natively — skip wire-level injection". Claiming it
                 // before registerTools() finishes would send round 1 out with
-                // NO ACP tools (the first provider request races the manifest
-                // fetch). Claim ownership only once tools are registered;
-                // until then the request rides the proxy's wire mode. A
-                // permanently failing manifest fetch keeps us in wire mode —
-                // a graceful fallback rather than a tool-less session.
+                // NO ACP tools, so ownership is claimed only once tools are
+                // registered. #1214: that used to be enforced by SKIPPING the
+                // stamp, which silently downgraded one-shot `-p` runs to proxy
+                // mode (round 1 dispatched before the manifest fetch settled →
+                // headerless request → anonymous pfa session). The host awaits
+                // this hook before the request leaves, so hold the request for
+                // the bounded readiness window instead; a permanently failing
+                // manifest fetch still degrades to wire mode after the timeout
+                // (graceful fallback rather than a tool-less or hung session).
+                await awaitToolsReadyGate(state, readyTimeoutMs, ctx);
                 if (state.toolsReady === true) {
                     const sid = sessionIdOf(ctx);
                     if (sid !== undefined) headers["x-bili-plugin-conversation"] = sid;
@@ -507,7 +569,8 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         // x-bili-plugin-* headers and reports runtime info (#955) — so omp's
         // report rides this per-request event instead: POST only, deduped per
         // model switch, gated on toolsReady like pi's header path (ownership
-        // claim = ACP tools registered; round 1 rides wire mode).
+        // claim = ACP tools registered; #1214: the readiness gate holds round
+        // 1 until they are, with the wire-mode fallback on timeout).
         function reportOmpRuntimeInfo(ctx: Ctx): void {
             if (state.toolsReady !== true) return;
             const modelId = ctx.model?.id;
@@ -516,16 +579,21 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             const maxOut = (ctx.model as { maxTokens?: unknown } | undefined)?.maxTokens;
             reportRuntimeInfoOnChange(proxyBaseForCtx(ctx), { agent, model: modelId, contextWindow: typeof window === "number" && window > 0 ? Math.floor(window) : undefined, maxOutput: typeof maxOut === "number" && maxOut > 0 ? Math.floor(maxOut) : undefined, baseURL: ctx.model?.baseUrl, source: "client-config" });
         }
-        pi.on("before_provider_request", (event, ctx) => {
+        pi.on("before_provider_request", async (event, ctx) => {
             // omp emits this per model request (but never before_provider_headers);
             // it doubles as the retry driver when the session_start manifest
             // fetch raced the proxy startup. Cached by sid, throttled by retryAt.
+            // #1214: same readiness gate as the header path — omp's ownership
+            // claim is the identity register inside registerTools(), which must
+            // land before round 1 leaves; idempotent if both hooks fire.
+            await awaitToolsReadyGate(state, readyTimeoutMs, ctx);
             void registerTools(pi, ctx, state, agent).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
             if (agent === "omp") reportOmpRuntimeInfo(ctx);
             return stampPromptCacheKey(event, ctx, agent);
         });
         pi.on("session_start", (_event, ctx) => {
             state.sid = undefined;
+            state.readyWaitGivenUp = undefined;
             void registerTools(pi, ctx, state, agent).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
         });
         // omp fires session_compact on in-session native compaction (sid does
