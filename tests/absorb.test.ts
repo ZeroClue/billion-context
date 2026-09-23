@@ -190,7 +190,7 @@ test("applyCompressSettings: maps settings absorb onto kernel AbsorbConfig with 
     assert.deepEqual(out.absorb, {
         enabled: true,
         toolName: "absorb",
-        minToolTokens: 1000,
+        minToolTokens: 4000,
         contextThresholdPct: 0.8,
         excludeTools: [],
     });
