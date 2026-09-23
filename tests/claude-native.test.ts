@@ -24,7 +24,7 @@ import {
     stripClaudeManagedBlock,
 } from "../src/plugin-install.ts";
 import { CLAUDE_NATIVE_DEFAULT_PORT, clearClaudeNativePort, resolveClaudeNativePort, saveClaudeNativePort } from "../src/config.ts";
-import { isClaudeHostArgv, planClaudeNativeBootstrap, readPsProcInfo, readWinProcInfo, resolveClaudeHostPid } from "../src/claude-native-bootstrap.ts";
+import { chooseWatchdogParentPid, isClaudeHostArgv, isTransientShArgv, planClaudeNativeBootstrap, readPsProcInfo, readWinProcInfo, resolveClaudeHostPid } from "../src/claude-native-bootstrap.ts";
 
 const HOOK_COMMAND = "/opt/bili/dist/claude-native-bootstrap.js";
 
@@ -206,6 +206,68 @@ test("resolveClaudeHostPid: no claude host in range → undefined (caller keeps 
     for (let i = 0; i < 30; i++) deep[100 + i] = { argv: ["proc", String(i)], ppid: 101 + i };
     deep[999] = { argv: ["claude"], ppid: 1 };
     assert.equal(resolveClaudeHostPid({ read: procTable(deep), startPid: 100 }), undefined);
+});
+
+test("resolveClaudeHostPid: the closer REAL claude beats a lookalike farther up", () => {
+    // `node /opt/claude` is not claude-code, but the walk is bottom-up and
+    // the real claude is always nearer the hook in a live session — a
+    // lookalike above it must never hijack the watchdog.
+    const read = procTable({
+        100: { argv: [process.execPath, "/pkg/dist/claude-native-bootstrap.js"], ppid: 200 },
+        200: { argv: ["/bin/sh", "-c", "node hook"], ppid: 300 },
+        300: { argv: ["/usr/local/bin/claude"], ppid: 400 },
+        400: { argv: [process.execPath, "/opt/claude"], ppid: 1 },
+    });
+    assert.equal(resolveClaudeHostPid({ read, startPid: 100 }), 300);
+});
+
+// — watchdog parent choice (no-host fallback) ——————————————————————————
+
+test("isTransientShArgv: sh-like one-shots only", () => {
+    assert.equal(isTransientShArgv(["sh", "-c", "node hook"]), true);
+    assert.equal(isTransientShArgv(["/bin/bash", "-lc", "cmd"]), true);
+    assert.equal(isTransientShArgv(["zsh", "-i"]), false);
+    assert.equal(isTransientShArgv(["node", "-c", "x"]), false);
+    assert.equal(isTransientShArgv(["sh", "--check", "x"]), false);
+});
+
+test("chooseWatchdogParentPid: host found → the host", () => {
+    const read = procTable({
+        [process.pid]: { argv: [process.execPath, "/pkg/dist/claude-native-bootstrap.js"], ppid: 500 },
+        500: { argv: ["/bin/sh", "-c", "node hook"], ppid: 700 },
+        700: { argv: ["claude"], ppid: 1 },
+    });
+    assert.equal(chooseWatchdogParentPid({ read, parentPid: 500 }), 700);
+});
+
+test("chooseWatchdogParentPid: no host + transient sh parent → the wrapper's parent (unrecognized claude)", () => {
+    // Exotic install form the matcher missed: the grandparent IS claude —
+    // watching it keeps the session alive with the correct lifetime, instead
+    // of re-arming the 2s self-kill on the transient wrapper.
+    const read = procTable({
+        [process.pid]: { argv: [process.execPath, "/pkg/dist/claude-native-bootstrap.js"], ppid: 500 },
+        500: { argv: ["/bin/sh", "-c", "node hook"], ppid: 600 },
+        600: { argv: ["/opt/weird-claude-launcher"], ppid: 1 },
+    });
+    assert.equal(chooseWatchdogParentPid({ read, parentPid: 500 }), 600);
+});
+
+test("chooseWatchdogParentPid: no host + non-transient/unreadable parent → legacy direct parent", () => {
+    // Interactive shell (manual run) — old behavior is the right behavior.
+    const interactive = procTable({
+        [process.pid]: { argv: ["node", "hook"], ppid: 500 },
+        500: { argv: ["/bin/zsh", "-i"], ppid: 1 },
+    });
+    assert.equal(chooseWatchdogParentPid({ read: interactive, parentPid: 500 }), 500);
+    // Wrapper parent whose own parent is init (no grandparent to watch).
+    const orphanSh = procTable({
+        [process.pid]: { argv: ["node", "hook"], ppid: 500 },
+        500: { argv: ["sh", "-c", "node hook"], ppid: 1 },
+    });
+    assert.equal(chooseWatchdogParentPid({ read: orphanSh, parentPid: 500 }), 500);
+    // Process table unreadable (hidepid / missing ps) — strictly no worse.
+    const blind = procTable({ [process.pid]: { argv: ["node", "hook"], ppid: 800 } });
+    assert.equal(chooseWatchdogParentPid({ read: blind, parentPid: 800 }), 800);
 });
 
 test("isClaudeHostArgv: exact matches only — never the hook itself or lookalikes", () => {
