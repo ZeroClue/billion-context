@@ -2699,6 +2699,10 @@ async function prepareOpenai(
             } catch {
             }
         }
+        // [#1095] restore-channel guidance — ephemeral trailing user message
+        // (same pattern as prepareAnthropic/Google/Responses).
+        const imgNote = imageFullTrailingNote(session);
+        if (imgNote) rebuiltMessages = [...rebuiltMessages, { role: "user", content: imgNote }];
     } catch (err) {
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         processedMessages = [];
