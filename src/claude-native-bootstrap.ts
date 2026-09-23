@@ -197,15 +197,24 @@ export function resolveClaudeHostPid(opts: { read?: ProcReader; startPid?: numbe
     return undefined;
 }
 
-/** Is this argv a shell running a `-c` one-shot (also `-lc`/`-ic` flag
- *  clusters)? Such wrappers exit the moment their command does — claude's
- *  SessionStart hook wrapper (`/bin/sh -c <hook>`) is exactly this shape.
- *  Exported for tests. */
+/** Is this argv a shell running a run-and-exit one-shot — the transient hook
+ *  wrapper shape? Covers POSIX `sh -c` (also -lc/-ic flag clusters), Windows
+ *  `cmd /c` (/k stays open — not transient), and `powershell -Command`
+ *  (claude uses one of these to launch SessionStart hooks on every OS).
+ *  Such wrappers exit the moment their command does. Exported for tests. */
 export function isTransientShArgv(argv: string[]): boolean {
     const parts = (argv[0] ?? "").split(/[\\/]/).filter((seg) => seg.length > 0);
     const shell = parts[parts.length - 1] ?? "";
-    if (!/^(sh|bash|dash|zsh|ksh|ash)(\.exe)?$/i.test(shell)) return false;
-    return argv.some((arg, i) => i > 0 && /^-[^-]*c$/.test(arg));
+    if (/^(sh|bash|dash|zsh|ksh|ash)(\.exe)?$/i.test(shell)) {
+        return argv.some((arg, i) => i > 0 && /^-[^-]*c$/.test(arg));
+    }
+    if (/^cmd(\.exe)?$/i.test(shell)) {
+        return argv.some((arg, i) => i > 0 && /^[-/]c$/i.test(arg));
+    }
+    if (/^(powershell|pwsh)(\.exe)?$/i.test(shell)) {
+        return argv.some((arg, i) => i > 0 && /^-?(command|encodedcommand)$/i.test(arg));
+    }
+    return false;
 }
 
 /** The pid the spawned proxy's watchdog should watch. The resolved claude
