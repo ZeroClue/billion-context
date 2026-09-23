@@ -980,3 +980,158 @@ test("hook e2e: watchdog tracks the claude host, not the transient sh wrapper", 
         await rmHome(home);
     }
 });
+
+// #7: the stable-port proxy is shared across sessions, so the parent-gone
+// watchdog had to become a WATCHER SET — POST /__bili__/watcher lets an
+// attached session register its claude host, and the proxy dies only when
+// every owner is gone. This test pins the route contract against a real
+// dist proxy, no fake claude needed (platform-neutral):
+//   - armed proxies accept registrations (200) and reject garbage (400);
+//   - daemon proxies (no BILI_PARENT_PID) NEVER take watchers (409) —
+//     registering one must not arm a lifetime watchdog on a daemon;
+//   - an armed proxy exits when its registered keeper dies.
+test("watcher route: shared proxies take watcher registrations, daemons refuse (#7)", { timeout: 120_000 }, async () => {
+    const distCli = path.resolve(import.meta.dirname, "..", "dist", "index.js");
+    ensureDistBuilt(distCli);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-watcher-route-"));
+    const xdg = { home, config: path.join(home, "cfg"), state: path.join(home, "state"), cache: path.join(home, "cache"), data: path.join(home, "data") };
+    const port = await freePort();
+    const origin = `http://127.0.0.1:${port}`;
+    const post = (body: unknown) => fetch(`${origin}/__bili__/watcher`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    // Keeper: a live pid the armed proxy watches. Its death must take the
+    // proxy down (the sweep side of the set watchdog).
+    const keeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 60000)"], { stdio: "ignore" });
+    const keeperPid = keeper.pid ?? 0;
+    const baseEnv = {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        HOME: xdg.home,
+        XDG_CONFIG_HOME: xdg.config,
+        XDG_STATE_HOME: xdg.state,
+        XDG_CACHE_HOME: xdg.cache,
+        XDG_DATA_HOME: xdg.data,
+        NO_COLOR: "1",
+    };
+    let armed = 0;
+    let daemon = 0;
+    try {
+        armed = spawnProxy(distCli, port, { ...baseEnv, BILI_PARENT_PID: String(keeperPid) });
+        assert.ok(await waitForPort(port, 60_000), "armed proxy up");
+        assert.equal((await post({})).status, 400, "empty body rejected");
+        assert.equal((await post({ pid: 0 })).status, 400, "pid 0 rejected");
+        assert.equal((await post({ pid: "12" })).status, 400, "string pid rejected");
+        assert.equal((await post({ pid: armed })).status, 400, "self-registration rejected");
+        const ok = await post({ pid: keeperPid });
+        assert.equal(ok.status, 200, "live pid accepted");
+        assert.match(JSON.stringify(await ok.json()), /"ok":true/, "ok:true body");
+
+        // Registered keeper dies → armed proxy must follow (≤ a few ticks).
+        if (keeperPid > 1) killPid(keeperPid);
+        const deadline = Date.now() + 15_000;
+        while (Date.now() < deadline && (await canConnect(port))) await new Promise((r) => setTimeout(r, 250));
+        assert.equal(await canConnect(port), false, "armed proxy exits when its watcher dies");
+
+        // Daemon mode: no BILI_PARENT_PID → registrations refused, and a
+        // refused registration must not arm a watchdog that kills it later.
+        daemon = spawnProxy(distCli, port, baseEnv);
+        assert.ok(await waitForPort(port, 60_000), "daemon proxy up on the same port");
+        assert.equal((await post({ pid: process.pid })).status, 409, "daemon refuses watchers");
+        await new Promise((r) => setTimeout(r, 5000));
+        assert.ok(await canConnect(port), "daemon stays up — no watchdog got armed");
+    } finally {
+        if (keeperPid > 1) killPid(keeperPid);
+        if (armed > 1) killPid(armed);
+        if (daemon > 1) killPid(daemon);
+        await rmHome(home);
+    }
+});
+
+function spawnProxy(distCli: string, port: number, env: NodeJS.ProcessEnv): number {
+    const child = spawn(process.execPath, [distCli, "start", "--host", "127.0.0.1", "--port", String(port)], { env, stdio: "ignore" });
+    return child.pid ?? 0;
+}
+
+// #7 end-to-end: two concurrent claude sessions share ONE stable-port proxy.
+// The first session's hook SPAWNS it (watchdog seeded with session A's host);
+// the second ATTACHES and must register its own host via POST /__bili__/watcher.
+// Old code: A's exit killed the shared proxy and session B went down with it
+// (Connection refused mid-session). Fixed: the proxy survives A's death while
+// B lives, and dies only after the LAST session exits. Linux-only like the
+// watchdog e2e above (fake claude walks /proc, /bin/sh shebang exec).
+test("hook e2e: shared proxy survives the first session's exit, dies after the last (#7)", { timeout: 180_000, skip: process.platform !== "linux" }, async () => {
+    const distScript = path.resolve(import.meta.dirname, "..", "dist", "claude-native-bootstrap.js");
+    ensureDistBuilt(distScript);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-share-"));
+    const xdg = { home, config: path.join(home, "cfg"), state: path.join(home, "state"), cache: path.join(home, "cache"), data: path.join(home, "data") };
+    const tmp = path.join(xdg.home, "tmp");
+    fs.mkdirSync(tmp, { recursive: true });
+    const port = await freePort();
+    const binDir = path.join(home, "bin");
+    fs.mkdirSync(binDir, { recursive: true });
+    const claudeBin = path.join(binDir, "claude");
+    fs.writeFileSync(
+        claudeBin,
+        '#!/usr/bin/env node\nconst { spawn } = require("node:child_process");\n' +
+            'spawn("/bin/sh", ["-c", process.env.BILI_FAKE_HOOK_CMD], { stdio: "ignore" });\n' +
+            "setInterval(() => {}, 60000);\n",
+    );
+    fs.chmodSync(claudeBin, 0o755);
+    const sessionEnv = {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        HOME: xdg.home,
+        XDG_CONFIG_HOME: xdg.config,
+        XDG_STATE_HOME: xdg.state,
+        XDG_CACHE_HOME: xdg.cache,
+        XDG_DATA_HOME: xdg.data,
+        BILI_CLAUDE_NATIVE_PORT: String(port),
+        NO_COLOR: "1",
+        TMPDIR: tmp,
+        TEMP: tmp,
+        TMP: tmp,
+        BILI_FAKE_HOOK_CMD: `"${process.execPath}" '${distScript}'`,
+    };
+    const spawnClaude = (): number => {
+        const proc = spawn(claudeBin, [], { env: sessionEnv, stdio: "ignore", detached: true });
+        return proc.pid ?? 0;
+    };
+    const instanceFile = path.join(xdg.state, "billion-context", "proxy-origin");
+    const claudeA = spawnClaude();
+    let proxyPid = 0;
+    let claudeB = 0;
+    try {
+        // A is guaranteed the SPAWNER: its proxy is up before B is even born.
+        assert.ok(await waitForPort(port, 60_000), "proxy up behind session A");
+        const inst = JSON.parse(await waitForInstanceFile(instanceFile, 30_000)) as { pid: number; origin: string };
+        proxyPid = inst.pid;
+        assert.equal(inst.origin, `http://127.0.0.1:${port}`);
+
+        // Session B starts: its hook attaches to the healthy proxy and
+        // registers B's host pid. Generous margin so CI jitter can't flake it.
+        claudeB = spawnClaude();
+        await new Promise((r) => setTimeout(r, 8000));
+
+        // A exits mid-B-session. Old watchdog: parent-gone killed the shared
+        // proxy within one 2s tick. Now: B is still registered → alive.
+        if (claudeA > 1) killPid(claudeA);
+        await new Promise((r) => setTimeout(r, 6000));
+        assert.ok(await canConnect(port), "proxy survives the FIRST session's exit while the second lives");
+        const instMid = JSON.parse(fs.readFileSync(instanceFile, "utf8")) as { pid: number };
+        assert.equal(instMid.pid, proxyPid, "same proxy instance throughout — no respawn");
+
+        // Last session exits → the proxy must follow within a few ticks.
+        if (claudeB > 1) killPid(claudeB);
+        const deadline = Date.now() + 15_000;
+        while (Date.now() < deadline && (await canConnect(port))) await new Promise((r) => setTimeout(r, 250));
+        assert.equal(await canConnect(port), false, "proxy exits after the LAST session");
+    } finally {
+        if (claudeA > 1) killPid(claudeA);
+        if (claudeB > 1) killPid(claudeB);
+        if (proxyPid > 1) killPid(proxyPid);
+        if (await canConnect(port)) {
+            try {
+                const leftover = JSON.parse(fs.readFileSync(instanceFile, "utf8")) as { pid: number };
+                if (typeof leftover.pid === "number") killPid(leftover.pid);
+            } catch {}
+        }
+        await rmHome(home);
+    }
+});

@@ -333,6 +333,17 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // (the chain check only compares against the other running instance).
     const instanceId = randomUUID();
     const instanceStartedAt = Date.now();
+    // #7 (shared stable-port proxy): the parent-gone watchdog watches a SET of
+    // pids, not one. The spawning hook seeds it via BILI_PARENT_PID; every
+    // ATTACHING session (POST /__bili__/watcher) adds its claude host, so a
+    // proxy shared across sessions dies when the LAST owner exits — not when
+    // the first spawner does. Per-server like instanceId above; armed here
+    // (before listen) so a racing first registration can never observe an
+    // unarmed watchdog.
+    const parentWatchPid = Number.parseInt(process.env.BILI_PARENT_PID ?? "", 10);
+    const initialWatcherPid = Number.isInteger(parentWatchPid) && parentWatchPid > 0 && parentWatchPid !== process.pid ? parentWatchPid : null;
+    const proxyWatchers = new Set<number>();
+    if (initialWatcherPid !== null) proxyWatchers.add(initialWatcherPid);
     // Reload persisted compression state before accepting traffic so sessions
     // that survived a restart keep their folded view (otherwise long sessions
     // re-send oversized raw history and hang).
@@ -365,7 +376,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     const server = http.createServer(async (req, res) => {
         armRequestWatchdog(req, res, log);
         try {
-            await handle(req, res, opts, core, config, log, instanceId, instanceStartedAt);
+            await handle(req, res, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid);
         } catch (err) {
             const msg = String(err);
             const e = err as { name?: string; message?: string };
@@ -592,10 +603,23 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // Launcher children have no console and TerminateProcess leaves no room
     // for a flush (#414): they watch the launcher pid and run the graceful
     // path themselves when it disappears (≤2s after the parent exits).
-    const parentPid = Number.parseInt(process.env.BILI_PARENT_PID ?? "", 10);
-    if (Number.isInteger(parentPid) && parentPid > 0 && parentPid !== process.pid) {
+    // #7: the watch is a SET — attached sessions register their host via
+    // POST /__bili__/watcher — so shutdown fires only when every owner is
+    // gone. A single-owner proxy still reports the historical
+    // `parent-gone (pid N)` reason; multi-owner deaths log `watchers-gone`.
+    if (initialWatcherPid !== null) {
         const watcher = setInterval(() => {
-            if (!isPidAlive(parentPid)) shutdown(`parent-gone (pid ${parentPid})`);
+            const dead: number[] = [];
+            for (const pid of proxyWatchers) {
+                if (!isPidAlive(pid)) {
+                    proxyWatchers.delete(pid);
+                    dead.push(pid);
+                }
+            }
+            if (proxyWatchers.size === 0) {
+                const reason = dead.length === 1 && dead[0] === initialWatcherPid ? `parent-gone (pid ${dead[0]})` : `watchers-gone (pids: ${dead.join(", ")})`;
+                shutdown(reason);
+            }
         }, 2_000);
         watcher.unref?.();
     }
@@ -721,6 +745,8 @@ async function handle(
     log: (level: string, msg: string) => void,
     instanceId: string,
     instanceStartedAt: number,
+    proxyWatchers: Set<number>,
+    initialWatcherPid: number | null,
 ): Promise<void> {
     // SECURITY: the /__bili/ management endpoints (config read/write, reload,
     // session stats) are privileged — a remote caller who can reach them can
@@ -876,6 +902,33 @@ async function handle(
             return;
         }
         return handlePluginStatus(conversationId, res, { core, config, log }, params.get("fallback") === "latest");
+    }
+    if (req.method === "POST" && req.url === "/__bili__/watcher") {
+        // #7: an ATTACHING claude session registers its host pid so the shared
+        // proxy outlives the first spawner's exit. Only proxies started in
+        // parent-watch mode (BILI_PARENT_PID) take watchers — daemons stay
+        // daemons, and a rejected registration leaves behavior unchanged.
+        try {
+            const body = await readBody(req);
+            const parsed = JSON.parse(body.toString("utf8")) as { pid?: unknown };
+            const pid = parsed.pid;
+            if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 1 || pid === process.pid) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "expected { pid: <integer> }" }));
+            } else if (initialWatcherPid === null) {
+                res.writeHead(409, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "watchdog not armed (no parent pid) — this proxy does not take watchers" }));
+            } else {
+                proxyWatchers.add(pid);
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: true, watchers: proxyWatchers.size }));
+            }
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
     }
     if (req.method === "POST" && req.url === "/__bili/plugin/tool") {
         try {

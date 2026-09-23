@@ -247,17 +247,37 @@ async function run(): Promise<void> {
         // killed a healthy proxy ~2s into every session. Watch the claude
         // host itself; when the walk cannot find it, chooseWatchdogParentPid
         // degrades via the wrapper's parent instead of the wrapper.
+        const watchPid = chooseWatchdogParentPid();
         const handle = await ensureProxyRunning(
             {
                 host: LAUNCHER_DEFAULT_HOST,
                 port: plan.port,
                 passthrough: plan.action === "passthrough",
                 debug: false,
-                parentPid: chooseWatchdogParentPid(),
+                parentPid: watchPid,
                 strictPort: true,
             },
             { scriptPath: proxyScriptPath() },
         );
+        // A stable-port proxy is SHARED across claude sessions: the spawner's
+        // watchdog would kill it when THAT session exits while this one still
+        // runs. ATTACHED sessions must therefore register their own host pid
+        // (POST /__bili__/watcher) so the proxy dies only after the last owner
+        // is gone (#7). Fire-and-forget: a failed registration only degrades
+        // to the single-owner watchdog, never blocks session start.
+        if (handle.attached) {
+            try {
+                const res = await fetch(`${handle.origin}/__bili__/watcher`, {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ pid: watchPid }),
+                    signal: AbortSignal.timeout(2_000),
+                });
+                if (!res.ok) log(`watcher registration returned HTTP ${res.status} — the shared proxy may exit when its first owner does`);
+            } catch (err) {
+                log(`watcher registration failed — the shared proxy may exit when its first owner does (${err instanceof Error ? err.message : String(err)})`);
+            }
+        }
         log(`proxy ${handle.attached ? "attached" : "started"} at ${handle.origin}${plan.action === "passthrough" ? " (passthrough — compression off)" : ""}`);
     } catch (err) {
         log(
