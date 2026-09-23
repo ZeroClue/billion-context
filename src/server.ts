@@ -3772,7 +3772,7 @@ function beginPreflightHold(res: http.ServerResponse, prepared: Prepared, log: (
 
 async function preflightCompressIfNeeded(
     prepared: Prepared,
-        runPrepare: () => Promise<Prepared>,
+    runPrepare: () => Promise<Prepared>,
     req: http.IncomingMessage,
     inboundBody: Buffer,
     res: http.ServerResponse,
@@ -3987,7 +3987,7 @@ async function preflightCompressIfNeeded(
     // #553) — the optimistic re-estimate is exactly what that regime distrusts.
     if (result.compressedRanges > 0) {
         log("info", `[${session.id}] preflight compressed ${result.compressedRanges} range(s), ~${result.savedTokens} tokens saved (${tokenCount} → ${session.stats.lastInputTokens}) in ${Date.now() - started}ms; rebuilding payload`);
-            const rebuilt = await runPrepare();
+        const rebuilt = await runPrepare();
         // runPrepare re-incremented stats.requests; the rebuild is internal
         // to this single client request.
         session.stats.requests -= 1;

@@ -381,7 +381,7 @@ export function executeImageFull(args: Record<string, unknown>, session: Session
     session.stats.imageFullCalls = (session.stats.imageFullCalls ?? 0) + 1;
     const parsed = parseImageFullInput(args, callId, (w) => loggerLog("info", `[acp-image] ${w}`));
     if (!parsed) {
-        return `${IMAGE_FULL_FAILURE_MARKER} invalid input — expected { ref: "mNNNNN" }]`;
+        return `${IMAGE_FULL_FAILURE_MARKER} invalid input — expected { ref: "mNNNNN" }`;
     }
     const wasRestored = isImageFullRestored(session.state, parsed.ref);
     const outcome = applyImageFull({ ref: parsed.ref, state: session.state, config });
