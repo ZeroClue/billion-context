@@ -159,7 +159,12 @@ function defaultProcReader(): ProcReader {
  *  and `node .../claude...` installs (`@anthropic-ai/claude-code` paths or a
  *  bare `claude` argument). Must NOT match this hook's own script
  *  (claude-native-bootstrap.js) or wrappers like `timeout 40 claude` /
- *  `sh -c ...` (their argv[0] is not claude). Exported for tests. */
+ *  `sh -c ...` (their argv[0] is not claude). The bare-`claude` node form can
+ *  false-positive on an unrelated `node /opt/claude`, but the walk is
+ *  bottom-up and the REAL claude sits 2 hops up in every session — a closer
+ *  match always wins, so a lookalike higher in the tree is unreachable.
+ *  Tightening it would instead break real `node ~/bin/claude` launcher
+ *  installs. Exported for tests. */
 export function isClaudeHostArgv(argv: string[]): boolean {
     const base = (p: string): string => {
         const parts = p.split(/[\\/]/).filter((seg) => seg.length > 0);
@@ -192,6 +197,38 @@ export function resolveClaudeHostPid(opts: { read?: ProcReader; startPid?: numbe
     return undefined;
 }
 
+/** Is this argv a shell running a `-c` one-shot (also `-lc`/`-ic` flag
+ *  clusters)? Such wrappers exit the moment their command does — claude's
+ *  SessionStart hook wrapper (`/bin/sh -c <hook>`) is exactly this shape.
+ *  Exported for tests. */
+export function isTransientShArgv(argv: string[]): boolean {
+    const parts = (argv[0] ?? "").split(/[\\/]/).filter((seg) => seg.length > 0);
+    const shell = parts[parts.length - 1] ?? "";
+    if (!/^(sh|bash|dash|zsh|ksh|ash)(\.exe)?$/i.test(shell)) return false;
+    return argv.some((arg, i) => i > 0 && /^-[^-]*c$/.test(arg));
+}
+
+/** The pid the spawned proxy's watchdog should watch. The resolved claude
+ *  host when the walk finds one. Otherwise: a SessionStart hook's direct
+ *  parent is always the transient `sh -c` wrapper — watching it re-arms the
+ *  2s self-kill — so fall back to ITS parent instead (in a real session that
+ *  is claude itself, even when an exotic install form went unrecognized);
+ *  when the direct parent is anything else (manual run under an interactive
+ *  shell) or unreadable, keep the legacy direct parent. Exported for tests
+ *  (inject `read` to stub the process table). */
+export function chooseWatchdogParentPid(opts: { read?: ProcReader; parentPid?: number } = {}): number {
+    const read = opts.read ?? defaultProcReader();
+    const host = resolveClaudeHostPid({ read });
+    if (host !== undefined) return host;
+    const parentPid = opts.parentPid ?? process.ppid;
+    const parentInfo = read(parentPid);
+    if (parentInfo !== null && parentInfo.argv !== null && isTransientShArgv(parentInfo.argv)) {
+        const grandPid = parentInfo.ppid;
+        if (grandPid !== null && grandPid > 1) return grandPid;
+    }
+    return parentPid;
+}
+
 async function run(): Promise<void> {
     const plan = planClaudeNativeBootstrap(process.env);
     if (plan.action === "exit") return;
@@ -199,15 +236,15 @@ async function run(): Promise<void> {
         // The direct parent is the transient `/bin/sh -c` wrapper claude used
         // to launch this hook — it exits with the hook, and a watchdog on it
         // killed a healthy proxy ~2s into every session. Watch the claude
-        // host itself; fall back to the direct parent only when the walk
-        // above cannot find it.
+        // host itself; when the walk cannot find it, chooseWatchdogParentPid
+        // degrades via the wrapper's parent instead of the wrapper.
         const handle = await ensureProxyRunning(
             {
                 host: LAUNCHER_DEFAULT_HOST,
                 port: plan.port,
                 passthrough: plan.action === "passthrough",
                 debug: false,
-                parentPid: resolveClaudeHostPid() ?? process.ppid,
+                parentPid: chooseWatchdogParentPid(),
                 strictPort: true,
             },
             { scriptPath: proxyScriptPath() },
