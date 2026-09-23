@@ -1566,7 +1566,18 @@ async function handle(
         // so a foreign session leaves no trace in this instance.
         if (artifactSeed) {
             const artifactKind = detectAcpArtifacts(bodyBuffer, parsed);
-            if (artifactKind !== null && !hasProcessedState(sessionId, { protocol })) {
+            // #1197: a cooperative plugin announces itself with x-bili-plugin —
+            // its protocol RE-SENDS bili's compression artifacts (the compress
+            // tool call + result live in the agent's own re-sent history by
+            // design), so content-shape evidence can never outrank that
+            // announcement. The #1086 fallback guards NON-cooperative clients
+            // chained behind a header-stripping middlebox; a plugin client that
+            // is ALSO double-chained through another bili AND had the hop header
+            // stripped is contrived, and weighing it against silently losing
+            // compression + /acp for every resumed plugin session (the #1197
+            // incident) says: process.
+            const pluginAnnounced = pluginAgentHeader(req.headers) !== undefined;
+            if (artifactKind !== null && !pluginAnnounced && !hasProcessedState(sessionId, { protocol })) {
                 if (!warnedChainSessions.has(sessionId)) {
                     warnedChainSessions.add(sessionId);
                     if (warnedChainSessions.size > WARNED_CHAIN_SESSION_CAP) {
