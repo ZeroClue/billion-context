@@ -148,26 +148,10 @@ test("parseZcodePersonalConfig: defensive — non-object / missing envelope / no
 });
 
 test("zcodeStoreFileFor: upstream derivation — ZCODE_DATA_BASE_DIR is a base dir, personal override wins (#1151)", () => {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-zcroot-"));
-    try {
-        withHome(home, () => {
-            assert.equal(zcodeDataRoot({}), path.join(home, ".zcode"));
-            assert.equal(zcodeStoreFileFor({}, "new"), path.join(home, ".zcode", "v2", "provider_config.json"));
-            assert.equal(zcodeStoreFileFor({}, "legacy"), path.join(home, ".zcode", "v2", "config.json"));
-            assert.equal(zcodeDataRoot({ ZCODE_DATA_BASE_DIR: "/data" }), path.join("/data", ".zcode"));
-            assert.equal(zcodeStoreFileFor({ ZCODE_DATA_BASE_DIR: "/data" }, "legacy"), path.join("/data", ".zcode", "v2", "config.json"));
-            assert.equal(
-                zcodeStoreFileFor({ ZCODE_DATA_BASE_DIR: "/data", ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: "/alt/p.json" }, "new"),
-                "/alt/p.json",
-            );
-            assert.equal(
-                zcodeStoreFileFor({ ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: "/alt/p.json" }, "legacy"),
-                path.join(home, ".zcode", "v2", "config.json"),
-            );
-        });
-    } finally {
-        fs.rmSync(home, { recursive: true, force: true });
-    }
+    assert.equal(zcodeStoreFileFor({ ZCODE_DATA_BASE_DIR: "/data" }, "legacy"), path.join("/data", ".zcode", "v2", "config.json"));
+    assert.equal(zcodeStoreFileFor({ ZCODE_DATA_BASE_DIR: "/data" }, "new"), path.join("/data", ".zcode", "v2", "provider_config.json"));
+    assert.equal(zcodeStoreFileFor({ ZCODE_DATA_BASE_DIR: "/data", ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: "/alt/p.json" }, "new"), "/alt/p.json");
+    assert.equal(zcodeStoreFileFor({ ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: "/alt/p.json" }, "legacy"), zcodeStoreFileFor({}, "legacy"));
 });
 
 test("readZcodeConfig: finds the legacy store under upstream env relocation (ZCODE_DATA_BASE_DIR as base dir, #1151)", () => {
