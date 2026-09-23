@@ -6,13 +6,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { acquireInFlight, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
 import { ABSORB_TOOL, ABSORB_TOOL_NAME, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_CONVERSATION_ID_PARAM, SEARCH_CONTEXT_TOOL_NAME } from "./compress-tool.js";
-import { effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
-import { effectiveRulesConfig } from "./rules-feature.js";
+import { absorbEnabled, effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
+import { effectiveRulesConfig, rulesEnabled } from "./rules-feature.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsMarkerLineText, containsRenderTagText, createMarkerLineFilter, createTagEchoFilter, mayStartMarkerLine, mayStartRenderTag, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
-import { ccrEnabled, contentStoreOf } from "./store.js";
+import { ccrEnabled, contentStoreOf, retrieveToolName } from "./store.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
 import { warnCacheCollapse } from "./cache-warn.js";
@@ -529,24 +529,27 @@ function withSearchContextConversationDescription(tools: unknown[]): unknown[] {
     });
 }
 
-export function handlePluginManifest(res: import("node:http").ServerResponse): void {
+export function handlePluginManifest(res: import("node:http").ServerResponse, config: Config): void {
+    // #1192: hosts register whatever the manifest serves verbatim (pi/omp/dsh/
+    // opencode native plugins, MCP shims), so advertising an opt-in tool this
+    // proxy's config leaves disabled guarantees a rejected call the moment the
+    // model uses it. Advertise absorb/acp_rule only when base-config enabled;
+    // per-request provider/model overrides may still differ (conservative: the
+    // manifest never advertises what the base config disables) and per-session
+    // enablement stays enforced at execution (isProxyToolFor / executeProxyTool).
+    const absorbOn = absorbEnabled(config);
+    const rulesOn = rulesEnabled(config);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         ok: true,
         protocolVersion: PLUGIN_PROTOCOL_VERSION,
         proxy: "billion-context",
         version: VERSION,
-        // Absorb and acp_rule are advertised alongside the four ACP tools.
-        // Both are host-registered opt-in (not in the kernel's
-        // ACP_TOOL_NAMES), so the manifest must list them explicitly.
-        // Per-session enablement is enforced at execution (isProxyToolFor /
-        // executeProxyTool), not here — the manifest has no request context to
-        // know which route will win.
-        toolNames: [...PROXY_TOOL_NAMES, ABSORB_TOOL_NAME, RULE_TOOL_NAME],
+        toolNames: [...PROXY_TOOL_NAMES, ...(absorbOn ? [ABSORB_TOOL_NAME] : []), ...(rulesOn ? [RULE_TOOL_NAME] : [])],
         tools: {
-            anthropic: withSearchContextConversationDescription([...BILI_ACP_TOOLS_ANTHROPIC, ABSORB_TOOL, RULE_TOOL].map(withConversationIdParam)),
-            openai: withSearchContextConversationDescription([...BILI_ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI, RULE_TOOL_OPENAI].map(withConversationIdParam)),
-            responses: withSearchContextConversationDescription([...BILI_ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES, RULE_TOOL_RESPONSES].map(withConversationIdParam)),
+            anthropic: withSearchContextConversationDescription([...BILI_ACP_TOOLS_ANTHROPIC, ...(absorbOn ? [ABSORB_TOOL] : []), ...(rulesOn ? [RULE_TOOL] : [])].map(withConversationIdParam)),
+            openai: withSearchContextConversationDescription([...BILI_ACP_TOOLS_OPENAI, ...(absorbOn ? [ABSORB_TOOL_OPENAI] : []), ...(rulesOn ? [RULE_TOOL_OPENAI] : [])].map(withConversationIdParam)),
+            responses: withSearchContextConversationDescription([...BILI_ACP_TOOLS_RESPONSES, ...(absorbOn ? [ABSORB_TOOL_RESPONSES] : []), ...(rulesOn ? [RULE_TOOL_RESPONSES] : [])].map(withConversationIdParam)),
         },
         headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER, maxOutput: PLUGIN_MAX_OUTPUT_HEADER, model: PLUGIN_MODEL_HEADER, instructionsMutable: PLUGIN_INSTRUCTIONS_MUTABLE_HEADER },
         toolEndpoint: "/__bili/plugin/tool",
@@ -595,6 +598,18 @@ function resolveConversation(conversationId: string): { session: Session | undef
         if (session) recordPluginSession(conversationId, session.id);
     }
     return { session, entry };
+}
+
+/** #1192: model-facing explanation for an opt-in tool the host registered but
+ *  this session's effective config has disabled. Returns undefined when the
+ *  name is not one of the known opt-in tools (a truly unknown tool keeps the
+ *  generic 400 with its allowed list). */
+function disabledOptionalToolNote(tool: string, session: Session, config: Config): string | undefined {
+    const absorbName = effectiveAbsorbConfig(session, config)?.toolName ?? ABSORB_TOOL_NAME;
+    if (tool === absorbName) return `${tool} is not enabled on this bili proxy (compress.absorb.enabled is not true) — nothing was absorbed.`;
+    if (tool === RULE_TOOL_NAME) return `${tool} is not enabled on this bili proxy (compress.rules.enabled is not true) — nothing was recorded.`;
+    if (!ccrEnabled(session) && tool === retrieveToolName(session)) return `${tool} is not enabled on this bili proxy (compress.ccr.enabled is not true) — nothing was retrieved.`;
+    return undefined;
 }
 
 /** Context-level visibility for plugin UIs (status bars / slash commands):
@@ -772,6 +787,17 @@ export async function handlePluginTool(
     // Absorb/rules enablement is per-session (last resolved config), so the
     // gate needs the session — it runs after the lookup above.
     if (!isProxyToolFor(tool, session, deps.config)) {
+        // #1192: a known opt-in tool disabled by this session's effective config
+        // (registered from a manifest served while it was enabled) answers with
+        // model-facing text on the same channel executeRule/executeAbsorb use
+        // for failures — a hard 400 would surface as an unfixable red error card.
+        const note = disabledOptionalToolNote(tool, session, deps.config);
+        if (note !== undefined) {
+            deps.log("info", `[${session.id}] [plugin] ${tool} called but disabled — replied with explanation`);
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, result: note }));
+            return;
+        }
         const allowed = [...PROXY_TOOL_NAMES];
         const absorb = effectiveAbsorbConfig(session, deps.config);
         if (absorb?.enabled === true) allowed.push(absorb.toolName ?? ABSORB_TOOL_NAME);
