@@ -605,9 +605,15 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // path themselves when it disappears (≤2s after the parent exits).
     // #7: the watch is a SET — attached sessions register their host via
     // POST /__bili__/watcher — so shutdown fires only when every owner is
-    // gone. A single-owner proxy still reports the historical
-    // `parent-gone (pid N)` reason; multi-owner deaths log `watchers-gone`.
+    // gone. The empty set must persist through WATCHER_IDLE_GRACE_MS first:
+    // a spawner that exits right after a second session launches would
+    // otherwise kill the proxy before the attacher's registration lands
+    // (observed live: spawner died 1s into the second session). A single-
+    // owner proxy still reports the historical `parent-gone (pid N)` reason;
+    // multi-owner deaths log `watchers-gone`.
     if (initialWatcherPid !== null) {
+        let idleSince: number | null = null;
+        let lastDead: number[] = [];
         const watcher = setInterval(() => {
             const dead: number[] = [];
             for (const pid of proxyWatchers) {
@@ -616,8 +622,17 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                     dead.push(pid);
                 }
             }
-            if (proxyWatchers.size === 0) {
-                const reason = dead.length === 1 && dead[0] === initialWatcherPid ? `parent-gone (pid ${dead[0]})` : `watchers-gone (pids: ${dead.join(", ")})`;
+            if (dead.length > 0) lastDead = dead;
+            if (proxyWatchers.size > 0) {
+                idleSince = null;
+                return;
+            }
+            if (idleSince === null) {
+                idleSince = Date.now();
+                return;
+            }
+            if (Date.now() - idleSince >= WATCHER_IDLE_GRACE_MS) {
+                const reason = lastDead.length === 1 && lastDead[0] === initialWatcherPid ? `parent-gone (pid ${lastDead[0]})` : `watchers-gone (pids: ${lastDead.join(", ")})`;
                 shutdown(reason);
             }
         }, 2_000);
@@ -735,6 +750,12 @@ function adminTrustedHosts(bindHost: string, port: number): Set<string> {
 // #924: one-time-per-model log for the output-budget fallback (request carries
 // no budget → configured/registry max output) — same pattern as windowSourceLogged.
 const headroomFallbackLogged = new Set<string>();
+
+// #7: how long the shared-proxy watchdog stays up after its LAST watcher
+// died. Long enough for a second session's registration to land when the
+// spawner exits immediately after it starts; short enough that an abandoned
+// proxy still disappears promptly.
+const WATCHER_IDLE_GRACE_MS = 5_000;
 
 async function handle(
     req: http.IncomingMessage,

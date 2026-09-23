@@ -999,9 +999,13 @@ test("watcher route: shared proxies take watcher registrations, daemons refuse (
     const origin = `http://127.0.0.1:${port}`;
     const post = (body: unknown) => fetch(`${origin}/__bili__/watcher`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     // Keeper: a live pid the armed proxy watches. Its death must take the
-    // proxy down (the sweep side of the set watchdog).
+    // proxy down (the sweep side of the set watchdog). A second keeper pins
+    // the idle GRACE: registering within WATCHER_IDLE_GRACE_MS of the last
+    // death cancels the pending shutdown.
     const keeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 60000)"], { stdio: "ignore" });
     const keeperPid = keeper.pid ?? 0;
+    const keeper2 = spawn(process.execPath, ["-e", "setInterval(() => {}, 60000)"], { stdio: "ignore" });
+    const keeper2Pid = keeper2.pid ?? 0;
     const baseEnv = {
         PATH: process.env.PATH ?? "/usr/bin:/bin",
         HOME: xdg.home,
@@ -1024,8 +1028,19 @@ test("watcher route: shared proxies take watcher registrations, daemons refuse (
         assert.equal(ok.status, 200, "live pid accepted");
         assert.match(JSON.stringify(await ok.json()), /"ok":true/, "ok:true body");
 
-        // Registered keeper dies → armed proxy must follow (≤ a few ticks).
+        // Grace: keeper1 dies, and BEFORE the idle grace expires a new owner
+        // registers (the live race: spawner exits right after a second session
+        // starts). The pending shutdown must be cancelled — the proxy stays up
+        // well past the grace window.
         if (keeperPid > 1) killPid(keeperPid);
+        await new Promise((r) => setTimeout(r, 3000));
+        const late = await post({ pid: keeper2Pid });
+        assert.equal(late.status, 200, "late registration within the grace window accepted");
+        await new Promise((r) => setTimeout(r, 7000));
+        assert.ok(await canConnect(port), "grace registration cancelled the pending shutdown");
+
+        // LAST owner dies → armed proxy must follow (≤ a few ticks + grace).
+        if (keeper2Pid > 1) killPid(keeper2Pid);
         const deadline = Date.now() + 15_000;
         while (Date.now() < deadline && (await canConnect(port))) await new Promise((r) => setTimeout(r, 250));
         assert.equal(await canConnect(port), false, "armed proxy exits when its watcher dies");
@@ -1039,6 +1054,7 @@ test("watcher route: shared proxies take watcher registrations, daemons refuse (
         assert.ok(await canConnect(port), "daemon stays up — no watchdog got armed");
     } finally {
         if (keeperPid > 1) killPid(keeperPid);
+        if (keeper2Pid > 1) killPid(keeper2Pid);
         if (armed > 1) killPid(armed);
         if (daemon > 1) killPid(daemon);
         await rmHome(home);
