@@ -2821,6 +2821,7 @@ function prepareGoogle(
         // usage reports are post-fold reality, drop the credit.
         session.stats.compressCreditTokens = 0;
         storeEffectiveAbsorb(session, loopConfig);
+        storeEffectiveRules(session, config);
         turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
         // Drop sub-viability fragments before any consumer sees them (the
         // kernel validates a compress batch atomically).
