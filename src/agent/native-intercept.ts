@@ -57,6 +57,11 @@ export interface NativeInterceptState {
 
 const INTERCEPT_FLAG = "__biliNativeFetchIntercept";
 
+/** #1158 self-heal: the property descriptor captured before we installed the
+ *  guarded accessor, so _resetForTest can restore a plain writable data
+ *  property. Undefined before the first install in a process. */
+let preInstallDesc: PropertyDescriptor | undefined;
+
 // Model-API endpoint suffixes across the wires bili proxies: Anthropic
 // `/v1/messages`, OpenAI chat `/v1/chat/completions` (and legacy
 // `/v1/completions`), Responses `/v1/responses`, Mistral
@@ -286,6 +291,8 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
     const g = globalThis as Record<string, unknown>;
     if (g[INTERCEPT_FLAG] === true) return false;
     const orig = globalThis.fetch;
+    // Shared across every re-armed chain link (a re-arm replaces the chain
+    // top but must not forget what this process already learned).
     let warned = false;
     // Origins verified dead-and-replaced during a runtime recovery (#1130).
     // Launcher settings overlays bake the origin into request URLs, so after
@@ -293,7 +300,9 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
     // network again. Only ever contains origins we ourselves observed dying.
     const replacedOrigins = new Set<string>();
 
-    const patched = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const makeChain = (downstream: typeof globalThis.fetch) => {
+        const patched = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+        const orig = downstream;
         const url = fetchUrlOf(input);
         if (url === undefined) return orig(input, init);
         // Rebuild a Request-object input against a different target. A
@@ -446,7 +455,42 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
         }
     };
 
-    globalThis.fetch = patched as typeof globalThis.fetch;
+        return patched as typeof globalThis.fetch;
+    };
+
+    // #1158 self-heal re-arm: dsh-http-proxy (0.1.3) re-applies by writing its
+    // module-load-time frozen originalFetch over globalThis.fetch, silently
+    // un-routing every model request away from bili while the session keeps
+    // working (observed live on Windows). Guard the property instead of
+    // trusting the assignment to survive: any third-party install becomes
+    // our downstream and model traffic keeps routing through bili.
+    const desc = Object.getOwnPropertyDescriptor(globalThis, "fetch");
+    let rearmCount = 0;
+    const REARM_LIMIT = 16;
+    let top = makeChain(orig);
+    if (desc === undefined || desc.configurable) {
+        preInstallDesc = desc;
+        Object.defineProperty(globalThis, "fetch", {
+            configurable: true,
+            enumerable: desc?.enumerable ?? true,
+            get: () => top,
+            set: (v: unknown) => {
+                if (typeof v !== "function" || v === top) return;
+                if (rearmCount >= REARM_LIMIT) {
+                    // A fighting patch (two self-healers) would loop forever;
+                    // past the limit stop guarding and let the winner stand.
+                    top = v as typeof globalThis.fetch;
+                    return;
+                }
+                rearmCount += 1;
+                top = makeChain(v as typeof globalThis.fetch);
+            },
+        });
+    } else {
+        // Non-configurable host property: keep the classic direct install
+        // (no guard, the old behavior).
+        globalThis.fetch = top;
+    }
     g[INTERCEPT_FLAG] = true;
     return true;
 }
@@ -456,4 +500,9 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
 export function _resetForTest(): void {
     const g = globalThis as Record<string, unknown>;
     delete g[INTERCEPT_FLAG];
+    if (preInstallDesc !== undefined) {
+        const d = preInstallDesc;
+        preInstallDesc = undefined;
+        Object.defineProperty(globalThis, "fetch", { ...d, configurable: true });
+    }
 }
