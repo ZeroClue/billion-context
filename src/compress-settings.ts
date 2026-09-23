@@ -1,4 +1,4 @@
-import { DEFAULT_ABSORB_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type AbsorbConfig, type Config, type PackSurface, type Prompts } from "acp-kernel";
+import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type PackSurface, type Prompts } from "acp-kernel";
 import * as path from "node:path";
 import { findRoute, type CompressSettings, type ProviderRoutes } from "./config.js";
 import { configDir } from "./paths.js";
@@ -59,7 +59,7 @@ export function mergeCompress(
     // like `prompts`: a model-level minToolTokens must not discard a
     // provider-level excludeTools.
     const absorbLevels = [global?.absorb, provider?.absorb, model?.absorb].filter(Boolean) as NonNullable<CompressSettings["absorb"]>[];
-    const storeLevels = [global?.store, provider?.store, model?.store].filter(Boolean) as NonNullable<CompressSettings["store"]>[];
+    const ccrLevels = [global?.ccr, provider?.ccr, model?.ccr].filter(Boolean) as NonNullable<CompressSettings["ccr"]>[];
     const reasoningLevels = [global?.reasoning, provider?.reasoning, model?.reasoning].filter(Boolean) as NonNullable<CompressSettings["reasoning"]>[];
     const reasoningGuardLevels = [global?.reasoningGuard, provider?.reasoningGuard, model?.reasoningGuard].filter(Boolean) as NonNullable<CompressSettings["reasoningGuard"]>[];
     return {
@@ -77,7 +77,7 @@ export function mergeCompress(
         prompts: promptLevels.length > 0 ? Object.assign({}, ...promptLevels) : undefined,
         acknowledgePromptsRisk: pick("acknowledgePromptsRisk"),
         absorb: absorbLevels.length > 0 ? Object.assign({}, ...absorbLevels) : undefined,
-        store: storeLevels.length > 0 ? Object.assign({}, ...storeLevels) : undefined,
+        ccr: ccrLevels.length > 0 ? Object.assign({}, ...ccrLevels) : undefined,
         rules: pick("rules"),
 
 stripImages: pick("stripImages"),
@@ -212,7 +212,11 @@ export function hasCompressSettings(s: CompressSettings): boolean {
   *    fully). Absent `s.absorb` leaves `base.absorb` untouched — the feature
   *    stays off unless some level enables it.
   *  - `rules` → `rules = { enabled }` (kernel RuleFeatureConfig; limits stay
-  *    at kernel defaults). Absent `s.rules` leaves `base.rules` untouched. */
+  *    at kernel defaults). Absent `s.rules` leaves `base.rules` untouched.
+  *  - `ccr` → `ccr` (kernel CcrConfig, acp-kernel >= 0.0.84; the kernel runs
+  *    the ccr-store node inside processTurn between prune and absorb).
+  *    Unset fields inherit DEFAULT_CCR_CONFIG. Absent `s.ccr` leaves
+  *    `base.ccr` untouched — the feature stays off unless some level enables it. */
 export function applyCompressSettings(base: Config, limit: number, s: CompressSettings): Config {
     const nudge = { ...base.nudge };
     const truncate = { ...base.truncate };
@@ -239,6 +243,17 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
             excludeTools: s.absorb.excludeTools ?? [...d.excludeTools],
         };
     }
+    let ccr: CcrConfig | undefined;
+    if (s.ccr !== undefined) {
+        const d = DEFAULT_CCR_CONFIG;
+        ccr = {
+            enabled: s.ccr.enabled === true,
+            toolName: s.ccr.toolName ?? d.toolName,
+            minToolTokens: s.ccr.minToolTokens ?? d.minToolTokens,
+            excludeTools: s.ccr.excludeTools ?? [...d.excludeTools],
+            maxHeadChars: s.ccr.maxHeadChars ?? d.maxHeadChars,
+        };
+    }
     return {
         ...base,
         modelContextLimit: limit,
@@ -254,6 +269,7 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         protectedLatestTools: s.protectedLatestTools ?? base.protectedLatestTools,
         protectedTools: s.protectedTools ?? base.protectedTools,
         ...(absorb !== undefined ? { absorb } : {}),
+        ...(ccr !== undefined ? { ccr } : {}),
         ...(s.rules !== undefined ? { rules: { enabled: s.rules === true } } : {}),
     };
 }

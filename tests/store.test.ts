@@ -1,24 +1,29 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { applyAbsorb, createCore, createInitialState, defaultConfig, type CoreMessage } from "acp-kernel";
 import {
-    applyStoreView,
-    effectiveStoreConfig,
-    ensureStored,
-    executeRetrieve,
-    storeEffectiveStore,
-} from "../src/store.ts";
+    buildStoredPlaceholder,
+    createCore,
+    createInitialState,
+    DEFAULT_CCR_CONFIG,
+    defaultConfig,
+    STORED_PLACEHOLDER_MARKER,
+    type CoreMessage,
+    type MessageContentStore,
+} from "acp-kernel";
+import { parseCompressSettings } from "../src/config.ts";
+import { applyCompressSettings, mergeCompress } from "../src/compress-settings.ts";
+import { adoptContentStore, drainPendingRetrievals, executeRetrieve, retrieveToolName, storeEffectiveCcr, contentStoreOf } from "../src/store.ts";
 import { RETRIEVE_TOOL_NAME } from "../src/compress-tool.ts";
-import { getSession, type Session } from "../src/session.ts";
+import { getSession } from "../src/session.ts";
+import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 
-// Route every sidecar write to a throwaway dir and disable session-file
-// persistence so these unit tests never touch the real data/state trees.
-const STORE_TMP = mkdtempSync(path.join(tmpdir(), "bili-store-test-"));
-process.env.BILI_STORE_DIR = STORE_TMP;
+// Unit tests never touch the real data/state trees: persistence off by
+// default; the envelope round-trip builds its own throwaway SessionStore.
 process.env.BILI_PERSIST = "0";
+const PERSIST_TMP = mkdtempSync(path.join(tmpdir(), "bili-ccr-persist-"));
 
 const BIG_TEXT = "line of build output ".repeat(700);
 
@@ -30,102 +35,163 @@ function toolResult(): CoreMessage[] {
     ];
 }
 
-// Build a session whose messageRefs map the tool-result raw id to a kernel ref,
-// mirroring the live pipeline (processTurn assigns the refs we later cite).
-function makeSession(withStore: boolean): { session: Session; ref: string } {
-    const session = getSession(`t-store-${Math.random().toString(36).slice(2)}`);
+function ccrConfig() {
+    return applyCompressSettings(defaultConfig(200000), 200_000, {
+        absorb: { enabled: true, minToolTokens: 50 },
+        ccr: { enabled: true, minToolTokens: 50 },
+    });
+}
+
+function turnWith(cfg: ReturnType<typeof applyCompressSettings>, store?: MessageContentStore) {
     const core = createCore();
-    const turn = core.processTurn({ messages: toolResult(), state: createInitialState(), config: defaultConfig(200000), tokenCount: 0, renderTags: "text-only" });
-    session.state.messageRefs = turn.state.messageRefs;
-    const ref = Object.entries(turn.state.messageRefs.byRef ?? {}).find(([, raw]) => raw === "t-res")?.[0] ?? "";
-    storeEffectiveStore(session, withStore ? { enabled: true, minTokens: 500 } : { enabled: false });
-    return { session, ref };
+    return core.processTurn({ messages: toolResult(), state: createInitialState(), config: cfg, tokenCount: 0, renderTags: "text-only", ...(store ? { contentStore: store } : {}) });
 }
 
-function findSidecar(hash: string): string | null {
-    for (const d of readdirSync(STORE_TMP)) {
-        const p = path.join(STORE_TMP, d, `${hash}.txt`);
-        if (existsSync(p)) return p;
-    }
-    return null;
-}
+test("parseCompressSettings: ccr key validates shape and types", () => {
+    const okFull = parseCompressSettings({
+        ccr: { enabled: true, minToolTokens: 500, excludeTools: ["webfetch"], toolName: "fetch_original", maxHeadChars: 64 },
+    });
+    assert.ok(okFull);
+    assert.deepEqual(okFull.ccr, { enabled: true, minToolTokens: 500, excludeTools: ["webfetch"], toolName: "fetch_original", maxHeadChars: 64 });
 
-test("effectiveStoreConfig reflects the stamped policy", () => {
-    assert.equal(effectiveStoreConfig(makeSession(false).session)?.enabled, false);
-    assert.equal(effectiveStoreConfig(makeSession(true).session)?.enabled, true);
-    assert.equal(effectiveStoreConfig(undefined), undefined);
+    // toolName is trimmed; empty after trim is invalid
+    assert.equal(parseCompressSettings({ ccr: { toolName: "  lookup  " } }).ccr?.toolName, "lookup");
+    assert.equal(parseCompressSettings({ ccr: { toolName: "   " } }), undefined);
+    // wrong types reject the whole settings block (fail loudly, #155)
+    assert.equal(parseCompressSettings({ ccr: { enabled: "yes" } }), undefined);
+    assert.equal(parseCompressSettings({ ccr: { minToolTokens: "500" } }), undefined);
+    assert.equal(parseCompressSettings({ ccr: { maxHeadChars: NaN } }), undefined);
+    assert.equal(parseCompressSettings({ ccr: { excludeTools: [42] } }), undefined);
+    assert.equal(parseCompressSettings({ ccr: { excludeTools: "webfetch" } }), undefined);
+    assert.equal(parseCompressSettings({ ccr: "on" }), undefined);
 });
 
-test("ensureStored: stores large content once, idempotent, skips small/disabled", () => {
-    const { session, ref } = makeSession(true);
-    const e1 = ensureStored(session, ref, BIG_TEXT, "bash");
-    assert.ok(e1 && e1.tokens > 500 && e1.bytes > 0);
-    assert.equal(e1!.hash.length, 40);
-    assert.equal(ensureStored(session, ref, BIG_TEXT, "bash"), e1);
-    assert.equal(ensureStored(session, "m00002", "tiny", "bash"), null);
-    assert.equal(ensureStored(makeSession(false).session, ref, BIG_TEXT, "bash"), null);
+test("mergeCompress: ccr merges sub-field-wise across the three levels", () => {
+    const global = parseCompressSettings({ ccr: { enabled: true, excludeTools: ["webfetch"] } })!;
+    const model = parseCompressSettings({ ccr: { minToolTokens: 200 } })!;
+    const merged = mergeCompress(global, undefined, model);
+    assert.deepEqual(merged.ccr, { enabled: true, minToolTokens: 200, excludeTools: ["webfetch"] });
+
+    // a deeper level can override a scalar without clobbering siblings
+    const provider = parseCompressSettings({ ccr: { toolName: "lookup" } })!;
+    const merged2 = mergeCompress(global, provider, model);
+    assert.deepEqual(merged2.ccr, { enabled: true, minToolTokens: 200, excludeTools: ["webfetch"], toolName: "lookup" });
+
+    assert.equal(mergeCompress(undefined, undefined, undefined).ccr, undefined);
 });
 
-test("applyStoreView replaces the oversized tool result with a stable placeholder, pairing intact", () => {
-    const { session, ref } = makeSession(true);
-    const out = applyStoreView(toolResult(), session);
-    const res = out.find((m) => m.id === "t-res")!;
-    assert.match(res.text!, new RegExp(`stored #${ref}`));
-    assert.match(res.text!, new RegExp(RETRIEVE_TOOL_NAME));
+test("applyCompressSettings: maps ccr onto kernel CcrConfig with DEFAULT_CCR_CONFIG defaults", () => {
+    const base = defaultConfig(200000);
+    const out = applyCompressSettings(base, 200_000, { ccr: { enabled: true, minToolTokens: 200 } });
+    assert.deepEqual(out.ccr, { ...DEFAULT_CCR_CONFIG, minToolTokens: 200, enabled: true });
+    // absent block leaves base.ccr untouched (kernel default = feature off)
+    const untouched = applyCompressSettings(base, 200_000, {});
+    assert.equal(untouched.ccr, base.ccr);
+});
+
+test("integration: kernel processTurn ID-references the oversized tool result (ccr+absorb enabled)", () => {
+    const cfg = ccrConfig();
+    const turn = turnWith(cfg);
+    const res = turn.messages.find((m) => m.role === "tool" && m.toolCallId === "call_1")!;
+    assert.ok(res, "tool-result message survived the turn");
     assert.notEqual(res.text, BIG_TEXT);
-    assert.equal(res.role, "tool");
-    assert.equal(res.contentType, "tool-result");
-    assert.equal(res.toolCallId, "call_1");
-    assert.equal(out.find((m) => m.id === "a-tc")!.text, JSON.stringify({ command: "npm run build" }));
-    const again = applyStoreView(toolResult(), session);
-    assert.equal(again.find((m) => m.id === "t-res")!.text, res.text);
+    assert.ok(res.text!.includes(STORED_PLACEHOLDER_MARKER), `placeholder expected: ${res.text!.slice(0, 160)}`);
+    const ref = Object.keys(turn.contentStore.byRef)[0]!;
+    assert.ok(res.text!.includes(ref), "placeholder cites the stored ref");
+    assert.ok(res.text!.includes(RETRIEVE_TOOL_NAME), "placeholder names the retrieve tool");
+    assert.equal(turn.contentStore.byRef[ref]!.rawId, "t-res");
+    assert.equal(Object.keys(turn.contentStore.byHash).length, 1);
+    // tool-call pairing survives substitution
+    assert.equal(turn.messages.find((m) => m.id === "a-tc")!.text, JSON.stringify({ command: "npm run build" }));
 });
 
-test("applyStoreView is a no-op when the store is disabled", () => {
-    const { session } = makeSession(false);
-    const out = applyStoreView(toolResult(), session);
-    assert.equal(out.find((m) => m.id === "t-res")!.text, BIG_TEXT);
+test("integration: ccr off → byte-identical pass-through", () => {
+    const cfg = applyCompressSettings(defaultConfig(200000), 200_000, {});
+    assert.notEqual(cfg.ccr?.enabled, true);
+    const turn = turnWith(cfg);
+    const res = turn.messages.find((m) => m.role === "tool" && m.toolCallId === "call_1")!;
+    assert.equal(res.text, BIG_TEXT);
+    assert.equal(Object.keys(turn.contentStore.byRef).length, 0);
 });
 
-test("executeRetrieve round-trips the original; a bad ref self-corrects", () => {
-    const { session, ref } = makeSession(true);
-    ensureStored(session, ref, BIG_TEXT, "bash");
-    const got = executeRetrieve({ ref }, session);
-    assert.ok(got.includes(BIG_TEXT.slice(0, 80)));
+test("executeRetrieve: hit queues injection + ack, miss self-corrects, tool name follows config", () => {
+    const session = getSession(`t-ccr-${Math.random().toString(36).slice(2)}`);
+    storeEffectiveCcr(session, { enabled: true, toolName: "lookup", minToolTokens: 50 });
+    assert.equal(retrieveToolName(session), "lookup");
+    adoptContentStore(session, turnWith(ccrConfig()).contentStore);
+    const ref = Object.keys(session.contentStore!.byRef)[0]!;
+
+    const ack = executeRetrieve({ ref }, session);
+    assert.match(ack, new RegExp(`retrieved ${ref}: [\\d,]+ tok`));
     assert.equal(session.stats.retrieveCalls, 1);
     assert.equal(session.stats.retrieveHits, 1);
+    const injections = drainPendingRetrievals(session);
+    assert.equal(injections.length, 1);
+    assert.equal(injections[0]!.id, `acp_retrieved_${ref}`);
+    assert.ok(injections[0]!.text.includes(BIG_TEXT.slice(0, 80)), "injection carries the full original");
+    assert.equal(drainPendingRetrievals(session).length, 0);
+
     const miss = executeRetrieve({ ref: "m99999" }, session);
     assert.match(miss, /not found/);
     assert.equal(session.stats.retrieveMisses, 1);
     assert.equal(session.stats.retrieveCalls, 2);
+    assert.equal(drainPendingRetrievals(session).length, 0, "a miss queues nothing");
+    // malformed arg is a miss, not a crash
+    assert.match(executeRetrieve({}, session), /ref/);
+    assert.equal(session.stats.retrieveMisses, 2);
 });
 
-test("sidecar is written to disk under storeDir and the index lands in session.metadata", () => {
-    const { session, ref } = makeSession(true);
-    const e = ensureStored(session, ref, BIG_TEXT, "bash")!;
-    const file = findSidecar(e.hash);
-    assert.ok(file, "sidecar file was written under storeDir");
-    assert.equal(readFileSync(file!, "utf8"), BIG_TEXT);
-    const idx = session.metadata.storeIndex as Record<string, { hash: string }>;
-    assert.equal(idx[ref].hash, e.hash);
-    assert.ok(!JSON.stringify(idx).includes(BIG_TEXT.slice(0, 40)), "index holds metadata only, never payload bytes");
+test("buildStoredPlaceholder renders the kernel wire format the gates assert on", () => {
+    const text = buildStoredPlaceholder({ ref: "m00423", kind: "shell output", tokens: 4213, head: "npm run build", command: "npm run build", retrieveToolName: RETRIEVE_TOOL_NAME });
+    assert.ok(text.includes("[acp-stored #m00423"));
+    assert.ok(text.includes("shell output"));
+    assert.ok(text.includes("4,213 tok"));
+    assert.ok(text.includes(`${RETRIEVE_TOOL_NAME}("m00423")`), "placeholder tells the model how to retrieve");
+    assert.ok(text.includes("npm run build"));
 });
 
-test("absorbing a stored item keeps its original retrievable", () => {
-    const { session, ref } = makeSession(true);
-    const substituted = applyStoreView(toolResult(), session);
-    assert.match(substituted.find((m) => m.id === "t-res")!.text!, new RegExp(`stored #${ref}`));
-    const outcome = applyAbsorb({
-        ref,
-        summary: "build succeeded in 3s",
-        absorbCallId: undefined,
-        messages: toolResult(),
-        state: session.state,
-        config: { ...defaultConfig(200000), absorb: { enabled: true } },
-    });
-    session.state = outcome.state;
-    assert.equal(outcome.ok, true, `absorb should succeed: ${outcome.resultText}`);
-    const got = executeRetrieve({ ref }, session);
-    assert.ok(got.includes(BIG_TEXT.slice(0, 80)), "retrieve returns the full original");
-    assert.ok(!got.includes("build succeeded in 3s"), "retrieve returns the original, not the digest");
+test("envelope round-trip: dirty flag gates the write; reload restores the store", () => {
+    const store = new SessionStore({ dir: PERSIST_TMP, debounceMs: 0 });
+    _setStoreForTest(store);
+    try {
+        const session = getSession(`ccr-rt-${Math.random().toString(36).slice(2)}`);
+        storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
+        adoptContentStore(session, turnWith(ccrConfig()).contentStore);
+        const ref = Object.keys(session.contentStore!.byRef)[0]!;
+
+        // clean store → no envelope write
+        session.contentStoreDirty = false;
+        store.flushSync(session);
+        assert.equal(findEnvelope(PERSIST_TMP), null, "clean store must not write the envelope");
+
+        // dirty → written; round-trip restores it verbatim
+        session.contentStoreDirty = true;
+        assert.ok(store.flushSync(session));
+        const file = findEnvelope(PERSIST_TMP);
+        assert.ok(file, "content-store.json written under the session dir");
+        const fresh = getSession(session.id);
+        const loaded = contentStoreOf(fresh);
+        assert.equal(loaded.byRef[ref]!.rawId, "t-res");
+        assert.equal(loaded.byHash[loaded.byRef[ref]!.hash], BIG_TEXT);
+
+        // rebase reset: store cleared + dirty → file deleted
+        session.contentStore = undefined;
+        session.contentStoreDirty = true;
+        store.flushSync(session);
+        assert.equal(findEnvelope(PERSIST_TMP), null, "emptied store deletes the envelope");
+    } finally {
+        _setStoreForTest(new SessionStore({ enabled: false }));
+        rmSync(PERSIST_TMP, { recursive: true, force: true });
+    }
 });
+
+function findEnvelope(root: string): string | null {
+    for (const d of readdirSync(root)) {
+        const p = path.join(root, d);
+        if (!statSync(p).isDirectory()) continue;
+        for (const f of readdirSync(p)) {
+            if (f.endsWith(".content-store.json")) return path.join(p, f);
+        }
+    }
+    return null;
+}

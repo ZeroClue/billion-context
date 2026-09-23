@@ -13,6 +13,7 @@
 import {
     parseCompressArgs,
     ABSORB_TOOL_OPENAI,
+    RETRIEVE_TOOL_NAME,
     RULE_TOOL_NAME,
     SEARCH_CONTEXT_TOOL,
     SEARCH_CONTEXT_TOOL_GOOGLE,
@@ -150,24 +151,31 @@ export const RULE_TOOL_RESPONSES = { type: "function" as const, name: RULE_TOOL_
 export const RULE_TOOL_GOOGLE = { name: RULE_TOOL_NAME, description: RULE_TOOL_DESCRIPTION, parameters: RULE_PARAM_SCHEMA };
 
 // #1097: acp_retrieve — resolve a stored ID-referenced message back to its full
-// original. Host-registered opt-in (no kernel const); synthesized in all four
+// original. Kernel-owned tool (RETRIEVE_TOOL_NAME); synthesized in all four
 // wire shapes here so every injection point (wire helpers, plugin manifest)
 // serves one definition. Takes a single `ref` (the mNNNNN id printed in the
-// [stored] placeholder). Read-only with respect to context: the fetched content
+// [acp-stored] placeholder). Read-only with respect to context: the fetched content
 // rides the ephemeral tool-result channel and consumes no message ref.
-const RETRIEVE_TOOL_DESCRIPTION = "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [stored #m00423 · bash · 4213 tok] \\\"npm run build\\\" → acp_retrieve(\\\"m00423\\\")\". Call this with that ref to read the complete original back into context. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.";
+const RETRIEVE_TOOL_DESCRIPTION = "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.";
 const RETRIEVE_PARAM_SCHEMA = {
-    type: "object",
+    type: "object" as const,
     properties: {
-        ref: { type: "string", description: "The stored message id to retrieve (an mNNNNN ref from a [stored] placeholder)." },
+        ref: { type: "string", description: "The stored message id to retrieve (an mNNNNN ref from an [acp-stored] placeholder)." },
     },
     required: ["ref"],
 };
-export const RETRIEVE_TOOL_NAME = "acp_retrieve";
-export const RETRIEVE_TOOL = { name: RETRIEVE_TOOL_NAME, description: RETRIEVE_TOOL_DESCRIPTION, input_schema: RETRIEVE_PARAM_SCHEMA };
-export const RETRIEVE_TOOL_OPENAI = { type: "function" as const, function: { name: RETRIEVE_TOOL_NAME, description: RETRIEVE_TOOL_DESCRIPTION, parameters: RETRIEVE_PARAM_SCHEMA } };
-export const RETRIEVE_TOOL_RESPONSES = { type: "function" as const, name: RETRIEVE_TOOL_NAME, description: RETRIEVE_TOOL_DESCRIPTION, parameters: RETRIEVE_PARAM_SCHEMA };
-export const RETRIEVE_TOOL_GOOGLE = { name: RETRIEVE_TOOL_NAME, description: RETRIEVE_TOOL_DESCRIPTION, parameters: RETRIEVE_PARAM_SCHEMA };
+export { RETRIEVE_TOOL_NAME };
+/** Wire tool shapes for the retrieve tool; name follows the session's resolved
+ *  `ccr.toolName` (default acp_retrieve) so registration, dispatch, and the
+ *  kernel placeholder hint all agree. */
+export function retrieveToolsFor(name: string) {
+    return {
+        anthropic: { name, description: RETRIEVE_TOOL_DESCRIPTION, input_schema: RETRIEVE_PARAM_SCHEMA },
+        openai: { type: "function" as const, function: { name, description: RETRIEVE_TOOL_DESCRIPTION, parameters: RETRIEVE_PARAM_SCHEMA } },
+        responses: { type: "function" as const, name, description: RETRIEVE_TOOL_DESCRIPTION, parameters: RETRIEVE_PARAM_SCHEMA },
+        google: { name, description: RETRIEVE_TOOL_DESCRIPTION, parameters: RETRIEVE_PARAM_SCHEMA },
+    };
+}
 
 export function parseCompressInput(input: unknown, callId?: string) {
     const parsed = parseCompressArgs(input, { callId });

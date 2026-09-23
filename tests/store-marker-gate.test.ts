@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { once } from "node:events";
@@ -8,18 +7,19 @@ import test from "node:test";
 
 process.env.NODE_ENV = "test";
 
-import { defaultConfig } from "acp-kernel";
+import { buildStoredPlaceholder, defaultConfig, RETRIEVE_TOOL_NAME } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
-// [#1097] The store must never emit a placeholder the model cannot retrieve.
-// The responses text/marker protocol declares only the readonly ACP tools (no
-// native tool channel for acp_retrieve), so an armed store there would silently
-// lose oversized tool results. These tests pin the gate at the policy-stamping
-// site: marker protocol → no placeholder, original stays verbatim; native tool
-// protocol → placeholder + acp_retrieve declaration.
-const PLACEHOLDER_MARK = "[stored #";
+// [#1097] The kernel content store must never emit a placeholder the model
+// cannot retrieve. The responses text/marker protocol declares only the
+// readonly ACP tools (no native tool channel for the retrieve tool), so an
+// armed store there would silently lose oversized tool results. These tests
+// pin the gate at the policy-stamping site: marker protocol → no placeholder,
+// original stays verbatim; native tool protocol → placeholder + retrieve tool
+// declaration, in the kernel's [acp-stored format.
+const PLACEHOLDER_MARK = "[acp-stored #";
 const BIG_OUTPUT = "big-output-line-0123456789abcdef\n".repeat(512);
 
 interface Harness {
@@ -43,10 +43,8 @@ async function startHarness(marker: boolean): Promise<Harness> {
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
     const upstreamPort = upstream.address().port;
-    _setStoreForTest(new SessionStore({ enabled: false }));
+    _setStoreForTest(new SessionStore({ dir: path.join(os.tmpdir(), `bili-store-gate-${marker ? "marker" : "native"}-${Math.random().toString(36).slice(2)}`), debounceMs: 0 }));
     setRegistryForTest({});
-    const storeDir = mkdtempSync(path.join(os.tmpdir(), "bili-store-gate-"));
-    process.env.BILI_STORE_DIR = storeDir;
     const route: Record<string, unknown> = { models: { "gpt-test": { context: 400_000 } } };
     if (marker) route.compressProtocol = "marker";
     const proxy = await startServer({
@@ -57,7 +55,7 @@ async function startHarness(marker: boolean): Promise<Harness> {
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
         promptCache: { routing: "auto" },
-        compress: { injectTool: true, injectNudge: false, store: { enabled: true, minTokens: 500 } },
+        compress: { injectTool: true, injectNudge: false, ccr: { enabled: true, minToolTokens: 500 } },
         sessionHeader: "x-acp-session",
         log: false,
         debug: false,
@@ -75,7 +73,6 @@ async function startHarness(marker: boolean): Promise<Harness> {
             await once(proxy, "close");
             upstream.close();
             await once(upstream, "close");
-            rmSync(storeDir, { recursive: true, force: true });
         },
     };
 }
@@ -100,7 +97,7 @@ async function sendBigToolResult(h: Harness, sessionId: string): Promise<void> {
     assert.equal(resp.status, 200, `request failed: ${text.slice(0, 300)}`);
 }
 
-test("#1097: marker-protocol responses wire — store disarmed, oversized tool result stays verbatim (no unretrievable placeholder)", async () => {
+test("#1097: marker-protocol responses wire — ccr disarmed, oversized tool result stays verbatim (no unretrievable placeholder)", async () => {
     const h = await startHarness(true);
     try {
         await sendBigToolResult(h, "store-gate-marker");
@@ -109,22 +106,33 @@ test("#1097: marker-protocol responses wire — store disarmed, oversized tool r
         assert.ok(!body.includes(PLACEHOLDER_MARK), "marker-protocol wire must not carry a store placeholder");
         assert.ok(!body.includes("acp_retrieve"), "acp_retrieve must not be declared or referenced on the marker-protocol wire");
         const line = "big-output-line-0123456789abcdef";
-        assert.ok(body.includes(`${line}\\n${line}`), "original tool result must stay verbatim when the store is disarmed");
+        assert.ok(body.includes(`${line}\\n${line}`), "original tool result must stay verbatim when ccr is disarmed");
         assert.ok(body.length > BIG_OUTPUT.length, "full tool result payload missing from the outbound body");
     } finally {
         await h.close();
     }
 });
 
-test("#1097: native-tool responses wire — store armed, placeholder emitted and acp_retrieve declared (control)", async () => {
+test("#1097: native-tool responses wire — ccr armed, kernel placeholder emitted and acp_retrieve declared (control)", async () => {
     const h = await startHarness(false);
     try {
         await sendBigToolResult(h, "store-gate-control");
         assert.equal(h.captured.length, 1, `expected exactly one upstream request, got ${h.captured.length}`);
         const body = h.captured[0]!;
-        assert.ok(body.includes(PLACEHOLDER_MARK), `native-tool wire must carry the store placeholder: ${body.slice(0, 400)}`);
+        assert.ok(body.includes(PLACEHOLDER_MARK), `native-tool wire must carry the kernel store placeholder: ${body.slice(0, 400)}`);
         assert.ok(body.includes('"name":"acp_retrieve"'), "acp_retrieve tool declaration missing on the native-tool wire");
+        // the placeholder must teach retrieval in the kernel format
+        const ref = body.match(/\[acp-stored #(m\d+)/)?.[1];
+        assert.ok(ref, "placeholder must cite an mNNNNN ref");
+        assert.ok(body.includes(`${RETRIEVE_TOOL_NAME}(\\"${ref}\\")`), `placeholder must show the retrieve call for ${ref}`);
     } finally {
         await h.close();
     }
+});
+
+test("#1097: kernel placeholder format reference — buildStoredPlaceholder renders the shape the gate asserts on", () => {
+    const text = buildStoredPlaceholder({ ref: "m00423", kind: "shell output", tokens: 4213, head: "gen", command: "gen", retrieveToolName: RETRIEVE_TOOL_NAME });
+    assert.ok(text.startsWith("\u{1F4E6} [acp-stored #m00423"), text);
+    assert.ok(text.includes("4,213 tok"));
+    assert.ok(text.includes(`${RETRIEVE_TOOL_NAME}("m00423")`));
 });

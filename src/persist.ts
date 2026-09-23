@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { readdir, readFile, rm } from "node:fs/promises";
 import * as path from "node:path";
 import { StateStore, flatFileNameFor, type PersistedEnvelope, type StateStoreCodec } from "acp-kernel/persist";
@@ -7,7 +7,7 @@ import { sessionsDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
-import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage } from "acp-kernel";
+import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import type { WireProtocol } from "./util.js";
 
@@ -197,6 +197,16 @@ function relPathFor(id: string, protocol?: string, upstreamOrigin?: string): str
     return path.join(proto, `${host}${createHash("sha256").update(id, "utf8").digest("hex").slice(0, 24)}.json`);
 }
 
+/** #1097: the kernel CCR content-store envelope lives in ONE dedicated file
+ *  per session, next to the session JSON (same namespace, same codec): the
+ *  originals are payload bytes, not state — keeping them out of the session
+ *  record preserves whole-file encryption, .json discovery, and the bounded
+ *  in-memory session cache (the envelope is lazily loaded per session). */
+function contentStoreRelPathFor(id: string, protocol?: string, upstreamOrigin?: string): string {
+    const base = relPathFor(id, protocol, upstreamOrigin);
+    return base.slice(0, -".json".length) + ".content-store.json";
+}
+
 /** Session persistence policy over the kernel StateStore mechanism. The
  *  public API predates the extraction and is kept stable for session.ts /
  *  server.ts / export.ts. */
@@ -252,11 +262,62 @@ export class SessionStore {
         });
     }
 
-    /** #1097: the active at-rest codec (undefined when BILI_ENCRYPTION_KEY is
-     *  unset), shared with the content-store sidecar files so they encrypt
-     *  identically to the session JSON. */
-    payloadCodec(): StateStoreCodec | undefined {
-        return this.codec;
+    /** #1097: load the session's kernel content-store envelope (namespaced
+     *  path first, then the _unknown/ fallback — same probe order as
+     *  loadEnvelope). Returns null when absent or unreadable; callers degrade
+     *  to a fresh store (retrieve misses), never crash the request. */
+    loadContentStore(session: Session): MessageContentStore | null {
+        if (!this.enabled) return null;
+        const rels = [
+            contentStoreRelPathFor(session.id, session.meta.protocol, session.meta.upstreamOrigin),
+            contentStoreRelPathFor(session.id),
+        ];
+        for (const rel of rels) {
+            let buf: Buffer;
+            try {
+                buf = readFileSync(path.join(this.dir, rel));
+            } catch {
+                continue;
+            }
+            try {
+                const text = this.codec ? this.codec.decode(buf) : buf.toString("utf8");
+                const parsed = JSON.parse(text) as MessageContentStore;
+                if (parsed && typeof parsed === "object" && parsed.version === 1
+                    && parsed.byHash && typeof parsed.byHash === "object"
+                    && parsed.byRef && typeof parsed.byRef === "object") {
+                    return parsed;
+                }
+                this.log("warn", `[persist] content-store for ${session.id} malformed, starting fresh`);
+                return null;
+            } catch (err) {
+                this.log("warn", `[persist] content-store for ${session.id} unreadable, starting fresh: ${err instanceof Error ? err.message : String(err)}`);
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /** #1097: persist the content-store envelope when dirty; an emptied store
+     *  (rebase reset) deletes the file. Payload-first: runs BEFORE the session
+     *  state write so a crash mid-save leaves at worst a retrieve miss, never
+     *  a placeholder whose original is gone. */
+    private saveContentStore(session: Session): void {
+        if (!this.enabled || !session.contentStoreDirty) return;
+        session.contentStoreDirty = false;
+        const rel = contentStoreRelPathFor(session.id, session.meta.protocol, session.meta.upstreamOrigin);
+        const abs = path.join(this.dir, rel);
+        if (!session.contentStore || Object.keys(session.contentStore.byRef).length === 0) {
+            rmSync(abs, { force: true });
+            return;
+        }
+        try {
+            mkdirSync(path.dirname(abs), { recursive: true });
+            const text = JSON.stringify(session.contentStore);
+            writeFileSync(abs, this.codec ? this.codec.encode(text) : text);
+        } catch (err) {
+            session.contentStoreDirty = true;
+            this.log("warn", `[persist] content-store write failed for ${session.id}: ${err instanceof Error ? err.message : String(err)}`);
+        }
     }
 
     /** Bulk-load every persisted session from disk into a map keyed by the
@@ -427,6 +488,12 @@ export class SessionStore {
         for (const rel of candidates) {
             await rm(path.join(this.dir, rel), { force: true }).catch(() => {});
         }
+        for (const rel of [
+            contentStoreRelPathFor(id, session.meta.protocol, session.meta.upstreamOrigin),
+            contentStoreRelPathFor(id),
+        ]) {
+            await rm(path.join(this.dir, rel), { force: true }).catch(() => {});
+        }
     }
 
     /** Shared envelope probe for the sync read paths: namespaced path
@@ -540,6 +607,7 @@ export class SessionStore {
      *  session state is persisted. Safe to call on the hot path. No-op if
      *  disabled. */
     scheduleSave(session: Session): void {
+        this.saveContentStore(session);
         this.store.scheduleSave(session.id, this.guardedBuild(session));
     }
 
@@ -547,6 +615,7 @@ export class SessionStore {
      *  on write failure so callers can react (e.g. avoid evicting). Serialized
      *  per-session by the kernel store's write chains. */
     async writeNow(session: Session): Promise<void> {
+        this.saveContentStore(session);
         await this.store.writeNow(session.id, this.guardedBuild(session));
     }
 
@@ -556,6 +625,7 @@ export class SessionStore {
      *  Returns true on success, false on failure (caller must NOT evict on
      *  failure for a never-persisted session or it is lost permanently). */
     flushSync(session: Session): boolean {
+        this.saveContentStore(session);
         return this.store.flushSync(session.id, this.guardedBuild(session));
     }
 
@@ -666,6 +736,7 @@ function buildSession(parsed: PersistedSession): Session {
         lastMessagesFolded: parsed.messagesFolded === true,
         inFlight: 0,
         persisted: true,
+        pendingRetrievals: [],
     };
 }
 
@@ -808,12 +879,6 @@ export function getStore(): SessionStore {
         _store = new SessionStore({ enabled: persistEnabled(), log: defaultLogger });
     }
     return _store;
-}
-
-/** #1097: active at-rest codec for content-store sidecar files (plaintext when
- *  BILI_ENCRYPTION_KEY is unset) — mirrors the session-JSON encryption. */
-export function storePayloadCodec(): StateStoreCodec | undefined {
-    return getStore().payloadCodec();
 }
 
 /** Test hook: inject a store with a temp dir. */

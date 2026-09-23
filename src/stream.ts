@@ -2,10 +2,10 @@ import { collectBlockContent, type CompressionCore, type Config, type CoreMessag
 import { handleAcpStatus } from "./acp-status.js";
 import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty } from "./session.js";
-import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, RETRIEVE_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
+import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
-import { effectiveStoreConfig, executeRetrieve } from "./store.js";
+import { ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
 import { containsMarkerLineText, containsRenderTagText, stripAcpTags } from "./loop/tag-echo-filter.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
 
@@ -46,8 +46,12 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
     if (absorb?.enabled === true && toolName === (absorb.toolName ?? ABSORB_TOOL_NAME)) {
         return executeAbsorb(args, undefined, absorb, ctx);
     }
-    if (effectiveStoreConfig(ctx.session)?.enabled === true && toolName === RETRIEVE_TOOL_NAME) {
-        return executeRetrieve(args, ctx.session);
+    if (ccrEnabled(ctx.session) && toolName === retrieveToolName(ctx.session)) {
+        // Non-stream rewrite has no re-request to ride, so the full text rides
+        // inline right after the ack inside the converted text block.
+        const ack = executeRetrieve(args, ctx.session);
+        const injections = drainPendingRetrievals(ctx.session);
+        return injections.length > 0 ? injections.reduce((acc, inj) => `${acc}\n\n${inj.text}`, ack) : ack;
     }
     return `[Unknown proxy tool: ${toolName}]`;
 }

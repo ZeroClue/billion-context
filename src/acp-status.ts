@@ -8,7 +8,7 @@ import {
     type CoreMessage,
 } from "acp-kernel";
 import { getBlindTunnelStats } from "./mitm.js";
-import { effectiveStoreConfig } from "./store.js";
+import { ccrEnabled, contentStoreOf } from "./store.js";
 import { preCompactionArchiveOf, type Session } from "./session.js";
 import { VERSION } from "./version.js";
 
@@ -54,9 +54,10 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         const turn = ctx.core.processTurn({
             messages: ctx.messages,
             state: ctx.session.state,
-            config: ctx.config,
+            config: ccrEnabled(ctx.session) ? ctx.config : { ...ctx.config, ccr: undefined },
             tokenCount: ctx.session.stats.lastInputTokens,
             renderTags: "none",
+            contentStore: contentStoreOf(ctx.session),
         });
         const nudge = turn.nudge;
         if (nudge) {
@@ -76,9 +77,11 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     } catch {
         // Base-only report; never fall back to a stale snapshot.
     }
-    const storeIdx = ctx.session.metadata.storeIndex as Record<string, unknown> | undefined;
-    const storeCount = storeIdx ? Object.keys(storeIdx).length : 0;
-    if (effectiveStoreConfig(ctx.session)?.enabled === true && (storeCount > 0 || (ctx.session.stats.retrieveCalls ?? 0) > 0)) {
+    // #1097: the processTurn above already resolved the envelope when armed
+    // (contentStoreOf is idempotent); when disarmed skip the disk read.
+    const ccrArmed = ccrEnabled(ctx.session);
+    const storeCount = ccrArmed ? Object.keys(contentStoreOf(ctx.session).byRef).length : 0;
+    if (ccrArmed && (storeCount > 0 || (ctx.session.stats.retrieveCalls ?? 0) > 0)) {
         const st = ctx.session.stats;
         const calls = st.retrieveCalls ?? 0;
         const hits = st.retrieveHits ?? 0;

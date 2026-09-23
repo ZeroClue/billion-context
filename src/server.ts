@@ -60,9 +60,9 @@ import {
     type GoogleSystemInstruction,
     type GoogleTool,
 } from "acp-kernel/wire";
-import { ABSORB_TOOL, ABSORB_TOOL_GOOGLE, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, RETRIEVE_TOOL, RETRIEVE_TOOL_GOOGLE, RETRIEVE_TOOL_OPENAI, RETRIEVE_TOOL_RESPONSES, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance, withSummaryBudgetNote } from "./compress-tool.js";
+import { ABSORB_TOOL, ABSORB_TOOL_GOOGLE, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, retrieveToolsFor, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance, withSummaryBudgetNote } from "./compress-tool.js";
 import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } from "./absorb.js";
-import { applyStoreView, effectiveStoreConfig, storeEffectiveStore, type StoreConfig } from "./store.js";
+import { adoptContentStore, ccrEnabled, contentStoreOf, executeRetrieve, retrieveToolName, storeEffectiveCcr, type CcrSettings } from "./store.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
@@ -1157,10 +1157,10 @@ async function handle(
     let reqSurface: PackSurface = {};
     let reqSurfacePack = "default";
     let wsSourceForLog: string | undefined;
-    // [#1097] host-only content-store policy for this request scope (three-level
+        // [#1097] host-only CCR policy for this request scope (three-level
     // merge); resolved before the session is bound, then stamped onto it below so
     // every view / injection / execution site reads one value.
-    let resolvedStoreCfg: StoreConfig | undefined;
+    let resolvedCcrCfg: CcrSettings | undefined;
     let reqModelId: string | undefined;
     if (parsed && typeof parsed === "object") {
         // Gemini's model lives in the request path, every other wire carries it
@@ -1254,7 +1254,7 @@ async function handle(
                 windowShrinkReason = "operator";
             }
             const compressCfg = resolveCompress(opts.routes, embeddedUrl, model, opts.compress);
-            resolvedStoreCfg = compressCfg.store;
+            resolvedCcrCfg = compressCfg.ccr;
             reqPrompts = resolveCompressPrompts(compressCfg);
             const surfaceRes = resolveCompressSurfaceDetailed(compressCfg);
             reqSurface = surfaceRes.surface;
@@ -1641,8 +1641,11 @@ async function handle(
         //    exactly one system at index 0, #377) accept it and the head system
         //    message stays byte-stable for the prefix cache.
         const pluginMode = pluginAgent !== undefined;
-        // [#1097] Stamp the resolved store policy. acp_retrieve needs a tool
-        // channel, so the store is only armed in proxy mode with tool injection
+        // [#1097] Stamp the resolved CCR policy. acp_retrieve needs a tool
+        // channel, so CCR is only armed in proxy mode with tool injection
+        // armed (mirrors absorb); every processTurn site strips `ccr` from the
+        // loop config unless this stamp says armed — the kernel's ccr-store
+        // node must never substitute placeholders the wire cannot resolve.
         // on — we must never emit a placeholder the model cannot retrieve (silent
         // loss). Plugin mode is out of scope for v1: the agent would need
         // acp_retrieve advertised in the plugin manifest to avoid that same trap.
@@ -1652,7 +1655,7 @@ async function handle(
         // leave placeholders unretrievable.
         const storeChannelOk = protocol !== "responses" ||
             (!process.env.ACP_NO_INJECT_TOOL && !FORCE_TEXT_PROTOCOL && resolveCompressProtocol(opts.routes, upstreamOrigin) !== "marker");
-        storeEffectiveStore(session, opts.compress.injectTool && !pluginMode && storeChannelOk ? resolvedStoreCfg : undefined);
+        storeEffectiveCcr(session, opts.compress.injectTool && !pluginMode && storeChannelOk && resolvedCcrCfg?.enabled === true ? resolvedCcrCfg : undefined);
         // #546: restore a client-shrunk output budget BEFORE the side gate so a
         // tool-carrying main request re-enters the pipeline at full budget (see
         // restoreOutputBudget for the starvation mechanism).
@@ -2356,18 +2359,20 @@ function prepareAnthropic(
         // ever injected into messages), so unlike absorb it needs no loop-
         // config stripping — only tool availability matters.
         const rulesActive = rulesEnabled(config) && opts.compress.injectTool;
-        const loopConfig = absorbActive ? config : { ...config, absorb: undefined };
-        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
+        // [#1097] the kernel ccr-store node ID-references oversized tool results
+        // BEFORE absorb (ID-reference wins over distill); armed policy is
+        // stamped per-request — strip `ccr` from the loop config when disarmed
+        // (plugin mode / no tool channel) so placeholders never hit the wire.
+        const loopConfig = { ...(absorbActive ? config : { ...config, absorb: undefined }), ...(ccrEnabled(session) ? {} : { ccr: undefined }) };
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", contentStore: contentStoreOf(session) });
         session.state = turn.state;
+        adoptContentStore(session, turn.contentStore);
         // The fold from last turn's compress has now materialized in state —
         // future usage reports are post-fold reality, drop the credit.
         session.stats.compressCreditTokens = 0;
         storeEffectiveAbsorb(session, loopConfig);
         storeEffectiveRules(session, config);
         turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
-        // [#1097] ID-reference oversized tool results AFTER absorb (absorb wins);
-        // self-gates off when the store is disabled or in plugin mode.
-        turn.messages = applyStoreView(turn.messages, session);
         // Drop sub-viability fragments before any consumer sees them: a tiny
         // range in the list makes batched compress attempts fail atomically
         // (kernel validates the whole batch). Mirrors billion-context-pi.
@@ -2401,7 +2406,7 @@ function prepareAnthropic(
 
         systemOut = injectSystem(parsed, opts, prompts, loopConfig, ensureCanonicalId(session), surface, visibilityMarkers);
         if (injectTools) {
-            toolsOut = injectTool(parsed.tools, [...(absorbActive ? [ABSORB_TOOL] : []), ...(rulesActive ? [RULE_TOOL] : []), ...(effectiveStoreConfig(session)?.enabled === true ? [RETRIEVE_TOOL] : [])], surface?.toolPrompts);
+            toolsOut = injectTool(parsed.tools, [...(absorbActive ? [ABSORB_TOOL] : []), ...(rulesActive ? [RULE_TOOL] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).anthropic] : [])], surface?.toolPrompts);
         }
         // Nudge as a separate trailing user message (cache-friendly): the
         // system block stays byte-stable so the prefix cache survives.
@@ -2530,18 +2535,16 @@ function prepareOpenai(
         // prefix-cache stability, so strip absorb from the loop config there.
         const absorbActive = absorbEnabled(config) && shouldInject;
         const rulesActive = rulesEnabled(config) && shouldInject;
-        const loopConfig = absorbActive ? config : { ...config, absorb: undefined };
-        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
+        const loopConfig = { ...(absorbActive ? config : { ...config, absorb: undefined }), ...(ccrEnabled(session) ? {} : { ccr: undefined }) };
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", contentStore: contentStoreOf(session) });
         session.state = turn.state;
+        adoptContentStore(session, turn.contentStore);
         // The fold from last turn's compress has now materialized in state —
         // future usage reports are post-fold reality, drop the credit.
         session.stats.compressCreditTokens = 0;
         storeEffectiveAbsorb(session, loopConfig);
         storeEffectiveRules(session, config);
         turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
-        // [#1097] ID-reference oversized tool results AFTER absorb (absorb wins);
-        // self-gates off when the store is disabled or in plugin mode.
-        turn.messages = applyStoreView(turn.messages, session);
         // Drop sub-viability fragments before any consumer sees them: a tiny
         // range in the list makes batched compress attempts fail atomically
         // (kernel validates the whole batch). Mirrors billion-context-pi.
@@ -2590,7 +2593,7 @@ function prepareOpenai(
         // avoids double-counting it.
         openaiOutboundSystem = sysParts.join("\n\n");
         if (injectTools) {
-            toolsOut = injectOpenaiTool(parsed.tools, [...(absorbActive ? [ABSORB_TOOL_OPENAI] : []), ...(rulesActive ? [RULE_TOOL_OPENAI] : []), ...(effectiveStoreConfig(session)?.enabled === true ? [RETRIEVE_TOOL_OPENAI] : [])], surface?.toolPrompts);
+            toolsOut = injectOpenaiTool(parsed.tools, [...(absorbActive ? [ABSORB_TOOL_OPENAI] : []), ...(rulesActive ? [RULE_TOOL_OPENAI] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).openai] : [])], surface?.toolPrompts);
         }
         // Nudge as a separate trailing user message (cache-friendly). Injected
         // in BOTH modes (#451): plugin agents supply the ACP tools but have no
@@ -2736,17 +2739,15 @@ function prepareGoogle(
         // ever injected into messages), so unlike absorb it needs no loop-
         // config stripping — only tool availability matters.
         const rulesActive = rulesEnabled(config) && shouldInject;
-        const loopConfig = absorbActive ? config : { ...config, absorb: undefined };
-        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: "text-only" });
+        const loopConfig = { ...(absorbActive ? config : { ...config, absorb: undefined }), ...(ccrEnabled(session) ? {} : { ccr: undefined }) };
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: "text-only", contentStore: contentStoreOf(session) });
         session.state = turn.state;
+        adoptContentStore(session, turn.contentStore);
         // The fold from last turn's compress has materialized in state — future
         // usage reports are post-fold reality, drop the credit.
         session.stats.compressCreditTokens = 0;
         storeEffectiveAbsorb(session, loopConfig);
         turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
-        // [#1097] ID-reference oversized tool results AFTER absorb (absorb wins);
-        // self-gates off when the store is disabled or in plugin mode.
-        turn.messages = applyStoreView(turn.messages, session);
         // Drop sub-viability fragments before any consumer sees them (the
         // kernel validates a compress batch atomically).
         if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
@@ -2779,7 +2780,7 @@ function prepareGoogle(
         const extraSystemParts = sysParts.slice(googleClientSystem ? 1 : 0);
         systemInstruction = extraSystemParts.length > 0 ? { parts: sysParts.map((text) => ({ text })) } : parsed.systemInstruction;
         if (injectTools) {
-            toolsOut = injectGoogleTool(parsed.tools, [...(absorbActive ? [ABSORB_TOOL_GOOGLE] : []), ...(rulesActive ? [RULE_TOOL_GOOGLE] : []), ...(effectiveStoreConfig(session)?.enabled === true ? [RETRIEVE_TOOL_GOOGLE] : [])], surface?.toolPrompts);
+            toolsOut = injectGoogleTool(parsed.tools, [...(absorbActive ? [ABSORB_TOOL_GOOGLE] : []), ...(rulesActive ? [RULE_TOOL_GOOGLE] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).google] : [])], surface?.toolPrompts);
         }
         if (sysNotes.length > 0) {
             rebuiltContents = appendGoogleNudge(rebuiltContents, sysNotes.join("\n\n---\n\n"));
@@ -2823,7 +2824,9 @@ export function prepareGoogleCountTokens(
     const sessionId = session.id;
     try {
         const { msgs } = googleToCore(parsed);
-        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: session.stats.lastInputTokens, renderTags: "text-only" });
+        // Read-only preview: the store rides in so placeholder substitution is
+        // counted, but nothing is adopted (state is discarded here too).
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrEnabled(session) ? config : { ...config, ccr: undefined }, tokenCount: session.stats.lastInputTokens, renderTags: "text-only", contentStore: contentStoreOf(session) });
         const stripped = stripKernelSummaries(turn.messages, turn.state);
         const rebuilt: GoogleRequestBody = { ...parsed, contents: coreToGoogle(stripped as BiliMessage[]) };
         log("info", `[${sessionId}] countTokens pruned: ${msgs.length} → ${stripped.length} msgs`);
@@ -2965,18 +2968,16 @@ function prepareResponses(
         // so strip absorb from the loop config there (both modes).
         const absorbActive = absorbEnabled(config) && shouldInject && !isCompactionTrigger && !responsesTextProtocol;
         const rulesActive = rulesEnabled(config) && shouldInject && !isCompactionTrigger && !responsesTextProtocol;
-        const loopConfig = absorbActive ? config : { ...config, absorb: undefined };
-        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags });
+        const loopConfig = { ...(absorbActive ? config : { ...config, absorb: undefined }), ...(ccrEnabled(session) ? {} : { ccr: undefined }) };
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags, contentStore: contentStoreOf(session) });
         session.state = turn.state;
+        adoptContentStore(session, turn.contentStore);
         // The fold from last turn's compress has now materialized in state —
         // future usage reports are post-fold reality, drop the credit.
         session.stats.compressCreditTokens = 0;
         storeEffectiveAbsorb(session, loopConfig);
         storeEffectiveRules(session, config);
         turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
-        // [#1097] ID-reference oversized tool results AFTER absorb (absorb wins);
-        // self-gates off when the store is disabled or in plugin mode.
-        turn.messages = applyStoreView(turn.messages, session);
         // Drop sub-viability fragments before any consumer sees them: a tiny
         // range in the list makes batched compress attempts fail atomically
         // (kernel validates the whole batch). Mirrors billion-context-pi.
@@ -3011,7 +3012,7 @@ function prepareResponses(
             responsesDevContent = devContent;
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
             if (!process.env.ACP_NO_INJECT_TOOL && injectTools) {
-                const respExtra = [...(absorbActive ? [ABSORB_TOOL_RESPONSES] : []), ...(rulesActive ? [RULE_TOOL_RESPONSES] : []), ...(effectiveStoreConfig(session)?.enabled === true ? [RETRIEVE_TOOL_RESPONSES] : [])];
+                const respExtra = [...(absorbActive ? [ABSORB_TOOL_RESPONSES] : []), ...(rulesActive ? [RULE_TOOL_RESPONSES] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).responses] : [])];
                 toolsOut = responsesTextProtocol
                     ? injectResponsesTool(parsed.tools, BILI_ACP_READONLY_TOOLS_RESPONSES, surface?.toolPrompts)
                     : injectResponsesTool(parsed.tools, respExtra.length > 0 ? [...BILI_ACP_TOOLS_RESPONSES, ...respExtra] : BILI_ACP_TOOLS_RESPONSES, surface?.toolPrompts);
@@ -3188,7 +3189,8 @@ export function prepareCountTokens(
     const sessionId = session.id;
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);
-        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: session.stats.lastInputTokens, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
+        // Read-only preview: same policy as the google twin above.
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrEnabled(session) ? config : { ...config, ccr: undefined }, tokenCount: session.stats.lastInputTokens, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", contentStore: contentStoreOf(session) });
         const stripped = stripKernelSummaries(turn.messages as BiliMessage[], turn.state);
         const rebuiltMessages = coreToAnthropic(stripped, cacheControls);
         log("info", `[${sessionId}] count_tokens pruned: ${msgs.length} → ${stripped.length} msgs`);
@@ -3257,6 +3259,8 @@ function prepareResponsesCompact(
     // half-applied fold (the upstream's own compaction boundary is handled by
     // markNativeCompactionBoundary + rebase instead).
     const prevState = session.state;
+    const prevStore = session.contentStore;
+    const prevStoreDirty = session.contentStoreDirty === true;
     // E2 endpoint form: /responses/compact. When the gate passes, run the same
     // fold pipeline as a normal turn and forge the compacted history as
     // {"output": [...]} — a deterministic handoff to the ACP state instead of a
@@ -3267,12 +3271,15 @@ function prepareResponsesCompact(
         // The forged handoff is one-shot with no tool channel: strip absorb so
         // no [ACP absorb] instruction bakes into the forged history, and run
         // the absorb view so absorbed pairs stay hidden in it (wire parity).
-        const compactConfig = { ...config, absorb: undefined };
-        const turn = core.processTurn({ messages: projection.msgs, state: session.state, config: compactConfig, tokenCount: session.stats.lastInputTokens, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
+        const compactConfig = { ...config, absorb: undefined, ...(ccrEnabled(session) ? {} : { ccr: undefined }) };
+        const turn = core.processTurn({ messages: projection.msgs, state: session.state, config: compactConfig, tokenCount: session.stats.lastInputTokens, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", contentStore: contentStoreOf(session) });
         session.state = turn.state;
+        adoptContentStore(session, turn.contentStore);
         transformOk = true;
         if (!codexCompactGate(session, config.modelContextLimit, transformOk)) {
             session.state = prevState;
+            session.contentStore = prevStore;
+            session.contentStoreDirty = prevStoreDirty;
             return base;
         }
         const viewed = applyAbsorbView(turn.messages, turn.state, compactConfig, session.stats.lastInputTokens);
@@ -3280,6 +3287,8 @@ function prepareResponsesCompact(
         let output = patchResponsesInput(projection, processed);
         if (typeof output === "string") {
             session.state = prevState;
+            session.contentStore = prevStore;
+            session.contentStoreDirty = prevStoreDirty;
             return base;
         }
         output = hoistTrappedToolItems(output);
@@ -3289,6 +3298,8 @@ function prepareResponsesCompact(
         return { ...base, codexForge: { kind: "endpoint", body: JSON.stringify({ output }), contentType: "application/json" } };
     } catch (err) {
         session.state = prevState;
+        session.contentStore = prevStore;
+        session.contentStoreDirty = prevStoreDirty;
         log("warn", `[${session.id}] codex compact forge failed (${String(err)}); passing through to upstream`);
         return base;
     }
@@ -4680,7 +4691,7 @@ async function forward(
             // tool is callable, keeping loop re-requests byte-consistent with
             // the first request (prefix-cache anchor).
             const absorbActive = absorbEnabled(config) && opts.compress.injectTool && !textProtocol;
-            const loopConfig = absorbActive ? config : { ...config, absorb: undefined };
+            const loopConfig = { ...(absorbActive ? config : { ...config, absorb: undefined }), ...(ccrEnabled(prepared.session) ? {} : { ccr: undefined }) };
             const absorbSection = absorbActive
                 ? `\n\n---\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
                 : "";
@@ -4699,8 +4710,10 @@ async function forward(
                         config: loopConfig,
                         tokenCount: prepared.session.stats.lastInputTokens,
                         renderTags: prepared.renderTags ?? "text-only",
+                        contentStore: contentStoreOf(prepared.session),
                     });
                     prepared.session.state = turn.state;
+                    adoptContentStore(prepared.session, turn.contentStore);
                     const viewed = applyAbsorbView(turn.messages, turn.state, loopConfig, prepared.session.stats.lastInputTokens);
                     const records = current.filter((m) => typeof m.id === "string" && m.id.startsWith("acp_loop_"));
                     return repairResponsesAssistantOrdering(stripKernelSummaries([...viewed, ...records] as BiliMessage[], turn.state), prepared.originalMessages);

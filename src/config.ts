@@ -224,24 +224,31 @@ export type CompressSettings = {
          *  the client's own tool names or the agent will call its own tool. */
         toolName?: string;
     };
-    /** [#1097] Content-addressed message store (host-only; no kernel Config
-     *  equivalent). When `enabled`, oversized tool results (>= minTokens) are
-     *  ID-referenced at arrival: the wire keeps a deterministic placeholder and
-     *  the original goes into the per-session content store (persisted alongside
-     *  blockContents), retrievable via the injected `acp_retrieve` tool. Lossless
-     *  by default — a retrieve not made costs one cheap tool call, whereas a
-     *  distilled-away detail is gone for good. Takes precedence over absorb /
-     *  pre-crush for the same result. Off unless explicitly enabled at some level
-     *  (default off for v1). Merged sub-field-wise across the three levels like
-     *  `absorb`. */
-    store?: {
-        /** Enable ID-reference + acp_retrieve for this scope. Absent/false = off. */
+    /** [#1097] Kernel CCR content store (kernel `Config.ccr`, acp-kernel
+     *  0.0.84). When `enabled`, oversized tool results (>= minToolTokens) are
+     *  ID-referenced at arrival by the kernel's ccr-store node (prune →
+     *  ccr-store → absorb): the wire keeps a deterministic `[acp-stored` …
+     *  placeholder and the original goes into the session's kernel
+     *  `MessageContentStore`, retrievable via the injected retrieve tool.
+     *  Lossless by default — a retrieve not made costs one cheap tool call,
+     *  whereas a distilled-away detail is gone for good. ID-reference wins
+     *  over absorb (kernel ordering). Off unless explicitly enabled at some
+     *  level. Merged sub-field-wise across the three levels like `absorb`. */
+    ccr?: {
+        /** Enable CCR for this scope. Absent/false = off (kernel semantics). */
         enabled?: boolean;
-        /** Tool results smaller than this many tokens stay verbatim (default 500). */
-        minTokens?: number;
-        /** Per-session cap on unique stored bytes (default 2 MiB). New content
-         *  beyond the cap is left verbatim rather than substituted. */
-        maxStoreBytes?: number;
+        /** Tool results smaller than this many tokens stay verbatim
+         *  (kernel default 4000). */
+        minToolTokens?: number;
+        /** Tool-name patterns (glob suffix allowed) never CCR-stored
+         *  (kernel default: none). */
+        excludeTools?: string[];
+        /** Rename the retrieve tool (default "acp_retrieve"). Must stay unique
+         *  against the client's own tool names. */
+        toolName?: string;
+        /** Max characters for the placeholder head/command preview (kernel
+         *  default 96). */
+        maxHeadChars?: number;
     };
     /** Persistent rule reminders (kernel `Config.rules`, acp-kernel >= 0.0.70).
      *  When `enabled`, an `acp_rule` tool is injected (or advertised in the
@@ -1029,24 +1036,31 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
             if (ok) out.absorb = cleaned;
         }
     }
-    if ("store" in obj && obj.store !== undefined) {
-        const st = obj.store;
-        if (!st || typeof st !== "object" || Array.isArray(st)) {
+    if ("ccr" in obj && obj.ccr !== undefined) {
+        const c = obj.ccr;
+        if (!c || typeof c !== "object" || Array.isArray(c)) {
             ok = false;
         } else {
-            const sto = st as Record<string, unknown>;
-            const cleaned: NonNullable<CompressSettings["store"]> = {};
-            if ("enabled" in sto) {
-                if (typeof sto.enabled !== "boolean") { ok = false; }
-                else cleaned.enabled = sto.enabled;
+            const co = c as Record<string, unknown>;
+            const cleaned: NonNullable<CompressSettings["ccr"]> = {};
+            for (const key of ["enabled", "minToolTokens", "excludeTools", "toolName", "maxHeadChars"] as const) {
+                if (!(key in co)) continue;
+                const v = co[key];
+                if (key === "enabled") {
+                    if (typeof v !== "boolean") { ok = false; continue; }
+                    cleaned.enabled = v;
+                } else if (key === "minToolTokens" || key === "maxHeadChars") {
+                    if (typeof v !== "number" || !Number.isFinite(v)) { ok = false; continue; }
+                    cleaned[key] = v;
+                } else if (key === "excludeTools") {
+                    if (!Array.isArray(v) || v.some((x) => typeof x !== "string")) { ok = false; continue; }
+                    cleaned.excludeTools = [...v] as string[];
+                } else {
+                    if (typeof v !== "string" || v.trim().length === 0) { ok = false; continue; }
+                    cleaned.toolName = v.trim();
+                }
             }
-            for (const key of ["minTokens", "maxStoreBytes"] as const) {
-                if (!(key in sto)) continue;
-                const v = sto[key];
-                if (typeof v !== "number" || !Number.isFinite(v)) { ok = false; continue; }
-                cleaned[key] = v;
-            }
-            if (ok) out.store = cleaned;
+            if (ok) out.ccr = cleaned;
         }
     }
     if ("prompts" in obj && obj.prompts !== undefined) {
