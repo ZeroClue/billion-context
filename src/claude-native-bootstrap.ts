@@ -7,11 +7,11 @@
 //      (resolveClaudeNativePort: BILI_CLAUDE_NATIVE_PORT > config
 //      claude.nativePort > 48787) with a /bili/-wrapped upstream — full
 //      traffic visibility without MITM;
-//   2. THIS hook (child of the claude process, fired before the first model
-//      request) makes sure a proxy is listening there: attach to a healthy
-//      compatible one, else spawn one detached whose parent-pid watchdog
-//      watches CLAUDE's pid (this hook's parent — the hook itself exits
-//      immediately) so the proxy lives and dies with the session;
+//   2. THIS hook (fired before the first model request) makes sure a proxy
+//      is listening there: attach to a healthy compatible one, else spawn one
+//      detached whose parent-pid watchdog watches CLAUDE's pid (resolved by
+//      walking past the transient `/bin/sh -c` hook wrapper — the hook itself
+//      exits immediately) so the proxy lives and dies with the session;
 //   3. the MCP shim (dist/mcp.js, registered user-scope, pinned to the same
 //      stable port) provides the native compress/decompress/acp_status tools
 //      and identity-registers the conversation (CLAUDE_CODE_SESSION_ID =
@@ -29,6 +29,8 @@
 
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "./launcher.js";
 import { resolveClaudeNativePort } from "./config.js";
 import { nativeBootstrapGate, proxyEnvOrigin } from "./agent/native-bootstrap.js";
@@ -59,21 +61,199 @@ export function planClaudeNativeBootstrap(env: NodeJS.ProcessEnv): { action: "ex
     return { action: "start", port };
 }
 
+// — claude host pid resolution ———————————————————————————————
+// claude (2.x) runs SessionStart hooks as `/bin/sh -c <command>`: the hook's
+// DIRECT parent is a transient sh that dies the moment the hook exits. A
+// proxy watchdog pointed at that parent self-kills ~2s into every session
+// (live "parent-gone (pid N)" failures) while claude itself lives on.
+
+const CLAUDE_HOST_MAX_WALK = 8;
+
+/** One process-table snapshot. argv is null when no command line is visible
+ *  (zombies, kernel threads, protected processes) — the ppid chain still
+ *  walks through those. null return means the pid is gone or its reader
+ *  failed — callers fall back to the legacy direct parent. */
+type ProcInfo = { argv: string[] | null; ppid: number | null };
+
+type ProcReader = (pid: number) => ProcInfo | null;
+
+type ExecFn = (cmd: string, args: string[]) => string | null;
+
+function defaultExec(cmd: string, args: string[]): string | null {
+    try {
+        return execFileSync(cmd, args, { encoding: "utf8", timeout: 5000 });
+    } catch {
+        return null;
+    }
+}
+
+function readProcInfo(pid: number): ProcInfo | null {
+    let argv: string[] | null = null;
+    let ppid: number | null = null;
+    try {
+        const parts = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter((p) => p.length > 0);
+        if (parts.length > 0) argv = parts;
+    } catch {
+        return null;
+    }
+    try {
+        // comm can contain spaces and parens — only the text after the LAST
+        // ')' is positional; field 2 of the remainder is ppid.
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+        const tail = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+        if (tail.length > 1) ppid = Number(tail[1]);
+    } catch {
+        // stat unreadable: stop the walk after this hop
+    }
+    return { argv, ppid };
+}
+
+/** ps fallback for platforms without /proc (darwin/BSD; the flags work on
+ *  linux too): one line "<ppid> <args...>". Whitespace-splitting a joined
+ *  command line can only LOSE a match (paths containing spaces) — never
+ *  invent one — so a miss degrades to the legacy fallback parent. Exported
+ *  for tests (inject `exec`). */
+export function readPsProcInfo(pid: number, exec: ExecFn = defaultExec): ProcInfo | null {
+    const out = exec("ps", ["-ww", "-o", "ppid=", "-o", "args=", "-p", String(pid)]);
+    if (out === null) return null;
+    const line = out.split("\n").find((l) => l.trim().length > 0);
+    if (line === undefined) return null;
+    const [ppidToken, ...rest] = line.trim().split(/\s+/);
+    const ppid = Number(ppidToken);
+    return { argv: rest.length > 0 ? rest : null, ppid: Number.isFinite(ppid) ? ppid : null };
+}
+
+/** Windows fallback: one PowerShell call returns "<ppid>\t<CommandLine>"
+ *  (ps/wmic are deprecated or absent). CommandLine can be empty for
+ *  protected processes — argv null still lets the ppid chain walk on.
+ *  Exported for tests (inject `exec`). */
+export function readWinProcInfo(pid: number, exec: ExecFn = defaultExec): ProcInfo | null {
+    const out = exec("powershell", [
+        "-NoProfile",
+        "-Command",
+        `(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}') | ForEach-Object { "$($_.ParentProcessId)\`t$($_.CommandLine)" }`,
+    ]);
+    if (out === null) return null;
+    const line = out.split("\n").find((l) => l.trim().length > 0);
+    if (line === undefined) return null;
+    const tab = line.indexOf("\t");
+    if (tab < 0) return null;
+    const ppid = Number(line.slice(0, tab).trim());
+    const argv = line
+        .slice(tab + 1)
+        .trim()
+        .split(/\s+/)
+        .filter((part) => part.length > 0);
+    return { argv: argv.length > 0 ? argv : null, ppid: Number.isFinite(ppid) ? ppid : null };
+}
+
+/** The platform's process-table reader: /proc on linux (microseconds, no
+ *  subprocess), PowerShell on windows, ps elsewhere. */
+function defaultProcReader(): ProcReader {
+    if (process.platform === "win32") return (pid) => readWinProcInfo(pid);
+    if (process.platform === "linux") return readProcInfo;
+    return (pid) => readPsProcInfo(pid);
+}
+
+/** Is this argv the claude-code session binary? Matches `claude`/`claude.exe`
+ *  and `node .../claude...` installs (`@anthropic-ai/claude-code` paths or a
+ *  bare `claude` argument). Must NOT match this hook's own script
+ *  (claude-native-bootstrap.js) or wrappers like `timeout 40 claude` /
+ *  `sh -c ...` (their argv[0] is not claude). The bare-`claude` node form can
+ *  false-positive on an unrelated `node /opt/claude`, but the walk is
+ *  bottom-up and the REAL claude sits 2 hops up in every session — a closer
+ *  match always wins, so a lookalike higher in the tree is unreachable.
+ *  Tightening it would instead break real `node ~/bin/claude` launcher
+ *  installs. Exported for tests. */
+export function isClaudeHostArgv(argv: string[]): boolean {
+    const base = (p: string): string => {
+        const parts = p.split(/[\\/]/).filter((seg) => seg.length > 0);
+        return parts[parts.length - 1] ?? "";
+    };
+    if (/^claude(\.exe)?$/i.test(base(argv[0] ?? ""))) return true;
+    if (/^(node|bun|deno)(\.exe)?$/i.test(base(argv[0] ?? ""))) {
+        return argv.slice(1).some((arg) => /^claude(\.exe)?$/i.test(base(arg)) || /@anthropic-ai[\\/]claude-code/.test(arg));
+    }
+    return false;
+}
+
+/** The claude session process that transitively owns this hook, found by
+ *  walking up from `startPid` (default: this hook) through the platform
+ *  process table (/proc on linux, ps elsewhere, PowerShell on windows).
+ *  undefined when no claude host sits within CLAUDE_HOST_MAX_WALK hops —
+ *  callers then fall back to the legacy direct parent (strictly no worse
+ *  than before). Exported for tests (inject `read` to stub the process
+ *  table). */
+export function resolveClaudeHostPid(opts: { read?: ProcReader; startPid?: number } = {}): number | undefined {
+    const read = opts.read ?? defaultProcReader();
+    let pid = opts.startPid ?? process.pid;
+    for (let hop = 0; hop < CLAUDE_HOST_MAX_WALK; hop++) {
+        const info = read(pid);
+        if (info === null) return undefined;
+        if (info.argv !== null && isClaudeHostArgv(info.argv)) return pid;
+        if (info.ppid === null || info.ppid <= 1) return undefined;
+        pid = info.ppid;
+    }
+    return undefined;
+}
+
+/** Is this argv a shell running a run-and-exit one-shot — the transient hook
+ *  wrapper shape? Covers POSIX `sh -c` (also -lc/-ic flag clusters), Windows
+ *  `cmd /c` (/k stays open — not transient), and `powershell -Command`
+ *  (claude uses one of these to launch SessionStart hooks on every OS).
+ *  Such wrappers exit the moment their command does. Exported for tests. */
+export function isTransientShArgv(argv: string[]): boolean {
+    const parts = (argv[0] ?? "").split(/[\\/]/).filter((seg) => seg.length > 0);
+    const shell = parts[parts.length - 1] ?? "";
+    if (/^(sh|bash|dash|zsh|ksh|ash)(\.exe)?$/i.test(shell)) {
+        return argv.some((arg, i) => i > 0 && /^-[^-]*c$/.test(arg));
+    }
+    if (/^cmd(\.exe)?$/i.test(shell)) {
+        return argv.some((arg, i) => i > 0 && /^[-/]c$/i.test(arg));
+    }
+    if (/^(powershell|pwsh)(\.exe)?$/i.test(shell)) {
+        return argv.some((arg, i) => i > 0 && /^-?(command|encodedcommand)$/i.test(arg));
+    }
+    return false;
+}
+
+/** The pid the spawned proxy's watchdog should watch. The resolved claude
+ *  host when the walk finds one. Otherwise: a SessionStart hook's direct
+ *  parent is always the transient `sh -c` wrapper — watching it re-arms the
+ *  2s self-kill — so fall back to ITS parent instead (in a real session that
+ *  is claude itself, even when an exotic install form went unrecognized);
+ *  when the direct parent is anything else (manual run under an interactive
+ *  shell) or unreadable, keep the legacy direct parent. Exported for tests
+ *  (inject `read` to stub the process table). */
+export function chooseWatchdogParentPid(opts: { read?: ProcReader; parentPid?: number } = {}): number {
+    const read = opts.read ?? defaultProcReader();
+    const host = resolveClaudeHostPid({ read });
+    if (host !== undefined) return host;
+    const parentPid = opts.parentPid ?? process.ppid;
+    const parentInfo = read(parentPid);
+    if (parentInfo !== null && parentInfo.argv !== null && isTransientShArgv(parentInfo.argv)) {
+        const grandPid = parentInfo.ppid;
+        if (grandPid !== null && grandPid > 1) return grandPid;
+    }
+    return parentPid;
+}
+
 async function run(): Promise<void> {
     const plan = planClaudeNativeBootstrap(process.env);
     if (plan.action === "exit") return;
     try {
-        // SessionStart hooks are children of the claude process itself, so
-        // OUR parent pid is claude's pid — exactly the lifetime the spawned
-        // proxy's watchdog should track (the hook process exits immediately
-        // after bring-up).
+        // The direct parent is the transient `/bin/sh -c` wrapper claude used
+        // to launch this hook — it exits with the hook, and a watchdog on it
+        // killed a healthy proxy ~2s into every session. Watch the claude
+        // host itself; when the walk cannot find it, chooseWatchdogParentPid
+        // degrades via the wrapper's parent instead of the wrapper.
         const handle = await ensureProxyRunning(
             {
                 host: LAUNCHER_DEFAULT_HOST,
                 port: plan.port,
                 passthrough: plan.action === "passthrough",
                 debug: false,
-                parentPid: process.ppid,
+                parentPid: chooseWatchdogParentPid(),
                 strictPort: true,
             },
             { scriptPath: proxyScriptPath() },

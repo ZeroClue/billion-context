@@ -24,7 +24,7 @@ import {
     stripClaudeManagedBlock,
 } from "../src/plugin-install.ts";
 import { CLAUDE_NATIVE_DEFAULT_PORT, clearClaudeNativePort, resolveClaudeNativePort, saveClaudeNativePort } from "../src/config.ts";
-import { planClaudeNativeBootstrap } from "../src/claude-native-bootstrap.ts";
+import { chooseWatchdogParentPid, isClaudeHostArgv, isTransientShArgv, planClaudeNativeBootstrap, readPsProcInfo, readWinProcInfo, resolveClaudeHostPid } from "../src/claude-native-bootstrap.ts";
 
 const HOOK_COMMAND = "/opt/bili/dist/claude-native-bootstrap.js";
 
@@ -147,6 +147,250 @@ test("planClaudeNativeBootstrap: launcher-owned / opt-out / start", () => {
     const start = planClaudeNativeBootstrap({});
     assert.deepEqual(start, { action: "start", port: CLAUDE_NATIVE_DEFAULT_PORT });
     assert.equal(planClaudeNativeBootstrap({ BILI_CLAUDE_NATIVE_PORT: "49999" }).port, 49999);
+});
+
+// — claude host pid resolution (parent-gone regression) —————————————————
+
+// Live shape (claude 2.1.278, SessionStart): the hook's direct parent is a
+// TRANSIENT `/bin/sh -c` wrapper; the claude session sits one level above it.
+function procTable(table: Record<number, { argv?: string[]; ppid?: number }>): (pid: number) => { argv: string[] | null; ppid: number | null } | null {
+    return (pid) => {
+        const entry = table[pid];
+        if (entry === undefined) return null;
+        return { argv: entry.argv ?? null, ppid: entry.ppid ?? null };
+    };
+}
+
+test("resolveClaudeHostPid: walks past the transient sh wrapper to claude", () => {
+    const read = procTable({
+        100: { argv: [process.execPath, "/pkg/dist/claude-native-bootstrap.js"], ppid: 200 },
+        200: { argv: ["/bin/sh", "-c", "node /pkg/dist/claude-native-bootstrap.js"], ppid: 300 },
+        300: { argv: ["/usr/local/bin/claude", "-p", "hi"], ppid: 400 },
+        400: { argv: ["/bin/bash"], ppid: 1 },
+    });
+    assert.equal(resolveClaudeHostPid({ read, startPid: 100 }), 300);
+});
+
+test("resolveClaudeHostPid: matches npm/node installs and skips zombie wrappers", () => {
+    // node-form install: node .../@anthropic-ai/claude-code/cli.js
+    const npmInstall = procTable({
+        100: { argv: [process.execPath, "/pkg/dist/claude-native-bootstrap.js"], ppid: 110 },
+        110: { argv: ["/bin/sh", "-c", "node hook"], ppid: 120 },
+        120: { argv: [process.execPath, "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"], ppid: 1 },
+    });
+    assert.equal(resolveClaudeHostPid({ read: npmInstall, startPid: 100 }), 120);
+
+    // The wrapper may linger as a zombie (empty cmdline) — the walk must
+    // continue through it instead of giving up.
+    const zombieSh = procTable({
+        100: { ppid: 110 },
+        110: { argv: [], ppid: 120 },
+        120: { argv: ["claude"], ppid: 1 },
+    });
+    assert.equal(resolveClaudeHostPid({ read: zombieSh, startPid: 100 }), 120);
+});
+
+test("resolveClaudeHostPid: no claude host in range → undefined (caller keeps legacy parent)", () => {
+    // `timeout 40 claude ...` runs claude, but a bare timeout tree WITHOUT a
+    // claude entry must not match, and neither must the wrapper chain itself.
+    const noClaude = procTable({
+        100: { argv: [process.execPath, "/pkg/dist/claude-native-bootstrap.js"], ppid: 200 },
+        200: { argv: ["/bin/sh", "-c", "node /pkg/dist/claude-native-bootstrap.js"], ppid: 300 },
+        300: { argv: ["timeout", "40", "claude", "-p", "hi"], ppid: 1 },
+    });
+    assert.equal(resolveClaudeHostPid({ read: noClaude, startPid: 100 }), undefined);
+
+    // Dead parent mid-walk, and a chain deeper than the walk budget.
+    assert.equal(resolveClaudeHostPid({ read: procTable({ 100: { argv: ["node"], ppid: 200 } }), startPid: 100 }), undefined);
+    const deep: Record<number, { argv: string[]; ppid: number }> = {};
+    for (let i = 0; i < 30; i++) deep[100 + i] = { argv: ["proc", String(i)], ppid: 101 + i };
+    deep[999] = { argv: ["claude"], ppid: 1 };
+    assert.equal(resolveClaudeHostPid({ read: procTable(deep), startPid: 100 }), undefined);
+});
+
+test("resolveClaudeHostPid: the closer REAL claude beats a lookalike farther up", () => {
+    // `node /opt/claude` is not claude-code, but the walk is bottom-up and
+    // the real claude is always nearer the hook in a live session — a
+    // lookalike above it must never hijack the watchdog.
+    const read = procTable({
+        100: { argv: [process.execPath, "/pkg/dist/claude-native-bootstrap.js"], ppid: 200 },
+        200: { argv: ["/bin/sh", "-c", "node hook"], ppid: 300 },
+        300: { argv: ["/usr/local/bin/claude"], ppid: 400 },
+        400: { argv: [process.execPath, "/opt/claude"], ppid: 1 },
+    });
+    assert.equal(resolveClaudeHostPid({ read, startPid: 100 }), 300);
+});
+
+// — watchdog parent choice (no-host fallback) ——————————————————————————
+
+test("isTransientShArgv: sh-like one-shots only", () => {
+    assert.equal(isTransientShArgv(["sh", "-c", "node hook"]), true);
+    assert.equal(isTransientShArgv(["/bin/bash", "-lc", "cmd"]), true);
+    assert.equal(isTransientShArgv(["zsh", "-i"]), false);
+    assert.equal(isTransientShArgv(["node", "-c", "x"]), false);
+    assert.equal(isTransientShArgv(["sh", "--check", "x"]), false);
+    // Windows wrapper shapes (claude runs hooks via cmd /c there).
+    assert.equal(isTransientShArgv(["C:\\Windows\\System32\\cmd.exe", "/c", "node hook"]), true);
+    assert.equal(isTransientShArgv(["cmd.exe", "/C", "node hook"]), true);
+    assert.equal(isTransientShArgv(["cmd.exe", "/k", "node hook"]), false); // /k stays open
+    assert.equal(isTransientShArgv(["powershell.exe", "-NoProfile", "-Command", "node hook"]), true);
+    assert.equal(isTransientShArgv(["pwsh", "-Command", "node hook"]), true);
+    assert.equal(isTransientShArgv(["powershell.exe", "-NoProfile"]), false); // interactive
+});
+
+test("chooseWatchdogParentPid: host found → the host", () => {
+    const read = procTable({
+        [process.pid]: { argv: [process.execPath, "/pkg/dist/claude-native-bootstrap.js"], ppid: 500 },
+        500: { argv: ["/bin/sh", "-c", "node hook"], ppid: 700 },
+        700: { argv: ["claude"], ppid: 1 },
+    });
+    assert.equal(chooseWatchdogParentPid({ read, parentPid: 500 }), 700);
+});
+
+test("chooseWatchdogParentPid: no host + transient sh parent → the wrapper's parent (unrecognized claude)", () => {
+    // Exotic install form the matcher missed: the grandparent IS claude —
+    // watching it keeps the session alive with the correct lifetime, instead
+    // of re-arming the 2s self-kill on the transient wrapper.
+    const read = procTable({
+        [process.pid]: { argv: [process.execPath, "/pkg/dist/claude-native-bootstrap.js"], ppid: 500 },
+        500: { argv: ["/bin/sh", "-c", "node hook"], ppid: 600 },
+        600: { argv: ["/opt/weird-claude-launcher"], ppid: 1 },
+    });
+    assert.equal(chooseWatchdogParentPid({ read, parentPid: 500 }), 600);
+});
+
+test("chooseWatchdogParentPid: no host + non-transient/unreadable parent → legacy direct parent", () => {
+    // Interactive shell (manual run) — old behavior is the right behavior.
+    const interactive = procTable({
+        [process.pid]: { argv: ["node", "hook"], ppid: 500 },
+        500: { argv: ["/bin/zsh", "-i"], ppid: 1 },
+    });
+    assert.equal(chooseWatchdogParentPid({ read: interactive, parentPid: 500 }), 500);
+    // Wrapper parent whose own parent is init (no grandparent to watch).
+    const orphanSh = procTable({
+        [process.pid]: { argv: ["node", "hook"], ppid: 500 },
+        500: { argv: ["sh", "-c", "node hook"], ppid: 1 },
+    });
+    assert.equal(chooseWatchdogParentPid({ read: orphanSh, parentPid: 500 }), 500);
+    // Process table unreadable (hidepid / missing ps) — strictly no worse.
+    const blind = procTable({ [process.pid]: { argv: ["node", "hook"], ppid: 800 } });
+    assert.equal(chooseWatchdogParentPid({ read: blind, parentPid: 800 }), 800);
+});
+
+test("isClaudeHostArgv: exact matches only — never the hook itself or lookalikes", () => {
+    assert.equal(isClaudeHostArgv(["claude"]), true);
+    assert.equal(isClaudeHostArgv(["claude", "-p", "hi"]), true);
+    assert.equal(isClaudeHostArgv(["claude.exe", "--resume"]), true);
+    assert.equal(isClaudeHostArgv([process.execPath, "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"]), true);
+    assert.equal(isClaudeHostArgv([process.execPath, "--import", "tsx", "/src/claude"]), true);
+    // The hook's own script must never match (basename differs from `claude`).
+    assert.equal(isClaudeHostArgv([process.execPath, "/pkg/dist/claude-native-bootstrap.js"]), false);
+    assert.equal(isClaudeHostArgv([process.execPath, "/pkg/src/claude-native-bootstrap.ts"]), false);
+    // Wrappers and lookalikes: argv[0] is not claude.
+    assert.equal(isClaudeHostArgv(["timeout", "40", "claude", "-p", "hi"]), false);
+    assert.equal(isClaudeHostArgv(["/bin/sh", "-c", "claude"]), false);
+    assert.equal(isClaudeHostArgv(["claude-doctor"]), false);
+    assert.equal(isClaudeHostArgv(["claudeworkflow"]), false);
+    // node with unrelated args must not match just because `claude` appears
+    // inside a longer path/argument.
+    assert.equal(isClaudeHostArgv([process.execPath, "/home/x/claude-notes/server.js"]), false);
+});
+
+// — ps / powershell process readers (non-linux fallback) ———————————————————
+
+// ps prints "<ppid> <joined args>"; whitespace-splitting can only LOSE a
+// match (paths with spaces), never invent one.
+test("readPsProcInfo: parses '<ppid> <args>' lines, degrades to null", () => {
+    const fakePs = (table: Record<number, string | null>) => (cmd: string, args: string[]): string | null => {
+        assert.equal(cmd, "ps");
+        assert.deepEqual(args.slice(0, -1), ["-ww", "-o", "ppid=", "-o", "args=", "-p"]);
+        return table[Number(args[args.length - 1])] ?? null;
+    };
+    const ps = fakePs({
+        300: "  7654 /usr/local/bin/claude -p hi\n",
+        310: "5678 \n",
+        320: "",
+    });
+    assert.deepEqual(readPsProcInfo(300, ps), { argv: ["/usr/local/bin/claude", "-p", "hi"], ppid: 7654 });
+    // No visible args (zombie/protected) — argv null, ppid chain still walks.
+    assert.deepEqual(readPsProcInfo(310, ps), { argv: null, ppid: 5678 });
+    // Empty output or a failed ps run both mean "pid gone".
+    assert.equal(readPsProcInfo(320, ps), null);
+    assert.equal(readPsProcInfo(999, ps), null);
+    // A garbage ppid column must not crash the walk (ppid null, argv kept).
+    assert.deepEqual(readPsProcInfo(330, fakePs({ 330: "NaN claude\n" })), { argv: ["claude"], ppid: null });
+});
+
+// PowerShell emits "<ppid>\t<CommandLine>" in one Get-CimInstance call
+// (ps/wmic are deprecated or absent on windows).
+test("readWinProcInfo: parses '<ppid>\\t<commandline>', degrades to null", () => {
+    const fakePs1 = (out: string | null) => (_cmd: string, _args: string[]): string | null => out;
+    assert.deepEqual(
+        readWinProcInfo(300, fakePs1("300\tC:\\n.exe C:\\x\\claude.exe\r\n")),
+        { argv: ["C:\\n.exe", "C:\\x\\claude.exe"], ppid: 300 },
+    );
+    // Protected process: empty CommandLine — argv null, ppid kept.
+    assert.deepEqual(readWinProcInfo(300, fakePs1("300\t\n")), { argv: null, ppid: 300 });
+    // Empty output, or error text without a tab, both degrade to null.
+    assert.equal(readWinProcInfo(300, fakePs1("")), null);
+    assert.equal(readWinProcInfo(300, fakePs1("Get-CimInstance : object not found\n")), null);
+    assert.equal(readWinProcInfo(300, fakePs1(null)), null);
+});
+
+test("resolveClaudeHostPid: full walk over a ps-backed table", () => {
+    // Same tree as the /proc test, but reached through readPsProcInfo's
+    // parsing instead of an injected ProcReader.
+    const lines: Record<number, string | null> = {
+        100: "200 node /pkg/dist/claude-native-bootstrap.js",
+        200: "300 /bin/sh -c node /pkg/dist/claude-native-bootstrap.js",
+        300: "400 /usr/local/bin/claude -p hi",
+    };
+    const psRead = (pid: number) => readPsProcInfo(pid, (_cmd, _args) => lines[pid] ?? null);
+    assert.equal(resolveClaudeHostPid({ read: psRead, startPid: 100 }), 300);
+});
+
+// Live mechanism check for the fallback path: a real `ps` subprocess, real
+// ppid chain, real match — everything except /proc itself.
+test("resolveClaudeHostPid: live ps walk finds a spawned claude host", { timeout: 30_000, skip: process.platform === "win32" }, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-ps-live-"));
+    const claudeBin = path.join(dir, "claude");
+    const pidFile = path.join(dir, "child.pid");
+    // Node-shebang fake claude (argv[0] is `node`, script basename `claude`)
+    // spawning a leaf through the same sh -c wrapper shape as SessionStart.
+    fs.writeFileSync(claudeBin, [
+        "#!/usr/bin/env node",
+        `const { spawn } = require("node:child_process");`,
+        `const fs = require("node:fs");`,
+        `const child = spawn("/bin/sh", ["-c", "sleep 30"], { stdio: "ignore" });`,
+        `fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+        `setInterval(() => {}, 1 << 30);`,
+        "",
+    ].join("\n"));
+    fs.chmodSync(claudeBin, 0o755);
+    let leafPid = 0;
+    let claude: ReturnType<typeof spawn> | null = null;
+    try {
+        claude = spawn(claudeBin, [], { stdio: "ignore" });
+        for (let waited = 0; !fs.existsSync(pidFile); waited += 100) {
+            if (waited > 10_000) assert.fail("leaf pid file never appeared");
+            await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        leafPid = Number(fs.readFileSync(pidFile, "utf8"));
+        // One hop up from the leaf must reach the fake claude via REAL ps.
+        assert.equal(resolveClaudeHostPid({ read: (pid) => readPsProcInfo(pid), startPid: leafPid }), claude.pid);
+        // A pid that cannot exist must read as gone, not crash.
+        assert.equal(readPsProcInfo(999_999_999), null);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+        if (claude !== null && claude.pid !== undefined && claude.pid > 1) process.kill(claude.pid, "SIGKILL");
+        if (leafPid > 1) {
+            try {
+                process.kill(leafPid, "SIGKILL");
+            } catch {
+                // already gone
+            }
+        }
+    }
 });
 
 // — installer round-trip (fake claude CLI + sandboxed config dir) ———————
@@ -648,6 +892,89 @@ test("hook e2e: dist script spawns a proxy on the stable port, second run attach
             try {
                 const inst = JSON.parse(fs.readFileSync(instanceFile, "utf8")) as { pid: number };
                 if (typeof inst.pid === "number") killPid(inst.pid);
+            } catch {}
+        }
+        await rmHome(home);
+    }
+});
+
+// The live parent-gone incident (claude 2.1.278 + hook 0.1.139): claude runs
+// SessionStart hooks as `/bin/sh -c <cmd>`, the hook exits right after proxy
+// bring-up, the transient sh dies with it — and the proxy's watchdog, pointed
+// at that sh, killed a healthy proxy ~2s into EVERY session while claude kept
+// running. The fake claude below reproduces the exact tree; the assertions
+// pin both sides of the intended lifetime. Linux-only: the resolver walks
+// /proc and the fake claude needs /bin/sh + shebang exec (CI runs windows too).
+test("hook e2e: watchdog tracks the claude host, not the transient sh wrapper", { timeout: 120_000, skip: process.platform !== "linux" }, async () => {
+    const distScript = path.resolve(import.meta.dirname, "..", "dist", "claude-native-bootstrap.js");
+    ensureDistBuilt(distScript);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-hook-"));
+    const xdg = { home, config: path.join(home, "cfg"), state: path.join(home, "state"), cache: path.join(home, "cache"), data: path.join(home, "data") };
+    const tmp = path.join(xdg.home, "tmp");
+    fs.mkdirSync(tmp, { recursive: true });
+    const port = await freePort();
+    // Fake claude binary reproducing the live SessionStart shape: it launches
+    // the hook as a `/bin/sh -c` child (a transient sh sits between hook and
+    // session), then OUTLIVES the hook like a real interactive session.
+    const binDir = path.join(home, "bin");
+    fs.mkdirSync(binDir, { recursive: true });
+    const claudeBin = path.join(binDir, "claude");
+    // A shebang'ed SHELL script would show argv[0]=/bin/sh in /proc and never
+    // match; a node shebang mirrors the npm install shape: argv becomes
+    // [node, <path>/claude] — the exact form the resolver must accept.
+    fs.writeFileSync(
+        claudeBin,
+        '#!/usr/bin/env node\nconst { spawn } = require("node:child_process");\n' +
+            'spawn("/bin/sh", ["-c", process.env.BILI_FAKE_HOOK_CMD], { stdio: "ignore" });\n' +
+            "setInterval(() => {}, 60000);\n",
+    );
+    fs.chmodSync(claudeBin, 0o755);
+    const claudeProc = spawn(claudeBin, [], {
+        env: {
+            PATH: process.env.PATH ?? "/usr/bin:/bin",
+            HOME: xdg.home,
+            XDG_CONFIG_HOME: xdg.config,
+            XDG_STATE_HOME: xdg.state,
+            XDG_CACHE_HOME: xdg.cache,
+            XDG_DATA_HOME: xdg.data,
+            BILI_CLAUDE_NATIVE_PORT: String(port),
+            NO_COLOR: "1",
+            TMPDIR: tmp,
+            TEMP: tmp,
+            TMP: tmp,
+            BILI_FAKE_HOOK_CMD: `"${process.execPath}" '${distScript}'`,
+        },
+        stdio: "ignore",
+        detached: true,
+    });
+    const claudePid = claudeProc.pid ?? 0;
+    const instanceFile = path.join(xdg.state, "billion-context", "proxy-origin");
+    let proxyPid = 0;
+    try {
+        assert.ok(await waitForPort(port, 60_000), "proxy up behind the fake claude session");
+        const inst = JSON.parse(await waitForInstanceFile(instanceFile, 30_000)) as { pid: number; origin: string };
+        proxyPid = inst.pid;
+        assert.equal(inst.origin, `http://127.0.0.1:${port}`);
+
+        // The hook exits after bring-up and its transient sh parent dies with
+        // it. Old code watched that sh: parent-gone killed the proxy within
+        // one 2s watchdog tick. Several ticks later the proxy must STILL be
+        // serving — the session is alive.
+        await new Promise((r) => setTimeout(r, 6000));
+        assert.ok(await canConnect(port), "proxy survives the transient sh wrapper's death");
+
+        // Session end: claude dies, the proxy must follow within a few ticks.
+        if (claudePid > 1) killPid(claudePid);
+        const deadline = Date.now() + 15_000;
+        while (Date.now() < deadline && (await canConnect(port))) await new Promise((r) => setTimeout(r, 250));
+        assert.equal(await canConnect(port), false, "proxy exits with the claude session");
+    } finally {
+        if (claudePid > 1) killPid(claudePid);
+        if (proxyPid > 1) killPid(proxyPid);
+        if (await canConnect(port)) {
+            try {
+                const leftover = JSON.parse(fs.readFileSync(instanceFile, "utf8")) as { pid: number };
+                if (typeof leftover.pid === "number") killPid(leftover.pid);
             } catch {}
         }
         await rmHome(home);
