@@ -24,7 +24,7 @@ import {
     stripClaudeManagedBlock,
 } from "../src/plugin-install.ts";
 import { CLAUDE_NATIVE_DEFAULT_PORT, clearClaudeNativePort, resolveClaudeNativePort, saveClaudeNativePort } from "../src/config.ts";
-import { isClaudeHostArgv, planClaudeNativeBootstrap, resolveClaudeHostPid } from "../src/claude-native-bootstrap.ts";
+import { isClaudeHostArgv, planClaudeNativeBootstrap, readPsProcInfo, readWinProcInfo, resolveClaudeHostPid } from "../src/claude-native-bootstrap.ts";
 
 const HOOK_COMMAND = "/opt/bili/dist/claude-native-bootstrap.js";
 
@@ -225,6 +225,103 @@ test("isClaudeHostArgv: exact matches only — never the hook itself or lookalik
     // node with unrelated args must not match just because `claude` appears
     // inside a longer path/argument.
     assert.equal(isClaudeHostArgv([process.execPath, "/home/x/claude-notes/server.js"]), false);
+});
+
+// — ps / powershell process readers (non-linux fallback) ———————————————————
+
+// ps prints "<ppid> <joined args>"; whitespace-splitting can only LOSE a
+// match (paths with spaces), never invent one.
+test("readPsProcInfo: parses '<ppid> <args>' lines, degrades to null", () => {
+    const fakePs = (table: Record<number, string | null>) => (cmd: string, args: string[]): string | null => {
+        assert.equal(cmd, "ps");
+        assert.deepEqual(args.slice(0, -1), ["-ww", "-o", "ppid=", "-o", "args=", "-p"]);
+        return table[Number(args[args.length - 1])] ?? null;
+    };
+    const ps = fakePs({
+        300: "  7654 /usr/local/bin/claude -p hi\n",
+        310: "5678 \n",
+        320: "",
+    });
+    assert.deepEqual(readPsProcInfo(300, ps), { argv: ["/usr/local/bin/claude", "-p", "hi"], ppid: 7654 });
+    // No visible args (zombie/protected) — argv null, ppid chain still walks.
+    assert.deepEqual(readPsProcInfo(310, ps), { argv: null, ppid: 5678 });
+    // Empty output or a failed ps run both mean "pid gone".
+    assert.equal(readPsProcInfo(320, ps), null);
+    assert.equal(readPsProcInfo(999, ps), null);
+    // A garbage ppid column must not crash the walk (ppid null, argv kept).
+    assert.deepEqual(readPsProcInfo(330, fakePs({ 330: "NaN claude\n" })), { argv: ["claude"], ppid: null });
+});
+
+// PowerShell emits "<ppid>\t<CommandLine>" in one Get-CimInstance call
+// (ps/wmic are deprecated or absent on windows).
+test("readWinProcInfo: parses '<ppid>\\t<commandline>', degrades to null", () => {
+    const fakePs1 = (out: string | null) => (_cmd: string, _args: string[]): string | null => out;
+    assert.deepEqual(
+        readWinProcInfo(300, fakePs1("300\tC:\\n.exe C:\\x\\claude.exe\r\n")),
+        { argv: ["C:\\n.exe", "C:\\x\\claude.exe"], ppid: 300 },
+    );
+    // Protected process: empty CommandLine — argv null, ppid kept.
+    assert.deepEqual(readWinProcInfo(300, fakePs1("300\t\n")), { argv: null, ppid: 300 });
+    // Empty output, or error text without a tab, both degrade to null.
+    assert.equal(readWinProcInfo(300, fakePs1("")), null);
+    assert.equal(readWinProcInfo(300, fakePs1("Get-CimInstance : object not found\n")), null);
+    assert.equal(readWinProcInfo(300, fakePs1(null)), null);
+});
+
+test("resolveClaudeHostPid: full walk over a ps-backed table", () => {
+    // Same tree as the /proc test, but reached through readPsProcInfo's
+    // parsing instead of an injected ProcReader.
+    const lines: Record<number, string | null> = {
+        100: "200 node /pkg/dist/claude-native-bootstrap.js",
+        200: "300 /bin/sh -c node /pkg/dist/claude-native-bootstrap.js",
+        300: "400 /usr/local/bin/claude -p hi",
+    };
+    const psRead = (pid: number) => readPsProcInfo(pid, (_cmd, _args) => lines[pid] ?? null);
+    assert.equal(resolveClaudeHostPid({ read: psRead, startPid: 100 }), 300);
+});
+
+// Live mechanism check for the fallback path: a real `ps` subprocess, real
+// ppid chain, real match — everything except /proc itself.
+test("resolveClaudeHostPid: live ps walk finds a spawned claude host", { timeout: 30_000, skip: process.platform === "win32" }, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-ps-live-"));
+    const claudeBin = path.join(dir, "claude");
+    const pidFile = path.join(dir, "child.pid");
+    // Node-shebang fake claude (argv[0] is `node`, script basename `claude`)
+    // spawning a leaf through the same sh -c wrapper shape as SessionStart.
+    fs.writeFileSync(claudeBin, [
+        "#!/usr/bin/env node",
+        `const { spawn } = require("node:child_process");`,
+        `const fs = require("node:fs");`,
+        `const child = spawn("/bin/sh", ["-c", "sleep 30"], { stdio: "ignore" });`,
+        `fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+        `setInterval(() => {}, 1 << 30);`,
+        "",
+    ].join("\n"));
+    fs.chmodSync(claudeBin, 0o755);
+    let leafPid = 0;
+    let claude: ReturnType<typeof spawn> | null = null;
+    try {
+        claude = spawn(claudeBin, [], { stdio: "ignore" });
+        for (let waited = 0; !fs.existsSync(pidFile); waited += 100) {
+            if (waited > 10_000) assert.fail("leaf pid file never appeared");
+            await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        leafPid = Number(fs.readFileSync(pidFile, "utf8"));
+        // One hop up from the leaf must reach the fake claude via REAL ps.
+        assert.equal(resolveClaudeHostPid({ read: (pid) => readPsProcInfo(pid), startPid: leafPid }), claude.pid);
+        // A pid that cannot exist must read as gone, not crash.
+        assert.equal(readPsProcInfo(999_999_999), null);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+        if (claude !== null && claude.pid !== undefined && claude.pid > 1) process.kill(claude.pid, "SIGKILL");
+        if (leafPid > 1) {
+            try {
+                process.kill(leafPid, "SIGKILL");
+            } catch {
+                // already gone
+            }
+        }
+    }
 });
 
 // — installer round-trip (fake claude CLI + sandboxed config dir) ———————

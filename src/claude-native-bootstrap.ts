@@ -30,6 +30,7 @@
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "./launcher.js";
 import { resolveClaudeNativePort } from "./config.js";
 import { nativeBootstrapGate, proxyEnvOrigin } from "./agent/native-bootstrap.js";
@@ -68,13 +69,23 @@ export function planClaudeNativeBootstrap(env: NodeJS.ProcessEnv): { action: "ex
 
 const CLAUDE_HOST_MAX_WALK = 8;
 
-/** One /proc/<pid> snapshot. argv is null when cmdline is empty (zombies,
- *  kernel threads) — the ppid chain still walks through those. null return
- *  means the pid is gone (or /proc does not exist — non-linux callers fall
- *  back to the legacy direct parent). */
+/** One process-table snapshot. argv is null when no command line is visible
+ *  (zombies, kernel threads, protected processes) — the ppid chain still
+ *  walks through those. null return means the pid is gone or its reader
+ *  failed — callers fall back to the legacy direct parent. */
 type ProcInfo = { argv: string[] | null; ppid: number | null };
 
 type ProcReader = (pid: number) => ProcInfo | null;
+
+type ExecFn = (cmd: string, args: string[]) => string | null;
+
+function defaultExec(cmd: string, args: string[]): string | null {
+    try {
+        return execFileSync(cmd, args, { encoding: "utf8", timeout: 5000 });
+    } catch {
+        return null;
+    }
+}
 
 function readProcInfo(pid: number): ProcInfo | null {
     let argv: string[] | null = null;
@@ -97,6 +108,53 @@ function readProcInfo(pid: number): ProcInfo | null {
     return { argv, ppid };
 }
 
+/** ps fallback for platforms without /proc (darwin/BSD; the flags work on
+ *  linux too): one line "<ppid> <args...>". Whitespace-splitting a joined
+ *  command line can only LOSE a match (paths containing spaces) — never
+ *  invent one — so a miss degrades to the legacy fallback parent. Exported
+ *  for tests (inject `exec`). */
+export function readPsProcInfo(pid: number, exec: ExecFn = defaultExec): ProcInfo | null {
+    const out = exec("ps", ["-ww", "-o", "ppid=", "-o", "args=", "-p", String(pid)]);
+    if (out === null) return null;
+    const line = out.split("\n").find((l) => l.trim().length > 0);
+    if (line === undefined) return null;
+    const [ppidToken, ...rest] = line.trim().split(/\s+/);
+    const ppid = Number(ppidToken);
+    return { argv: rest.length > 0 ? rest : null, ppid: Number.isFinite(ppid) ? ppid : null };
+}
+
+/** Windows fallback: one PowerShell call returns "<ppid>\t<CommandLine>"
+ *  (ps/wmic are deprecated or absent). CommandLine can be empty for
+ *  protected processes — argv null still lets the ppid chain walk on.
+ *  Exported for tests (inject `exec`). */
+export function readWinProcInfo(pid: number, exec: ExecFn = defaultExec): ProcInfo | null {
+    const out = exec("powershell", [
+        "-NoProfile",
+        "-Command",
+        `(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}') | ForEach-Object { "$($_.ParentProcessId)\`t$($_.CommandLine)" }`,
+    ]);
+    if (out === null) return null;
+    const line = out.split("\n").find((l) => l.trim().length > 0);
+    if (line === undefined) return null;
+    const tab = line.indexOf("\t");
+    if (tab < 0) return null;
+    const ppid = Number(line.slice(0, tab).trim());
+    const argv = line
+        .slice(tab + 1)
+        .trim()
+        .split(/\s+/)
+        .filter((part) => part.length > 0);
+    return { argv: argv.length > 0 ? argv : null, ppid: Number.isFinite(ppid) ? ppid : null };
+}
+
+/** The platform's process-table reader: /proc on linux (microseconds, no
+ *  subprocess), PowerShell on windows, ps elsewhere. */
+function defaultProcReader(): ProcReader {
+    if (process.platform === "win32") return (pid) => readWinProcInfo(pid);
+    if (process.platform === "linux") return readProcInfo;
+    return (pid) => readPsProcInfo(pid);
+}
+
 /** Is this argv the claude-code session binary? Matches `claude`/`claude.exe`
  *  and `node .../claude...` installs (`@anthropic-ai/claude-code` paths or a
  *  bare `claude` argument). Must NOT match this hook's own script
@@ -115,12 +173,14 @@ export function isClaudeHostArgv(argv: string[]): boolean {
 }
 
 /** The claude session process that transitively owns this hook, found by
- *  walking up from `startPid` (default: this hook) through /proc. undefined
- *  when no claude host sits within CLAUDE_HOST_MAX_WALK hops — callers then
- *  fall back to the legacy direct parent (strictly no worse than before).
- *  Exported for tests (inject `read` to stub /proc). */
+ *  walking up from `startPid` (default: this hook) through the platform
+ *  process table (/proc on linux, ps elsewhere, PowerShell on windows).
+ *  undefined when no claude host sits within CLAUDE_HOST_MAX_WALK hops —
+ *  callers then fall back to the legacy direct parent (strictly no worse
+ *  than before). Exported for tests (inject `read` to stub the process
+ *  table). */
 export function resolveClaudeHostPid(opts: { read?: ProcReader; startPid?: number } = {}): number | undefined {
-    const read = opts.read ?? readProcInfo;
+    const read = opts.read ?? defaultProcReader();
     let pid = opts.startPid ?? process.pid;
     for (let hop = 0; hop < CLAUDE_HOST_MAX_WALK; hop++) {
         const info = read(pid);
