@@ -795,3 +795,62 @@ test("#1197 T11: plugin-announced request with history artifacts is processed, n
         rmSync(dir, { recursive: true, force: true });
     }
 });
+
+// Review of #1213: T3 pins the #1086 fallback for the TOOL-HISTORY family at
+// server level, but nothing pinned it for the TAGS family — the exact family
+// this PR re-scopes. A non-cooperative client whose HISTORY carries real
+// render tags must still be judged a chain when this instance holds no state
+// for it: byte-identical passthrough, one warn, no session record.
+test("#1197 T12: foreign client with tags in HISTORY passes through byte-identical, one warn, no state", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-chain-t12-"));
+    const store = new SessionStore({ dir, debounceMs: 5, enabled: true });
+    _setStoreForTest(store);
+    _resetSessionsForTest();
+    _resetChainWarningsForTest();
+    setRegistryForTest({});
+    const logs: LogRec[] = [];
+    setLogCapture((level, msg) => logs.push({ level, msg }));
+    const captured: Captured[] = [];
+    const upstream = makeUpstream(captured);
+    upstream.listen(0, "127.0.0.1");
+    await listen(upstream);
+    const proxy = await startServer(makeOpts(`http://127.0.0.1:${(upstream.address() as { port: number }).port}`));
+    await listen(proxy);
+    try {
+        // Proxy-mode chain shape: the re-voiced acp_summary lands as a user
+        // message whose content carries the render tags.
+        const realTag = "\x3cacp tokens=\"1.2K\" type=\"text\"\x3em00042\x3c/acp\x3e";
+        const raw = JSON.stringify({
+            model: MODEL,
+            stream: false,
+            messages: [
+                { role: "system", content: "You are a test assistant." },
+                { role: "user", content: `earlier context folded ${realTag} continue` },
+            ],
+        });
+        for (let i = 0; i < 2; i++) {
+            const resp = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/v1/chat/completions`, {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-acp-session": "foreign-tags-1" },
+                body: raw,
+            });
+            assert.equal(resp.status, 200);
+            await resp.text();
+        }
+        assert.equal(captured.length, 2);
+        assert.equal(captured[0]!.body, raw, "foreign payload with history tags must reach the LLM byte-identical (no kernel processing)");
+        assert.equal(captured[1]!.body, raw);
+        const warns = chainWarns(logs, "foreign-tags-1");
+        assert.equal(warns.length, 1, `exactly one warn per session (got ${warns.length}: ${JSON.stringify(warns)})`);
+        assert.ok(warns[0]!.msg.includes("chainContentDetection=false"), "warning must point at the escape valve");
+        assert.equal(peekSession("foreign-tags-1"), undefined, "foreign sessions must leave no trace in this instance");
+    } finally {
+        setLogCapture(null);
+        proxy.closeAllConnections?.();
+        await close(proxy);
+        upstream.closeAllConnections?.();
+        await close(upstream);
+        store.cancelAll();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
