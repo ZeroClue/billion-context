@@ -335,7 +335,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     const instanceStartedAt = Date.now();
     // #7 (shared stable-port proxy): the parent-gone watchdog watches a SET of
     // pids, not one. The spawning hook seeds it via BILI_PARENT_PID; every
-    // ATTACHING session (POST /__bili__/watcher) adds its claude host, so a
+    // ATTACHING session (POST /__bili/watcher) adds its claude host, so a
     // proxy shared across sessions dies when the LAST owner exits — not when
     // the first spawner does. Per-server like instanceId above; armed here
     // (before listen) so a racing first registration can never observe an
@@ -604,7 +604,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // for a flush (#414): they watch the launcher pid and run the graceful
     // path themselves when it disappears (≤2s after the parent exits).
     // #7: the watch is a SET — attached sessions register their host via
-    // POST /__bili__/watcher — so shutdown fires only when every owner is
+    // POST /__bili/watcher — so shutdown fires only when every owner is
     // gone. The empty set must persist through WATCHER_IDLE_GRACE_MS first:
     // a spawner that exits right after a second session launches would
     // otherwise kill the proxy before the attacher's registration lands
@@ -924,7 +924,7 @@ async function handle(
         }
         return handlePluginStatus(conversationId, res, { core, config, log }, params.get("fallback") === "latest");
     }
-    if (req.method === "POST" && req.url === "/__bili__/watcher") {
+    if (req.method === "POST" && req.url === "/__bili/watcher") {
         // #7: an ATTACHING claude session registers its host pid so the shared
         // proxy outlives the first spawner's exit. Only proxies started in
         // parent-watch mode (BILI_PARENT_PID) take watchers — daemons stay

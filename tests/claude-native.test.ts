@@ -982,7 +982,7 @@ test("hook e2e: watchdog tracks the claude host, not the transient sh wrapper", 
 });
 
 // #7: the stable-port proxy is shared across sessions, so the parent-gone
-// watchdog had to become a WATCHER SET — POST /__bili__/watcher lets an
+// watchdog had to become a WATCHER SET — POST /__bili/watcher lets an
 // attached session register its claude host, and the proxy dies only when
 // every owner is gone. This test pins the route contract against a real
 // dist proxy, no fake claude needed (platform-neutral):
@@ -997,7 +997,8 @@ test("watcher route: shared proxies take watcher registrations, daemons refuse (
     const xdg = { home, config: path.join(home, "cfg"), state: path.join(home, "state"), cache: path.join(home, "cache"), data: path.join(home, "data") };
     const port = await freePort();
     const origin = `http://127.0.0.1:${port}`;
-    const post = (body: unknown) => fetch(`${origin}/__bili__/watcher`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const post = (body: unknown, headers: Record<string, string> = {}) =>
+        fetch(`${origin}/__bili/watcher`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
     // Keeper: a live pid the armed proxy watches. Its death must take the
     // proxy down (the sweep side of the set watchdog). A second keeper pins
     // the idle GRACE: registering within WATCHER_IDLE_GRACE_MS of the last
@@ -1020,6 +1021,12 @@ test("watcher route: shared proxies take watcher registrations, daemons refuse (
     try {
         armed = spawnProxy(distCli, port, { ...baseEnv, BILI_PARENT_PID: String(keeperPid) });
         assert.ok(await waitForPort(port, 60_000), "armed proxy up");
+        // The watcher route MUST sit inside the /__bili/ admin family: a URL
+        // outside isAdminPath (e.g. a /__bili__/ spelling) silently skips the
+        // tunnel-header, loopback and trusted-origin gates. Both probes below
+        // must be rejected by the GATE (403), never reach the route.
+        assert.equal((await post({ pid: keeperPid }, { "x-bili-tunnel": "1" })).status, 403, "watcher route is behind the tunnel-header gate");
+        assert.equal((await post({ pid: keeperPid }, { origin: "https://evil.example" })).status, 403, "watcher route is behind the trusted-origin gate");
         assert.equal((await post({})).status, 400, "empty body rejected");
         assert.equal((await post({ pid: 0 })).status, 400, "pid 0 rejected");
         assert.equal((await post({ pid: "12" })).status, 400, "string pid rejected");
@@ -1068,7 +1075,7 @@ function spawnProxy(distCli: string, port: number, env: NodeJS.ProcessEnv): numb
 
 // #7 end-to-end: two concurrent claude sessions share ONE stable-port proxy.
 // The first session's hook SPAWNS it (watchdog seeded with session A's host);
-// the second ATTACHES and must register its own host via POST /__bili__/watcher.
+// the second ATTACHES and must register its own host via POST /__bili/watcher.
 // Old code: A's exit killed the shared proxy and session B went down with it
 // (Connection refused mid-session). Fixed: the proxy survives A's death while
 // B lives, and dies only after the LAST session exits. Linux-only like the
