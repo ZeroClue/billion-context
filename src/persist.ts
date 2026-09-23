@@ -109,6 +109,11 @@ interface PersistedSession {
         retrieveMisses?: number;
         storedBytes?: number;
         storeBytesSaved?: number;
+        imageShrunkCount?: number;
+        imageBytesSaved?: number;
+        imageTokensSaved?: number;
+        imageFullCalls?: number;
+        imageFullRestores?: number;
     };
     /** Free-form escape hatch (v2+). */
     metadata?: Record<string, unknown>;
@@ -161,6 +166,11 @@ function mergeState(parsed: CompressionState): CompressionState {
         // resurrects with absorbed=[] and hideAbsorbedMessages has nothing to hide.
         absorbed: parsed.absorbed ?? fresh.absorbed,
         rules: parsed.rules ?? fresh.rules,
+        // #1095: without these, a restart forgets both which refs are restored
+        // (image_full silently re-downscales them) and the shrink records that
+        // keep re-encoding deterministic per ref.
+        imageFullRestored: parsed.imageFullRestored ?? fresh.imageFullRestored,
+        imageShrinks: parsed.imageShrinks ?? fresh.imageShrinks,
     };
 }
 
@@ -718,8 +728,13 @@ function buildSession(parsed: PersistedSession): Session {
             retrieveCalls: stats.retrieveCalls ?? 0,
             retrieveHits: stats.retrieveHits ?? 0,
             retrieveMisses: stats.retrieveMisses ?? 0,
-            storedBytes: stats.storedBytes ?? 0,
-            storeBytesSaved: stats.storeBytesSaved ?? 0,
+        storedBytes: stats.storedBytes ?? 0,
+        storeBytesSaved: stats.storeBytesSaved ?? 0,
+        imageShrunkCount: stats.imageShrunkCount ?? 0,
+        imageBytesSaved: stats.imageBytesSaved ?? 0,
+        imageTokensSaved: stats.imageTokensSaved ?? 0,
+        imageFullCalls: stats.imageFullCalls ?? 0,
+        imageFullRestores: stats.imageFullRestores ?? 0,
         },
         metadata: parsed.metadata ?? {},
         state: mergeState(parsed.state),

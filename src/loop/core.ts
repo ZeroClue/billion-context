@@ -16,6 +16,7 @@ import {
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "../absorb.js";
 import { effectiveRulesConfig, executeRule } from "../rules-feature.js";
 import { ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "../store.js";
+import { IMAGE_FULL_TOOL_NAME, executeImageFull, imageCompressionEnabled, imageUsageSuffix } from "../image-compress.js";
 import { applyRanges } from "../stream.js";
 import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
 import { buildVisibilityMarker } from "../compress-loop.js";
@@ -189,6 +190,9 @@ export function executeProxyTool(
     if (ccrEnabled(ctx.session) && toolName === retrieveToolName(ctx.session)) {
         return executeRetrieve(args, ctx.session);
     }
+    if (imageCompressionEnabled(ctx.session) && toolName === IMAGE_FULL_TOOL_NAME) {
+        return executeImageFull(args, ctx.session, ctx.config, callId);
+    }
     return `[Unknown proxy tool: ${toolName}]`;
 }
 
@@ -224,7 +228,7 @@ function recordUsage(
     const foldNew = ctx.session.stats.pendingFoldUsage === true;
     if (foldNew) ctx.session.stats.pendingFoldUsage = false;
     ctx.log(
-        `[acp-usage] round ${round} input=${total} cached=${cached ?? 0} (cache hit ${hitPct}%)${foldNew ? " fold=new" : ""}${total <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`,
+        `[acp-usage] round ${round} input=${total} cached=${cached ?? 0} (cache hit ${hitPct}%)${foldNew ? " fold=new" : ""}${total <= 0 ? " (zero-total: lastInputTokens kept)" : ""}${imageUsageSuffix(ctx.session)}`,
     );
     if (total > 0 || typeof cached === "number") {
         recordCacheSample(ctx.session, { at: Date.now(), input: total, cached: cached ?? 0, output: out });

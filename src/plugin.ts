@@ -13,6 +13,7 @@ import { normalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsMarkerLineText, containsRenderTagText, createMarkerLineFilter, createTagEchoFilter, mayStartMarkerLine, mayStartRenderTag, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
 import { ccrEnabled, contentStoreOf, retrieveToolName } from "./store.js";
+import { imageUsageSuffix } from "./image-compress.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
 import { warnCacheCollapse } from "./cache-warn.js";
@@ -975,7 +976,7 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
         const hit = sample.cachedTokens === undefined ? undefined : Math.round((100 * (sample.cachedTokens ?? 0)) / total);
         const foldNew = session.stats.pendingFoldUsage === true;
         if (foldNew) session.stats.pendingFoldUsage = false;
-        loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} cached=${sample.cachedTokens ?? "n/a"}${hit === undefined ? "" : ` (cache hit ${hit}%)`}${foldNew ? " fold=new" : ""}`);
+        loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} cached=${sample.cachedTokens ?? "n/a"}${hit === undefined ? "" : ` (cache hit ${hit}%)`}${foldNew ? " fold=new" : ""}${imageUsageSuffix(session)}`);
         recordCacheSample(session, { at: Date.now(), input: total, cached: sample.cachedTokens ?? 0, output: sample.outputTokens });
     }
     if (sample.outputTokens !== undefined) session.stats.outputTokens += sample.outputTokens;

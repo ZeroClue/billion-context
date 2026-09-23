@@ -88,5 +88,8 @@
     "bundle": {
       "patch": "./dsh.bundle.patch.yml"
     }
+  },
+  "optionalDependencies": {
+    "sharp": "^0.35.4"
   }
 }
