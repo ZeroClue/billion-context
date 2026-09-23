@@ -742,16 +742,17 @@ export async function handlePluginTool(
         if (!entry) {
             // #1158: a tool call implies the model ALREADY answered, yet no model
             // request ever carried this conversation id — its traffic never reached
-            // this proxy at all. Two causes: the client's LLM transport injected its
-            // own fetch into the SDK, bypassing the intercepted global fetch (known
-            // case: dsh llm-pi-ai custom providers under a bare `dsh` profile
-            // install — the `bili dsh` launcher routes them via baseURL rewrite), or
-            // the id went stale after a host resume. Both were silently unselfable
-            // before; now the first hit leaves an actionable trace.
+            // this proxy at all. The exact cause is still under investigation with
+            // runtime evidence (candidates: the LLM transport bypasses the
+            // intercepted fetch via an SDK-injected fetch / non-global dispatcher,
+            // a host-side attribution gap leaves the traffic unclaimed by the
+            // takeover gate, or the id went stale after a host resume). Whatever
+            // it is, it was silently unselfable before; the first hit now leaves
+            // an actionable trace, and the trace names no single confirmed cause.
             if (!warnedNoModelRequests.has(conversationId)) {
                 if (warnedNoModelRequests.size >= WARNED_NO_MODEL_REQUESTS_CAP) warnedNoModelRequests.clear();
                 warnedNoModelRequests.add(conversationId);
-                deps.log("warn", `[plugin] NO MODEL REQUESTS seen for conversation ${conversationId} (tool "${tool}"): the model answered without any of its requests reaching this proxy — its LLM transport likely bypasses the intercepted fetch (SDK-injected fetch; known case: dsh llm-pi-ai custom providers under a bare \`dsh\` profile install — run through the \`bili dsh\` launcher, which rewrites their baseURLs) or the conversation id is stale after a host resume. Verify: send a message and look for processTurn lines in bili.log — none appearing means the transport is bypassing the proxy.`);
+                deps.log("warn", `[plugin] NO MODEL REQUESTS seen for conversation ${conversationId} (tool "${tool}"): the model answered without any of its requests reaching this proxy — candidates: its LLM transport bypasses the intercepted fetch (SDK-injected fetch or non-global dispatcher), the host's attribution left this traffic unclaimed by the proxy, or the conversation id is stale after a host resume. Verify: send a message and look for processTurn lines in bili.log — none appearing means the traffic never reaches the proxy; routing through the client's bili launcher (baseURL rewrite) reaches it regardless of which fetch the transport uses.`);
             }
         } else {
             deps.log("warn", `[plugin] tool "${tool}" rejected for conversation ${conversationId}: id registered but session not resident in this proxy instance`);
@@ -760,7 +761,7 @@ export async function handlePluginTool(
         res.end(JSON.stringify({
             ok: false,
             error: !entry
-                ? "unknown plugin conversation (no model request has arrived with this conversation id yet — if your messages ARE still reaching the model, its LLM transport is likely bypassing this proxy's fetch interception (SDK-injected fetch; e.g. dsh llm-pi-ai under a bare profile install — run through the bili launcher) or the id is stale after a host resume; check bili.log for processTurn lines)"
+                ? "unknown plugin conversation (no model request has arrived with this conversation id yet — if your messages ARE still reaching the model, its LLM transport may be bypassing this proxy's fetch interception (SDK-injected fetch / non-global dispatcher), the host's attribution may have left this traffic unclaimed by the proxy, or the id may be stale after a host resume; check bili.log for processTurn lines)"
                 : "unknown plugin conversation (id registered but its session is not resident in this proxy instance — a fresh model request re-binds it)",
         }));
         return;

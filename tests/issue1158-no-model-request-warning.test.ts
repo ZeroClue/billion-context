@@ -1,9 +1,10 @@
-// #1158: dsh's llm-pi-ai transport injects its own fetch into the OpenAI SDK,
-// bypassing the global-fetch interception — model requests never reach the
-// proxy, yet the model keeps calling the registered bili tools. The 404 for
-// such a conversation must be actionable (preserving the substrings mcp.ts /
-// opencode-v2.ts match on) and the warn one-shot per conversation, not a
-// silent repeat or an unselfable generic 404.
+// #1158: some dsh profile-install sessions show ZERO model requests reaching
+// the proxy (root cause under investigation with runtime evidence — transport
+// fetch shape vs host-side attribution gap), yet the model keeps calling the
+// registered bili tools. The 404 for such a conversation must be actionable —
+// hypothesis-neutral (no single confirmed cause named), preserving the
+// substrings mcp.ts / opencode-v2.ts match on — and the warn one-shot per
+// conversation, not a silent repeat or an unselfable generic 404.
 import assert from "node:assert/strict";
 import http from "node:http";
 import { beforeEach, describe, it } from "node:test";
@@ -50,15 +51,18 @@ describe("#1158: no-model-request 404 is loud, actionable, and one-shot", () => 
         // src/agent/opencode-v2.ts stale-id recovery.
         assert.match(r.json.error ?? "", /no model request has arrived with this conversation id yet/);
         assert.match(r.json.error ?? "", /no model request has arrived/);
-        // The new actionable part: names the bypass hypothesis + how to verify.
+        // The actionable part: names the candidate causes + how to verify.
         assert.match(r.json.error ?? "", /bypass/i);
-        assert.match(r.json.error ?? "", /launcher/i);
+        assert.match(r.json.error ?? "", /attribution/);
         assert.match(r.json.error ?? "", /processTurn/);
         const warns = logs.filter((l) => l.includes("NO MODEL REQUESTS"));
         assert.equal(warns.length, 1, `expected exactly one NO MODEL REQUESTS warn, got: ${logs.join(" | ")}`);
         assert.match(warns[0]!, /warn: \[plugin\] NO MODEL REQUESTS seen for conversation bypass-conv \(tool "acp_status"\)/);
-        assert.match(warns[0]!, /llm-pi-ai/);
-        assert.match(warns[0]!, /bili dsh/);
+        assert.match(warns[0]!, /bypasses the intercepted fetch/);
+        assert.match(warns[0]!, /stale after a host resume/);
+        assert.match(warns[0]!, /launcher/);
+        // The wording must NOT name any single confirmed cause (#1158 retraction).
+        assert.doesNotMatch(warns[0]!, /known case/i);
     });
 
     it("the warn fires once per conversation, not per rejected tool call", async () => {

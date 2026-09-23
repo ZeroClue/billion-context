@@ -436,19 +436,21 @@ Two lanes, same plugin (#941):
   plugin and the proxy never drift apart again (#953); profiles pinned to a
   local source are left alone. The refresh is best-effort and never fails the
   update itself.
-- **Known limitation under profile install — the `llm-pi-ai` transport
-  (#1158):** providers served by dsh's `llm-pi-ai` layer (custom
-  `llm-pi-ai.providers.*` routes) hand their own fetch implementation straight
-  to the OpenAI SDK, so their model requests never pass through the global
-  fetch patch this lane relies on — they bypass the proxy entirely and
-  compression stays silently inactive for them (transports that use the plain
-  global fetch work normally). Detection: the proxy logs a one-time
-  `[plugin] NO MODEL REQUESTS seen for conversation …` warning when such a
-  session's tools are called without any model request having arrived, and the
-  tool error carries the same guidance. Fix: launch through `bili dsh` instead
-  — the launcher's settings overlay rewrites those providers' `baseURL`s to
-  `/bili/` URLs, routing them regardless of which fetch the transport
-  injects.
+ - **Reported: zero proxy traffic for some transports under profile install
+   (#1158, under investigation):** sessions served by some of dsh's
+   `llm-pi-ai`-layer transports show NO model request ever reaching the proxy
+   (no `processTurn` logged; bili tools 404 with "no model request has
+   arrived") while other providers in the same host work normally. The root
+   cause is still being pinned down with runtime evidence — candidates: the
+   transport-level fetch shape (SDK-injected fetch / non-global dispatcher) or
+   a host-side attribution gap leaving the traffic unclaimed by the takeover
+   gate. Detection: the proxy logs a one-time `[plugin] NO MODEL REQUESTS seen
+   for conversation …` warning, and the dsh plugin logs each distinct endpoint
+   the attribution gate lets through unproxied (once per process). Reliable
+   workaround meanwhile: launch through `bili dsh` instead — the launcher's
+   settings overlay rewrites those providers' `baseURL`s to `/bili/` URLs, so
+   the traffic reaches the proxy regardless of which fetch the transport uses
+   or what the attribution state is.
 
 Under a `bili dsh` launch the plugin ATTACHES to the launcher's proxy (no
 second spawn). Raw upstream URLs rewrite to `<proxy>/bili/<url>` like

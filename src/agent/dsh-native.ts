@@ -416,7 +416,34 @@ export function apply(ctx: PluginContext): void {
         state.ready = start();
     }
 
-    state.takeoverGate = (_url) => sessionIdOf(ctx) !== undefined;
+    // #1158: a refusal sends model traffic DIRECT with zero trace — the exact
+    // silence that made the reported zero-traffic case undiagnosable. Log each
+    // distinct endpoint once per process with the attribution state at refusal
+    // time; legitimate agentless lanes (dsh's withoutInitiator background
+    // drivers, third-party in-process callers) add at most one flat line per
+    // endpoint, so the noise floor stays constant (#1117 silence preserved).
+    const gateRefusedPaths = new Set<string>();
+    state.takeoverGate = (url) => {
+        if (sessionIdOf(ctx) !== undefined) return true;
+        let key: string;
+        try {
+            const u = new URL(url);
+            key = `${u.origin}${u.pathname}`;
+        } catch {
+            key = url;
+        }
+        if (gateRefusedPaths.size >= 256) gateRefusedPaths.clear();
+        if (!gateRefusedPaths.has(key)) {
+            gateRefusedPaths.add(key);
+            let init: unknown;
+            try { init = ctx.agents?.currentInitiator?.(); } catch { init = undefined; }
+            const initiatorPresent = init !== undefined && init !== null;
+            console.error(
+                `bili-native-dsh: model request sent DIRECT (uncompressed) — takeover gate refused ${key}: ${initiatorPresent ? "initiator present but missing session id" : "no active initiator attribution (agentless/background lane, third-party in-process caller, or stale attribution after host resume?)"}`,
+            );
+        }
+        return false;
+    };
 
     state.headersFor = (_url) => {
         maybeRetry(ctx);

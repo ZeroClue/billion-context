@@ -793,6 +793,52 @@ test("#1117 apply() installs takeoverGate keyed on currentInitiator attribution"
     }
 });
 
+test("#1158 apply() gate refusal logs each endpoint once per process with attribution state", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1158-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const gate = _stateTakeoverGateForTest();
+            assert.ok(gate !== undefined, "takeoverGate installed");
+            const origErr = console.error;
+            const errs: string[] = [];
+            console.error = (...args: unknown[]) => {
+                errs.push(args.map(String).join(" "));
+            };
+            try {
+                const url = "https://api.gate-probe.test/v1/chat/completions";
+                assert.equal(gate(url), false, "unattributed → refused");
+                assert.equal(gate(url), false, "second refusal of the same endpoint");
+                let lines = errs.filter((e) => e.includes("takeover gate refused"));
+                assert.equal(lines.length, 1, `expected one refusal line per endpoint, got: ${errs.join(" | ")}`);
+                assert.match(lines[0]!, /api\.gate-probe\.test\/v1\/chat\/completions/);
+                assert.match(lines[0]!, /no active initiator attribution/);
+                // A query string neither spawns a new line nor leaks into it.
+                assert.equal(gate(`${url}?key=sk-do-not-log`), false);
+                assert.equal(errs.filter((e) => e.includes("takeover gate refused")).length, 1);
+                assert.ok(!errs.join(" ").includes("do-not-log"), "query string must not reach the log");
+                // A different endpoint earns its own line.
+                assert.equal(gate("https://api.other-probe.test/v1/messages"), false);
+                assert.equal(errs.filter((e) => e.includes("takeover gate refused")).length, 2);
+                // Attributed traffic claims silently.
+                ctx.setInitiator({ session: { id: "s1158" } });
+                assert.equal(gate(url), true);
+                assert.equal(errs.filter((e) => e.includes("takeover gate refused")).length, 2);
+            } finally {
+                console.error = origErr;
+            }
+        });
+    } finally {
+        proxy.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
 // — #1130: runtime death of a SHARED attach proxy re-probes + falls back ———
 
 test("#1130 apply() attach mode: runtime death of the shared proxy re-probes and falls back to spawn", async () => {
