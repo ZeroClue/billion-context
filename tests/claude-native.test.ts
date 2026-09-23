@@ -229,6 +229,13 @@ test("isTransientShArgv: sh-like one-shots only", () => {
     assert.equal(isTransientShArgv(["zsh", "-i"]), false);
     assert.equal(isTransientShArgv(["node", "-c", "x"]), false);
     assert.equal(isTransientShArgv(["sh", "--check", "x"]), false);
+    // Windows wrapper shapes (claude runs hooks via cmd /c there).
+    assert.equal(isTransientShArgv(["C:\\Windows\\System32\\cmd.exe", "/c", "node hook"]), true);
+    assert.equal(isTransientShArgv(["cmd.exe", "/C", "node hook"]), true);
+    assert.equal(isTransientShArgv(["cmd.exe", "/k", "node hook"]), false); // /k stays open
+    assert.equal(isTransientShArgv(["powershell.exe", "-NoProfile", "-Command", "node hook"]), true);
+    assert.equal(isTransientShArgv(["pwsh", "-Command", "node hook"]), true);
+    assert.equal(isTransientShArgv(["powershell.exe", "-NoProfile"]), false); // interactive
 });
 
 test("chooseWatchdogParentPid: host found → the host", () => {
