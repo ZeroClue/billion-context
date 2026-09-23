@@ -583,8 +583,13 @@ test("#1101 T7: persisted own state survives a simulated restart — disk branch
         await close(proxy);
         upstream.closeAllConnections?.();
         await close(upstream);
+        // #1194: a post-turn persist flush (debounceMs 0) can already be in
+        // flight here — cancelAll() only clears not-yet-fired debounces and
+        // never drains the in-flight write chain. Drain BEFORE deleting the
+        // store dir or rmSync races the writer (ENOTEMPTY on `openai/`).
+        for (const s of stores) await s.flushAll([]);
         for (const s of stores) s.cancelAll();
-        rmSync(root, { recursive: true, force: true });
+        rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     }
 });
 
