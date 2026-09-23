@@ -16,6 +16,14 @@ export default defineConfig({
     // npm then installs acp-kernel as a runtime dep — breaking the
     // "dist/index.js is self-contained" contract (AGENTS.md §2.1).
     noExternal: ["acp-kernel", "fzstd", "node-forge", "tar", "undici", "jsonc-parser"],
+    // sharp is an OPTIONAL runtime dependency (native module): it must stay
+    // EXTERNAL so dist keeps a real lazy `import("sharp")` that Node resolves
+    // at runtime from node_modules — missing ⇒ clean pass-through, and the
+    // bundle stays independent of which sharp version npm resolved (the caret
+    // range in optionalDependencies would otherwise bake that version into
+    // dist and break reproducible builds). tsup does not auto-externalize
+    // optionalDependencies, hence the explicit entry.
+    external: ["sharp"],
     banner: {
         // node-forge is a CommonJS dependency that calls require("crypto") etc.
         // inlined into our ESM output, esbuild's __require shim throws in an
