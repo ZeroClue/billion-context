@@ -22,6 +22,10 @@ permissions:
 jobs:
     cleanup-dist-tags:
         runs-on: ubuntu-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                pkg: [billion-context, billion-context-pr]
         steps:
             - uses: actions/setup-node@v4
               with:
@@ -34,11 +38,12 @@ jobs:
                   GH_TOKEN: ${{ github.token }}
                   DRY_RUN_INPUT: ${{ inputs.dry_run }}
                   BUFFER_DAYS_INPUT: ${{ inputs.buffer_days }}
+                  PKG_INPUT: ${{ matrix.pkg }}
                   EVENT_NAME: ${{ github.event_name }}
               run: |
                   set -uo pipefail
-                  REPO="${{ github.repository }}"
-                  PKG="billion-context"
+                  export REPO="${{ github.repository }}"
+                  PKG="$PKG_INPUT"
 
                   BUF="$BUFFER_DAYS_INPUT"
                   case "$BUF" in ''|*[!0-9]*) BUF=3 ;; esac
