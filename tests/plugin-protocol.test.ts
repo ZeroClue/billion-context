@@ -5,7 +5,7 @@ import test from "node:test";
 
 process.env.NODE_ENV = "test";
 
-import { defaultConfig } from "acp-kernel";
+import { defaultConfig, type Config } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -83,7 +83,7 @@ function compressToolScript(): string[] {
     ];
 }
 
-async function startHarness(scripts: string[][]): Promise<Harness> {
+async function startHarness(scripts: string[][], kernelConfig?: Config): Promise<Harness> {
     const captured: { body: string; headers: Record<string, string | string[] | undefined> }[] = [];
     let call = 0;
     const upstream = http.createServer((req, res) => {
@@ -123,7 +123,7 @@ async function startHarness(scripts: string[][]): Promise<Harness> {
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-test": { context: 400_000 } } } },
         modelContextLimit: 400_000,
-        kernelConfig: defaultConfig(400_000),
+        kernelConfig: kernelConfig ?? defaultConfig(400_000),
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
@@ -222,11 +222,14 @@ test("plugin manifest serves the exact wire tool schemas, headers and version", 
         assert.equal(manifest.ok, true);
         assert.equal(manifest.protocolVersion, 1);
         assert.ok(/^\d+\.\d+\.\d+/.test(manifest.version), `version looks wrong: ${manifest.version}`);
-        assert.deepEqual([...manifest.toolNames].sort(), ["absorb", "acp_cache", "acp_rule", "acp_status", "compress", "decompress", "search_context"]);
+        // #1192: absorb/acp_rule are opt-in and only advertised when enabled —
+        // hosts register manifest tools verbatim, so a disabled tool must not be
+        // listed (the default config enables neither). acp_cache stays in the base toolset.
+        assert.deepEqual([...manifest.toolNames].sort(), ["acp_cache", "acp_status", "compress", "decompress", "search_context"]);
         const names = manifest.tools.anthropic!.map((t) => String(t.name)).sort();
-        assert.deepEqual(names, ["absorb", "acp_cache", "acp_rule", "acp_status", "compress", "decompress", "search_context"]);
-        assert.equal(manifest.tools.openai!.length, 7);
-        assert.equal(manifest.tools.responses!.length, 7);
+        assert.deepEqual(names, ["acp_cache", "acp_status", "compress", "decompress", "search_context"]);
+        assert.equal(manifest.tools.openai!.length, 5);
+        assert.equal(manifest.tools.responses!.length, 5);
         // #841: search_context's conversation_id doubles as a cross-session
         // read-only search target — its param description must carry the
         // historical-search wording in every wire shape.
@@ -244,6 +247,30 @@ test("plugin manifest serves the exact wire tool schemas, headers and version", 
         assert.equal(manifest.headers.agent, "x-bili-plugin");
         assert.equal(manifest.headers.conversation, "x-bili-plugin-conversation");
         assert.equal(manifest.toolEndpoint, "/__bili/plugin/tool");
+    } finally {
+        await h.close();
+    }
+});
+
+// #1192 (regression): with absorb + rules enabled in the base config the
+// manifest advertises all seven tools again — enabling the features must not
+// shrink the toolset dsh/pi/omp/MCP shims register.
+test("plugin manifest: absorb and acp_rule advertised when enabled in config", async () => {
+    const h = await startHarness([textScript()], { ...defaultConfig(400_000), absorb: { enabled: true }, rules: { enabled: true } });
+    try {
+        const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/manifest`);
+        assert.equal(resp.status, 200);
+        const manifest = (await resp.json()) as { toolNames: string[]; tools: Record<string, Array<Record<string, unknown>>> };
+        assert.deepEqual([...manifest.toolNames].sort(), ["absorb", "acp_cache", "acp_rule", "acp_status", "compress", "decompress", "search_context"]);
+        for (const shape of ["anthropic", "openai", "responses"] as const) {
+            const listed = manifest.tools[shape]!.map((t) => {
+                const fn = t.function as { name?: unknown } | undefined;
+                return typeof t.name === "string" ? t.name : (typeof fn?.name === "string" ? fn.name : "");
+            });
+            assert.ok(listed.includes("absorb"), `${shape} has absorb`);
+            assert.ok(listed.includes("acp_rule"), `${shape} has acp_rule`);
+            assert.equal(listed.length, 7);
+        }
     } finally {
         await h.close();
     }

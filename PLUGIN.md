@@ -50,7 +50,7 @@ Fetch once at plugin startup.
 }
 ```
 
-Register the four tools natively with your agent, in whichever wire format your agent speaks. If `protocolVersion` is higher than you know, still register the tools — extra fields in schemas are ignored by agents.
+Register the tools natively with your agent, in whichever wire format your agent speaks — register exactly what `toolNames` lists. The opt-in tools (`absorb`, `acp_rule`) appear only when the proxy's config enables them; calling one that is known but disabled answers `200` with an explanatory `result` instead of an error (#1192). If `protocolVersion` is higher than you know, still register the tools — extra fields in schemas are ignored by agents.
 
 ### 2. Request headers
 
@@ -92,7 +92,7 @@ Notes:
 
 - Execution happens **under the session lock**, against the same view the model was shown on the last request (refs match what the model sees).
 - `compress` mutates state; `decompress` / `search_context` / `acp_status` are read-only.
-- Errors: `400` invalid JSON / missing `conversationId` / unknown tool, `404` unknown conversation (no model request has arrived with that conversation id yet), `500` execution failure.
+- Errors: `400` invalid JSON / missing `conversationId` / unknown tool, `404` unknown conversation (no model request has arrived with that conversation id yet), `500` execution failure. A **known but disabled** opt-in tool (`absorb` / `acp_rule`) is not an error: it answers `200` with `ok: true` and a `result` explaining that the feature is off on this proxy (#1192).
 
 ### 4. `GET /__bili/plugin/status?conversationId=<id>`
 
@@ -148,7 +148,7 @@ No special handling is needed for decompression: `decompress` results come back 
 
 ## Obligations of a plugin
 
-1. Register the four tools from the manifest (all of them; the model relies on the full set).
+1. Register the tools from the manifest (all of them as listed; the model relies on the full set).
 2. Send both headers on every model request through the proxy.
 3. Forward tool executions verbatim; return `result` as the tool result.
 4. Self-disable when not running behind bili (e.g. the agent's baseURL does not point at the proxy) — same convention as billion-context-pi / opencode-acp extensions.

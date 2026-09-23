@@ -912,7 +912,7 @@ async function handle(
     // tool endpoint lets an agent-side plugin execute compress/decompress/
     // search_context/acp_status against the session the plugin drives. Both
     // live under the /__bili/ loopback + trusted-origin gate above.
-    if (req.method === "GET" && req.url === "/__bili/plugin/manifest") return handlePluginManifest(res);
+    if (req.method === "GET" && req.url === "/__bili/plugin/manifest") return handlePluginManifest(res, config);
     if (req.method === "GET" && req.url?.startsWith("/__bili/plugin/status")) {
         const query = req.url.slice(req.url.indexOf("?") + 1);
         const params = new URLSearchParams(query);
