@@ -32,6 +32,9 @@
 // left to the kernel's natural ingest diff (#395 gap, acceptable: manual
 // /compact is rare and auto mode is off).
 
+import { appendFileSync, mkdirSync } from "node:fs";
+import path from "node:path";
+import { defaultLogFile } from "../paths.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, type NativeInterceptState } from "./native-intercept.js";
@@ -173,6 +176,23 @@ function errMessage(err: unknown): string {
     return err instanceof Error ? err.message : String(err);
 }
 
+// #1158: GUI hosts swallow process stderr, so a bootstrap failure that only
+// console.errors vanishes together with the symptom it causes (silent
+// direct-send degradation — zero interception, zero trace). Append the same
+// fact to the shared bili.log in the proxy's own line shape, origin-marked
+// [dsh-client], best-effort: a failed append must never break the host.
+// appendFileSync reopens by path on every call, so the proxy's 10MB rotation
+// (rename to .old) can't strand these writes on a renamed inode.
+export function persistClientEvent(msg: string): void {
+    try {
+        const file = defaultLogFile();
+        mkdirSync(path.dirname(file), { recursive: true });
+        appendFileSync(file, `${new Date().toISOString()} [warn] [dsh-client] ${msg}\n`);
+    } catch {
+        // best-effort: logging must never break the host
+    }
+}
+
 async function bootstrap(): Promise<string | undefined> {
     try {
         const handle = await ensureProxyRunning(
@@ -188,7 +208,9 @@ async function bootstrap(): Promise<string | undefined> {
         // lifecycles goes through ensureProxyRunning's instance discovery.
         return handle.origin;
     } catch (err) {
-        console.error(`bili-native-dsh: proxy bootstrap failed — model traffic goes direct (uncompressed): ${errMessage(err)}`);
+        const msg = `proxy bootstrap failed — model traffic goes direct (uncompressed): ${errMessage(err)}`;
+        persistClientEvent(msg);
+        console.error(`bili-native-dsh: ${msg}`);
         return undefined;
     }
 }
@@ -222,6 +244,7 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
         state.origin = attachOrigin;
         return attachOrigin;
     }
+    persistClientEvent(`attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
     console.error(`bili-native-dsh: attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
     // Unfreeze: only the preset (BILLION_CONTEXT_PROXY) freezes future
     // plans; an explicit BILLION_CONTEXT_ATTACH never touches the preset.
@@ -232,6 +255,7 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
     const start = singleFlight(_spawnForTest ?? bootstrap);
     state.respawn = start;
     state.onGiveUp = () => {
+        persistClientEvent("proxy respawn gave up — model traffic goes direct (uncompressed)");
         register.base = undefined;
         register.toolsReady = false;
     };
@@ -398,6 +422,7 @@ export function apply(ctx: PluginContext): void {
             const start = singleFlight(() => verifyAttachAndRecover(attachOrigin));
             state.respawn = start;
             state.onGiveUp = () => {
+                persistClientEvent("proxy respawn gave up — model traffic goes direct (uncompressed)");
                 register.base = undefined;
                 register.toolsReady = false;
             };
@@ -410,13 +435,41 @@ export function apply(ctx: PluginContext): void {
         const start = singleFlight(bootstrap);
         state.respawn = start;
         state.onGiveUp = () => {
+            persistClientEvent("proxy respawn gave up — model traffic goes direct (uncompressed)");
             register.base = undefined;
             register.toolsReady = false;
         };
         state.ready = start();
     }
 
-    state.takeoverGate = (_url) => sessionIdOf(ctx) !== undefined;
+    // #1158: a refusal sends model traffic DIRECT with zero trace — the exact
+    // silence that made the reported zero-traffic case undiagnosable. Log each
+    // distinct endpoint once per process with the attribution state at refusal
+    // time; legitimate agentless lanes (dsh's withoutInitiator background
+    // drivers, third-party in-process callers) add at most one flat line per
+    // endpoint, so the noise floor stays constant (#1117 silence preserved).
+    const gateRefusedPaths = new Set<string>();
+    state.takeoverGate = (url) => {
+        if (sessionIdOf(ctx) !== undefined) return true;
+        let key: string;
+        try {
+            const u = new URL(url);
+            key = `${u.origin}${u.pathname}`;
+        } catch {
+            key = url;
+        }
+        if (gateRefusedPaths.size >= 256) gateRefusedPaths.clear();
+        if (!gateRefusedPaths.has(key)) {
+            gateRefusedPaths.add(key);
+            let init: unknown;
+            try { init = ctx.agents?.currentInitiator?.(); } catch { init = undefined; }
+            const initiatorPresent = init !== undefined && init !== null;
+            console.error(
+                `bili-native-dsh: model request sent DIRECT (uncompressed) — takeover gate refused ${key}: ${initiatorPresent ? "initiator present but missing session id" : "no active initiator attribution (agentless/background lane, third-party in-process caller, or stale attribution after host resume?)"}`,
+            );
+        }
+        return false;
+    };
 
     state.headersFor = (_url) => {
         maybeRetry(ctx);

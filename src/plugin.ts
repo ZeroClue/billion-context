@@ -160,6 +160,14 @@ const MAX_PLUGIN_CONVERSATIONS = 1024;
 const conversations = new Map<string, ConversationEntry>();
 const remembered = new Map<string, RememberedMessages>();
 
+// #1158: one-shot "no model requests arrived" warnings, keyed by conversation
+// id. A tool call proves the model already answered, so an id with ZERO model
+// requests means its traffic never reached this proxy (SDK-injected fetch,
+// e.g. dsh llm-pi-ai under a bare profile install) or is stale after a host
+// resume — warn once per conversation instead of on every rejected tool call.
+const warnedNoModelRequests = new Set<string>();
+const WARNED_NO_MODEL_REQUESTS_CAP = 4096;
+
 // The conversationId → session mapping is in-memory. Persist it so a resumed
 // or restarted proxy can still resolve /acp + tool calls to the (persisted)
 // session without waiting for a fresh model request. Best-effort: a crash
@@ -731,12 +739,29 @@ export async function handlePluginTool(
         // NEVER registered is the classic stale-shim-id case (host resumed its
         // session after the MCP shim captured CLAUDE_CODE_SESSION_ID) — say so,
         // and log it: these 404s used to be invisible in bili.log.
-        deps.log("warn", `[plugin] tool "${tool}" rejected for conversation ${conversationId}: ${entry ? "id registered but session not resident in this proxy instance" : "id never registered (stale shim session id after host resume?)"}`);
+        if (!entry) {
+            // #1158: a tool call implies the model ALREADY answered, yet no model
+            // request ever carried this conversation id — its traffic never reached
+            // this proxy at all. The exact cause is still under investigation with
+            // runtime evidence (candidates: the LLM transport bypasses the
+            // intercepted fetch via an SDK-injected fetch / non-global dispatcher,
+            // a host-side attribution gap leaves the traffic unclaimed by the
+            // takeover gate, or the id went stale after a host resume). Whatever
+            // it is, it was silently unselfable before; the first hit now leaves
+            // an actionable trace, and the trace names no single confirmed cause.
+            if (!warnedNoModelRequests.has(conversationId)) {
+                if (warnedNoModelRequests.size >= WARNED_NO_MODEL_REQUESTS_CAP) warnedNoModelRequests.clear();
+                warnedNoModelRequests.add(conversationId);
+                deps.log("warn", `[plugin] NO MODEL REQUESTS seen for conversation ${conversationId} (tool "${tool}"): the model answered without any of its requests reaching this proxy — candidates: its LLM transport bypasses the intercepted fetch (SDK-injected fetch or non-global dispatcher), the host's attribution left this traffic unclaimed by the proxy, or the conversation id is stale after a host resume. Verify: send a message and look for processTurn lines in bili.log — none appearing means the traffic never reaches the proxy; routing through the client's bili launcher (baseURL rewrite) reaches it regardless of which fetch the transport uses.`);
+            }
+        } else {
+            deps.log("warn", `[plugin] tool "${tool}" rejected for conversation ${conversationId}: id registered but session not resident in this proxy instance`);
+        }
         res.writeHead(404, { "content-type": "application/json" });
         res.end(JSON.stringify({
             ok: false,
             error: !entry
-                ? "unknown plugin conversation (no model request has arrived with this conversation id yet)"
+                ? "unknown plugin conversation (no model request has arrived with this conversation id yet — if your messages ARE still reaching the model, its LLM transport may be bypassing this proxy's fetch interception (SDK-injected fetch / non-global dispatcher), the host's attribution may have left this traffic unclaimed by the proxy, or the id may be stale after a host resume; check bili.log for processTurn lines)"
                 : "unknown plugin conversation (id registered but its session is not resident in this proxy instance — a fresh model request re-binds it)",
         }));
         return;
@@ -2203,4 +2228,5 @@ export function _resetPluginStateForTest(): void {
     pendingRegisters.length = 0;
     registeredIds.clear();
     pluginRuntimeTable.clear();
+    warnedNoModelRequests.clear();
 }
