@@ -389,6 +389,9 @@ test("records rawInputTokens per turn and persists it (#1082)", async () => {
             const expected = estimateRawBodyTokens(imgBody) + imageTokensInParsedBody("openai", imgBody);
             const raw2 = sess!.metadata.rawInputTokens;
             assert.ok(typeof raw2 === "number" && raw2 >= expected, `image turn records text+image (want >= ${expected}, got ${String(raw2)})`);
+            // #1208: a debounced save from an earlier turn can still be in flight
+            // here; drain it so its stale rename cannot land after this read.
+            await store.flushAll([]);
             assert.ok(store.flushSync(sess as Session), "flush lands the session file");
             const file = findSessionFile(dir, "gc-rec-integration");
             assert.ok(file, "session file written to disk");
