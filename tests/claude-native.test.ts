@@ -24,7 +24,7 @@ import {
     stripClaudeManagedBlock,
 } from "../src/plugin-install.ts";
 import { CLAUDE_NATIVE_DEFAULT_PORT, clearClaudeNativePort, resolveClaudeNativePort, saveClaudeNativePort } from "../src/config.ts";
-import { planClaudeNativeBootstrap } from "../src/claude-native-bootstrap.ts";
+import { isClaudeHostArgv, planClaudeNativeBootstrap, resolveClaudeHostPid } from "../src/claude-native-bootstrap.ts";
 
 const HOOK_COMMAND = "/opt/bili/dist/claude-native-bootstrap.js";
 
@@ -147,6 +147,84 @@ test("planClaudeNativeBootstrap: launcher-owned / opt-out / start", () => {
     const start = planClaudeNativeBootstrap({});
     assert.deepEqual(start, { action: "start", port: CLAUDE_NATIVE_DEFAULT_PORT });
     assert.equal(planClaudeNativeBootstrap({ BILI_CLAUDE_NATIVE_PORT: "49999" }).port, 49999);
+});
+
+// — claude host pid resolution (parent-gone regression) —————————————————
+
+// Live shape (claude 2.1.278, SessionStart): the hook's direct parent is a
+// TRANSIENT `/bin/sh -c` wrapper; the claude session sits one level above it.
+function procTable(table: Record<number, { argv?: string[]; ppid?: number }>): (pid: number) => { argv: string[] | null; ppid: number | null } | null {
+    return (pid) => {
+        const entry = table[pid];
+        if (entry === undefined) return null;
+        return { argv: entry.argv ?? null, ppid: entry.ppid ?? null };
+    };
+}
+
+test("resolveClaudeHostPid: walks past the transient sh wrapper to claude", () => {
+    const read = procTable({
+        100: { argv: [process.execPath, "/pkg/dist/claude-native-bootstrap.js"], ppid: 200 },
+        200: { argv: ["/bin/sh", "-c", "node /pkg/dist/claude-native-bootstrap.js"], ppid: 300 },
+        300: { argv: ["/usr/local/bin/claude", "-p", "hi"], ppid: 400 },
+        400: { argv: ["/bin/bash"], ppid: 1 },
+    });
+    assert.equal(resolveClaudeHostPid({ read, startPid: 100 }), 300);
+});
+
+test("resolveClaudeHostPid: matches npm/node installs and skips zombie wrappers", () => {
+    // node-form install: node .../@anthropic-ai/claude-code/cli.js
+    const npmInstall = procTable({
+        100: { argv: [process.execPath, "/pkg/dist/claude-native-bootstrap.js"], ppid: 110 },
+        110: { argv: ["/bin/sh", "-c", "node hook"], ppid: 120 },
+        120: { argv: [process.execPath, "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"], ppid: 1 },
+    });
+    assert.equal(resolveClaudeHostPid({ read: npmInstall, startPid: 100 }), 120);
+
+    // The wrapper may linger as a zombie (empty cmdline) — the walk must
+    // continue through it instead of giving up.
+    const zombieSh = procTable({
+        100: { ppid: 110 },
+        110: { argv: [], ppid: 120 },
+        120: { argv: ["claude"], ppid: 1 },
+    });
+    assert.equal(resolveClaudeHostPid({ read: zombieSh, startPid: 100 }), 120);
+});
+
+test("resolveClaudeHostPid: no claude host in range → undefined (caller keeps legacy parent)", () => {
+    // `timeout 40 claude ...` runs claude, but a bare timeout tree WITHOUT a
+    // claude entry must not match, and neither must the wrapper chain itself.
+    const noClaude = procTable({
+        100: { argv: [process.execPath, "/pkg/dist/claude-native-bootstrap.js"], ppid: 200 },
+        200: { argv: ["/bin/sh", "-c", "node /pkg/dist/claude-native-bootstrap.js"], ppid: 300 },
+        300: { argv: ["timeout", "40", "claude", "-p", "hi"], ppid: 1 },
+    });
+    assert.equal(resolveClaudeHostPid({ read: noClaude, startPid: 100 }), undefined);
+
+    // Dead parent mid-walk, and a chain deeper than the walk budget.
+    assert.equal(resolveClaudeHostPid({ read: procTable({ 100: { argv: ["node"], ppid: 200 } }), startPid: 100 }), undefined);
+    const deep: Record<number, { argv: string[]; ppid: number }> = {};
+    for (let i = 0; i < 30; i++) deep[100 + i] = { argv: ["proc", String(i)], ppid: 101 + i };
+    deep[999] = { argv: ["claude"], ppid: 1 };
+    assert.equal(resolveClaudeHostPid({ read: procTable(deep), startPid: 100 }), undefined);
+});
+
+test("isClaudeHostArgv: exact matches only — never the hook itself or lookalikes", () => {
+    assert.equal(isClaudeHostArgv(["claude"]), true);
+    assert.equal(isClaudeHostArgv(["claude", "-p", "hi"]), true);
+    assert.equal(isClaudeHostArgv(["claude.exe", "--resume"]), true);
+    assert.equal(isClaudeHostArgv([process.execPath, "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"]), true);
+    assert.equal(isClaudeHostArgv([process.execPath, "--import", "tsx", "/src/claude"]), true);
+    // The hook's own script must never match (basename differs from `claude`).
+    assert.equal(isClaudeHostArgv([process.execPath, "/pkg/dist/claude-native-bootstrap.js"]), false);
+    assert.equal(isClaudeHostArgv([process.execPath, "/pkg/src/claude-native-bootstrap.ts"]), false);
+    // Wrappers and lookalikes: argv[0] is not claude.
+    assert.equal(isClaudeHostArgv(["timeout", "40", "claude", "-p", "hi"]), false);
+    assert.equal(isClaudeHostArgv(["/bin/sh", "-c", "claude"]), false);
+    assert.equal(isClaudeHostArgv(["claude-doctor"]), false);
+    assert.equal(isClaudeHostArgv(["claudeworkflow"]), false);
+    // node with unrelated args must not match just because `claude` appears
+    // inside a longer path/argument.
+    assert.equal(isClaudeHostArgv([process.execPath, "/home/x/claude-notes/server.js"]), false);
 });
 
 // — installer round-trip (fake claude CLI + sandboxed config dir) ———————
@@ -648,6 +726,88 @@ test("hook e2e: dist script spawns a proxy on the stable port, second run attach
             try {
                 const inst = JSON.parse(fs.readFileSync(instanceFile, "utf8")) as { pid: number };
                 if (typeof inst.pid === "number") killPid(inst.pid);
+            } catch {}
+        }
+        await rmHome(home);
+    }
+});
+
+// The live parent-gone incident (claude 2.1.278 + hook 0.1.139): claude runs
+// SessionStart hooks as `/bin/sh -c <cmd>`, the hook exits right after proxy
+// bring-up, the transient sh dies with it — and the proxy's watchdog, pointed
+// at that sh, killed a healthy proxy ~2s into EVERY session while claude kept
+// running. The fake claude below reproduces the exact tree; the assertions
+// pin both sides of the intended lifetime.
+test("hook e2e: watchdog tracks the claude host, not the transient sh wrapper", { timeout: 120_000 }, async () => {
+    const distScript = path.resolve(import.meta.dirname, "..", "dist", "claude-native-bootstrap.js");
+    ensureDistBuilt(distScript);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-hook-"));
+    const xdg = { home, config: path.join(home, "cfg"), state: path.join(home, "state"), cache: path.join(home, "cache"), data: path.join(home, "data") };
+    const tmp = path.join(xdg.home, "tmp");
+    fs.mkdirSync(tmp, { recursive: true });
+    const port = await freePort();
+    // Fake claude binary reproducing the live SessionStart shape: it launches
+    // the hook as a `/bin/sh -c` child (a transient sh sits between hook and
+    // session), then OUTLIVES the hook like a real interactive session.
+    const binDir = path.join(home, "bin");
+    fs.mkdirSync(binDir, { recursive: true });
+    const claudeBin = path.join(binDir, "claude");
+    // A shebang'ed SHELL script would show argv[0]=/bin/sh in /proc and never
+    // match; a node shebang mirrors the npm install shape: argv becomes
+    // [node, <path>/claude] — the exact form the resolver must accept.
+    fs.writeFileSync(
+        claudeBin,
+        '#!/usr/bin/env node\nconst { spawn } = require("node:child_process");\n' +
+            'spawn("/bin/sh", ["-c", process.env.BILI_FAKE_HOOK_CMD], { stdio: "ignore" });\n' +
+            "setInterval(() => {}, 60000);\n",
+    );
+    fs.chmodSync(claudeBin, 0o755);
+    const claudeProc = spawn(claudeBin, [], {
+        env: {
+            PATH: process.env.PATH ?? "/usr/bin:/bin",
+            HOME: xdg.home,
+            XDG_CONFIG_HOME: xdg.config,
+            XDG_STATE_HOME: xdg.state,
+            XDG_CACHE_HOME: xdg.cache,
+            XDG_DATA_HOME: xdg.data,
+            BILI_CLAUDE_NATIVE_PORT: String(port),
+            NO_COLOR: "1",
+            TMPDIR: tmp,
+            TEMP: tmp,
+            TMP: tmp,
+            BILI_FAKE_HOOK_CMD: `"${process.execPath}" '${distScript}'`,
+        },
+        stdio: "ignore",
+        detached: true,
+    });
+    const claudePid = claudeProc.pid ?? 0;
+    const instanceFile = path.join(xdg.state, "billion-context", "proxy-origin");
+    let proxyPid = 0;
+    try {
+        assert.ok(await waitForPort(port, 60_000), "proxy up behind the fake claude session");
+        const inst = JSON.parse(await waitForInstanceFile(instanceFile, 30_000)) as { pid: number; origin: string };
+        proxyPid = inst.pid;
+        assert.equal(inst.origin, `http://127.0.0.1:${port}`);
+
+        // The hook exits after bring-up and its transient sh parent dies with
+        // it. Old code watched that sh: parent-gone killed the proxy within
+        // one 2s watchdog tick. Several ticks later the proxy must STILL be
+        // serving — the session is alive.
+        await new Promise((r) => setTimeout(r, 6000));
+        assert.ok(await canConnect(port), "proxy survives the transient sh wrapper's death");
+
+        // Session end: claude dies, the proxy must follow within a few ticks.
+        if (claudePid > 1) killPid(claudePid);
+        const deadline = Date.now() + 15_000;
+        while (Date.now() < deadline && (await canConnect(port))) await new Promise((r) => setTimeout(r, 250));
+        assert.equal(await canConnect(port), false, "proxy exits with the claude session");
+    } finally {
+        if (claudePid > 1) killPid(claudePid);
+        if (proxyPid > 1) killPid(proxyPid);
+        if (await canConnect(port)) {
+            try {
+                const leftover = JSON.parse(fs.readFileSync(instanceFile, "utf8")) as { pid: number };
+                if (typeof leftover.pid === "number") killPid(leftover.pid);
             } catch {}
         }
         await rmHome(home);

@@ -7,11 +7,11 @@
 //      (resolveClaudeNativePort: BILI_CLAUDE_NATIVE_PORT > config
 //      claude.nativePort > 48787) with a /bili/-wrapped upstream — full
 //      traffic visibility without MITM;
-//   2. THIS hook (child of the claude process, fired before the first model
-//      request) makes sure a proxy is listening there: attach to a healthy
-//      compatible one, else spawn one detached whose parent-pid watchdog
-//      watches CLAUDE's pid (this hook's parent — the hook itself exits
-//      immediately) so the proxy lives and dies with the session;
+//   2. THIS hook (fired before the first model request) makes sure a proxy
+//      is listening there: attach to a healthy compatible one, else spawn one
+//      detached whose parent-pid watchdog watches CLAUDE's pid (resolved by
+//      walking past the transient `/bin/sh -c` hook wrapper — the hook itself
+//      exits immediately) so the proxy lives and dies with the session;
 //   3. the MCP shim (dist/mcp.js, registered user-scope, pinned to the same
 //      stable port) provides the native compress/decompress/acp_status tools
 //      and identity-registers the conversation (CLAUDE_CODE_SESSION_ID =
@@ -29,6 +29,7 @@
 
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { readFileSync } from "node:fs";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "./launcher.js";
 import { resolveClaudeNativePort } from "./config.js";
 import { nativeBootstrapGate, proxyEnvOrigin } from "./agent/native-bootstrap.js";
@@ -59,21 +60,94 @@ export function planClaudeNativeBootstrap(env: NodeJS.ProcessEnv): { action: "ex
     return { action: "start", port };
 }
 
+// — claude host pid resolution ———————————————————————————————
+// claude (2.x) runs SessionStart hooks as `/bin/sh -c <command>`: the hook's
+// DIRECT parent is a transient sh that dies the moment the hook exits. A
+// proxy watchdog pointed at that parent self-kills ~2s into every session
+// (live "parent-gone (pid N)" failures) while claude itself lives on.
+
+const CLAUDE_HOST_MAX_WALK = 8;
+
+/** One /proc/<pid> snapshot. argv is null when cmdline is empty (zombies,
+ *  kernel threads) — the ppid chain still walks through those. null return
+ *  means the pid is gone (or /proc does not exist — non-linux callers fall
+ *  back to the legacy direct parent). */
+type ProcInfo = { argv: string[] | null; ppid: number | null };
+
+type ProcReader = (pid: number) => ProcInfo | null;
+
+function readProcInfo(pid: number): ProcInfo | null {
+    let argv: string[] | null = null;
+    let ppid: number | null = null;
+    try {
+        const parts = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter((p) => p.length > 0);
+        if (parts.length > 0) argv = parts;
+    } catch {
+        return null;
+    }
+    try {
+        // comm can contain spaces and parens — only the text after the LAST
+        // ')' is positional; field 2 of the remainder is ppid.
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+        const tail = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+        if (tail.length > 1) ppid = Number(tail[1]);
+    } catch {
+        // stat unreadable: stop the walk after this hop
+    }
+    return { argv, ppid };
+}
+
+/** Is this argv the claude-code session binary? Matches `claude`/`claude.exe`
+ *  and `node .../claude...` installs (`@anthropic-ai/claude-code` paths or a
+ *  bare `claude` argument). Must NOT match this hook's own script
+ *  (claude-native-bootstrap.js) or wrappers like `timeout 40 claude` /
+ *  `sh -c ...` (their argv[0] is not claude). Exported for tests. */
+export function isClaudeHostArgv(argv: string[]): boolean {
+    const base = (p: string): string => {
+        const parts = p.split(/[\\/]/).filter((seg) => seg.length > 0);
+        return parts[parts.length - 1] ?? "";
+    };
+    if (/^claude(\.exe)?$/i.test(base(argv[0] ?? ""))) return true;
+    if (/^(node|bun|deno)(\.exe)?$/i.test(base(argv[0] ?? ""))) {
+        return argv.slice(1).some((arg) => /^claude(\.exe)?$/i.test(base(arg)) || /@anthropic-ai[\\/]claude-code/.test(arg));
+    }
+    return false;
+}
+
+/** The claude session process that transitively owns this hook, found by
+ *  walking up from `startPid` (default: this hook) through /proc. undefined
+ *  when no claude host sits within CLAUDE_HOST_MAX_WALK hops — callers then
+ *  fall back to the legacy direct parent (strictly no worse than before).
+ *  Exported for tests (inject `read` to stub /proc). */
+export function resolveClaudeHostPid(opts: { read?: ProcReader; startPid?: number } = {}): number | undefined {
+    const read = opts.read ?? readProcInfo;
+    let pid = opts.startPid ?? process.pid;
+    for (let hop = 0; hop < CLAUDE_HOST_MAX_WALK; hop++) {
+        const info = read(pid);
+        if (info === null) return undefined;
+        if (info.argv !== null && isClaudeHostArgv(info.argv)) return pid;
+        if (info.ppid === null || info.ppid <= 1) return undefined;
+        pid = info.ppid;
+    }
+    return undefined;
+}
+
 async function run(): Promise<void> {
     const plan = planClaudeNativeBootstrap(process.env);
     if (plan.action === "exit") return;
     try {
-        // SessionStart hooks are children of the claude process itself, so
-        // OUR parent pid is claude's pid — exactly the lifetime the spawned
-        // proxy's watchdog should track (the hook process exits immediately
-        // after bring-up).
+        // The direct parent is the transient `/bin/sh -c` wrapper claude used
+        // to launch this hook — it exits with the hook, and a watchdog on it
+        // killed a healthy proxy ~2s into every session. Watch the claude
+        // host itself; fall back to the direct parent only when the walk
+        // above cannot find it.
         const handle = await ensureProxyRunning(
             {
                 host: LAUNCHER_DEFAULT_HOST,
                 port: plan.port,
                 passthrough: plan.action === "passthrough",
                 debug: false,
-                parentPid: process.ppid,
+                parentPid: resolveClaudeHostPid() ?? process.ppid,
                 strictPort: true,
             },
             { scriptPath: proxyScriptPath() },
