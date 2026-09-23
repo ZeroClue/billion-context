@@ -360,6 +360,17 @@
   - `toolName: string` — 重命名注入工具（默认 `"absorb"`）；模式、系统提示段与按会话裁决都跟随名称。
   注入跟随线上原生工具面：代理模式在 anthropic/openai/responses 原生工具线上注入工具 + 静态系统提示段，插件模式在插件清单中广告它（MCP shell 自动拾取）。Responses **marker/文本协议**路由不支持（无原生工具面 — 强制的 absorb 指令不可满足），标题生成请求（`max_tokens ≤ 200`）跳过注入如压缩提示一样。吸收配对在重启后保持隐藏（在会话状态持久化）。
 
+#### `crush`
+
+- **类型：** `object`（`{ enabled?, minReduction?, strategies? }`）
+- **默认值：** *（禁用 — 除非显式设置 `enabled: true`，该特性完全关闭）*
+- **状态：** ACTIVE（要求解析层级上 `absorb.enabled: true`；内核 >= 0.0.84）
+- **说明：** 可选开启的**确定性预压碎** — absorb 门槛的第 1 层（issue #1094）。内核在 `processTurn` 内部执行它（位于 absorb-hide 与 absorb-prompt 之间）：在 `[ACP absorb]` 决策之前，每个符合条件的超大结果被纯函数选择器机械缩减（无模型调用）— **JSON** 常量字段提升 + 相同行/连续段折叠为带注释的信封（无损，可解码回原文）；**代码**（Python、JS/TS）注释/文档串/空行省略（有损）；**日志**按级别分类选行，优先保留 ERROR/FAIL 行、去重 warning、摘要行与折叠栈帧（有损，诚实 `[N lines omitted: …]` 尾注）。被压到 `absorb.minToolTokens` 以下的结果完全跳过模型 absorb 往返；仍超限的结果以压碎后的载荷附带正常 absorb 提示转发。不可解析或低于缩减底线的内容字节原样通过（fail-open）。子字段：
+  - `enabled: boolean` — 预压碎通道主开关。
+  - `minReduction: number|percent-string` — 压碎必须移除的载荷最小比例（默认 `0.1`；边际节省不值得改变线上字节）。
+  - `strategies: object` — 按内核插件 id 的逐策略覆盖：`"json-fold"`、`"code-trim"`、`"log-select"`。每项 `{ enabled?: boolean, excludeTools?: string[] }` 可整体禁用策略或对匹配工具名跳过；id 级最深层级胜出（更深的条目整体替换该 id，浅层其他 id 保留）。
+  按字段最深层级胜出合并，如父块一样；由内核执行（其 `crush` 管线节点），两种压缩模式行为完全一致。
+
 #### `rules`
 
 - **类型：** `boolean`

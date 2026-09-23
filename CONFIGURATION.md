@@ -360,6 +360,17 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
   - `toolName: string` — rename the injected tool (default `"absorb"`); the schema, system-prompt section and per-session adjudication all follow the name.
   Injection follows the wire's native-tool surface: proxy mode injects the tool + a static system-prompt section on the anthropic/openai/responses native-tools wires, plugin mode advertises it in the plugin manifest (the MCP shell picks it up for free). Responses **marker/text-protocol** routes are not supported (no native tool surface — the REQUIRED absorb instruction would be unsatisfiable), and title-generation requests (`max_tokens ≤ 200`) skip injection like the compress prompt does. Absorbed pairs stay hidden across restarts (persisted in the session state).
 
+#### `crush`
+
+- **Type:** `object` (`{ enabled?, minReduction?, strategies? }`)
+- **Default:** *(disabled — the feature is off unless you set `enabled: true`)*
+- **Status:** ACTIVE (requires `absorb.enabled: true` at the resolved level; kernel >= 0.0.84)
+- **Description:** Opt-in **deterministic pre-crush** — tier 1 of the absorb gate (issue #1094). The kernel runs it inside `processTurn` between absorb-hide and absorb-prompt: before the `[ACP absorb]` decision, each eligible oversized result is mechanically reduced by a pure, stateless selector (no model call) — **JSON** gets constant fields hoisted + identical rows/runs folded into annotated envelopes (lossless, decodable back to the original); **code** (Python, JS/TS) gets comment/docstring/blank-line elision (lossy); **logs** get level-classified line selection keeping ERROR/FAIL lines with priority, deduped warnings, summary lines and collapsed stack frames (lossy, honest `[N lines omitted: …]` footer). A result crushed below `absorb.minToolTokens` skips the model absorb round-trip entirely; a result still over it is forwarded crushed with the normal absorb prompt. Unparseable or below-reduction-floor content passes through byte-identical (fail-open). Sub-fields:
+  - `enabled: boolean` — master switch for the pre-crush channel.
+  - `minReduction: number|percent-string` — minimum fraction of the payload that must be removed for the crush to be used (default `0.1`; marginal savings are not worth altered bytes on the wire).
+  - `strategies: object` — per-strategy overrides keyed by kernel plugin id: `"json-fold"`, `"code-trim"`, `"log-select"`. Each entry `{ enabled?: boolean, excludeTools?: string[] }` can disable a strategy outright or skip it for matching tool names; ids merge deepest-wins (a deeper entry replaces that id whole, shallower ids survive).
+  Merged deepest-wins like the parent block; executed by the kernel (its `crush` pipeline node), so both compression modes get it identically.
+
 #### `rules`
 
 - **Type:** `boolean`

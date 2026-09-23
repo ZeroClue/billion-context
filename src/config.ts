@@ -224,6 +224,33 @@ export type CompressSettings = {
          *  the client's own tool names or the agent will call its own tool. */
         toolName?: string;
     };
+    /** Deterministic pre-crush of eligible oversized tool results — tier 1 of
+     *  the absorb gate (#1094, kernel `Config.crush`, acp-kernel >= 0.0.84:
+     *  the kernel runs it inside processTurn between absorb-hide and
+     *  absorb-prompt). Requires `absorb.enabled` at the resolved level.
+     *  JSON payloads get lossless field-variance folding (constant fields
+     *  hoisted, identical runs collapsed); code gets comment/docstring
+     *  elision; logs get level-classified line selection (both lossy). A
+     *  result crushed below `absorb.minToolTokens` never triggers a model
+     *  absorb round-trip. Unparseable or uncrushable content passes through
+     *  byte-identical. Off unless explicitly enabled. */
+    crush?: {
+        /** Enable pre-crush for this scope (`absorb.enabled` must also be
+         *  true at the resolved level). */
+        enabled?: boolean;
+        /** Minimum fraction of tokens the crush must save for the
+         *  replacement to be accepted. Accepts a ratio in (0,1] or a percent
+         *  string; kernel default 0.1. */
+        minReduction?: number | string;
+        /** Per-strategy toggles keyed by kernel plugin id (`json-fold`,
+         *  `code-trim`, `log-select`). Id-level deepest-wins merge. */
+        strategies?: Record<string, {
+            /** Set false to disable this strategy even when crush is enabled. */
+            enabled?: boolean;
+            /** Tool-name patterns this strategy skips. */
+            excludeTools?: string[];
+        }>;
+    };
     /** Persistent rule reminders (kernel `Config.rules`, acp-kernel >= 0.0.70).
      *  When `enabled`, an `acp_rule` tool is injected (or advertised in the
      *  plugin manifest): passing a short `rule` records a principle-level
@@ -1008,6 +1035,54 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
                 }
             }
             if (ok) out.absorb = cleaned;
+        }
+    }
+    if ("crush" in obj && obj.crush !== undefined) {
+        const c = obj.crush;
+        if (!c || typeof c !== "object" || Array.isArray(c)) {
+            ok = false;
+        } else {
+            const co = c as Record<string, unknown>;
+            const cleaned: NonNullable<CompressSettings["crush"]> = {};
+            if ("enabled" in co) {
+                if (typeof co.enabled !== "boolean") ok = false;
+                else cleaned.enabled = co.enabled;
+            }
+            if ("minReduction" in co) {
+                const v = co.minReduction;
+                if (typeof v === "number" || (typeof v === "string" && v.trim().endsWith("%"))) {
+                    const ratio = typeof v === "number" ? v : Number(v.trim().slice(0, -1)) / 100;
+                    if (!Number.isFinite(ratio) || ratio <= 0 || ratio > 1) ok = false;
+                    else cleaned.minReduction = typeof v === "string" ? v.trim() : v;
+                } else {
+                    ok = false;
+                }
+            }
+            if ("strategies" in co && co.strategies !== undefined) {
+                const sv = co.strategies;
+                if (!sv || typeof sv !== "object" || Array.isArray(sv)) {
+                    ok = false;
+                } else {
+                    const strategies: NonNullable<NonNullable<CompressSettings["crush"]>["strategies"]> = {};
+                    for (const [id, ent] of Object.entries(sv as Record<string, unknown>)) {
+                        if (typeof id !== "string" || id.trim().length === 0 || !ent || typeof ent !== "object" || Array.isArray(ent)) { ok = false; continue; }
+                        const eo = ent as Record<string, unknown>;
+                        const entry: NonNullable<NonNullable<NonNullable<CompressSettings["crush"]>["strategies"]>[string]> = {};
+                        if ("enabled" in eo) {
+                            if (typeof eo.enabled !== "boolean") { ok = false; continue; }
+                            entry.enabled = eo.enabled;
+                        }
+                        if ("excludeTools" in eo) {
+                            const ev = eo.excludeTools;
+                            if (!Array.isArray(ev) || ev.some((x) => typeof x !== "string" || x.trim().length === 0)) { ok = false; continue; }
+                            entry.excludeTools = (ev as string[]).map((x) => x.trim());
+                        }
+                        strategies[id.trim()] = entry;
+                    }
+                    if (ok) cleaned.strategies = strategies;
+                }
+            }
+            if (ok) out.crush = cleaned;
         }
     }
     if ("prompts" in obj && obj.prompts !== undefined) {
