@@ -55,8 +55,13 @@ test("isCodexClient: UA prefix detection (Node lowercases header keys)", () => {
 test("isCodexClient: lenient 'codex' substring fallback for unknown client variants (#645)", () => {
     assert.equal(isCodexClient({ "user-agent": "codex_new_variant/9.9.9" }), true, "unknown prefix still contains codex");
     assert.equal(isCodexClient({ "user-agent": "Mozilla/5.0 (codex-embed)" }), true, "codex mentioned mid-UA");
-    assert.equal(isCodexClient({ "user-agent": "Codex_CLI_RS/0.53.0" }), false, "case-sensitive: uppercase Codex does not match");
+    assert.equal(isCodexClient({ "user-agent": "Codex_CLI_RS/0.53.0" }), true, "known prefix matches case-insensitively (#1169)");
     assert.equal(isCodexClient({ "user-agent": "node-fetch/3.1" }), false, "no codex at all");
+    assert.equal(isCodexClient({ "user-agent": "CodeXchange/1.0" }), false, "mixed-case 'codex'-shaped UA is NOT codex: fallback stays case-sensitive (#1106)");
+});
+
+test("isCodexClient: Codex Desktop UA (initial-capital 'Codex') is detected (#1169)", () => {
+    assert.equal(isCodexClient({ "user-agent": "Codex Desktop/0.155.0-alpha.9" }), true, "exact UA from #1169 via registered prefix");
 });
 
 test("hasCompactionTrigger: only a FINAL compaction_trigger counts", () => {
