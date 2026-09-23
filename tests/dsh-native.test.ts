@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, _resetRegisterForTest, _setSpawnForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setSpawnForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest } from "../src/agent/dsh-native.ts";
 
 import { dshNativeInstalled, isNpmInstallForm, pluginInstall, pluginRemove, pluginStatusAll, selfPackageRoot } from "../src/plugin-install.ts";
 import { DSH_PATCH_BEGIN, DSH_PATCH_END, dshBundleInstalled, dshProfileDirs, planDshSpawn, stripDshManagedPatch, stripLegacyManagedBlock, _setDshRunnersForTest, type DshPlan } from "../src/dsh-channel.ts";
@@ -836,6 +836,68 @@ test("#1158 apply() gate refusal logs each endpoint once per process with attrib
         proxy.close();
         fs.rmSync(home, { recursive: true, force: true });
         _resetRegisterForTest(undefined);
+    }
+});
+
+test("#1158 apply() persists bootstrap failures to bili.log (GUI stderr is invisible)", async () => {
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1158c-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1158c-home-"));
+    let spawnCalls = 0;
+    _setSpawnForTest(async () => {
+        spawnCalls += 1;
+        return undefined;
+    });
+    const errs: string[] = [];
+    const origErr = console.error;
+    console.error = (...args: unknown[]) => {
+        errs.push(args.map(String).join(" "));
+    };
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: "http://127.0.0.1:1", XDG_STATE_HOME: stateHome }, async () => {
+            _resetRegisterForTest("http://127.0.0.1:1");
+            const ctx = mockCtx();
+            apply(ctx);
+            // port 1 on loopback: connection refused immediately — a stale preset
+            await waitFor(() => errs.some((e) => e.includes("not healthy")), "attach-unhealthy fallback line");
+            assert.equal(spawnCalls, 1, "fallback spawn attempted");
+            // The same fact must exist durably in the shared bili.log in the
+            // proxy's own line shape, origin-marked — stderr alone is invisible
+            // to GUI hosts, which is exactly how #1158 stayed silent.
+            const logFile = path.join(stateHome, "billion-context", "bili.log");
+            const content = fs.readFileSync(logFile, "utf8");
+            assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[warn\] \[dsh-client\] attach target http:\/\/127\.0\.0\.1:1 is not healthy — falling back to a spawned proxy$/m);
+        });
+    } finally {
+        console.error = origErr;
+        _setSpawnForTest(undefined);
+        fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(stateHome, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#1158 persistClientEvent: standard line shape into bili.log; broken fs never throws", async () => {
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1158d-state-"));
+    try {
+        await withEnv({ XDG_STATE_HOME: stateHome }, async () => {
+            persistClientEvent("boom-marker-xyz");
+            const logFile = path.join(stateHome, "billion-context", "bili.log");
+            const content = fs.readFileSync(logFile, "utf8");
+            assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[warn\] \[dsh-client\] boom-marker-xyz$/m);
+        });
+        // Broken target (state root under a regular file): must swallow, never throw.
+        const blocker = path.join(os.tmpdir(), `bili-dsh-1158d-blocker-${Date.now()}`);
+        fs.writeFileSync(blocker, "x");
+        try {
+            await withEnv({ XDG_STATE_HOME: `${blocker}/sub` }, async () => {
+                persistClientEvent("must-not-throw");
+                assert.ok(!fs.existsSync(`${blocker}/sub`), "no partial dir tree created");
+            });
+        } finally {
+            fs.rmSync(blocker, { force: true });
+        }
+    } finally {
+        fs.rmSync(stateHome, { recursive: true, force: true });
     }
 });
 

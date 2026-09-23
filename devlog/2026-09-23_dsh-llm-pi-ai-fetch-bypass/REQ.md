@@ -45,3 +45,4 @@
 2. `takeoverGate`(dsh-native)对**每端点每进程一次性**经 console.error 记录被拒 origin+pathname(query 剥离防泄 key)+ 当时归属状态(无 initiator / 有 initiator 缺 session id)—— 有拒绝行且聊天轮次本应归属 → 指向运行时归属缺口;无任何拒绝行而流量仍绕 → 指向传输层 fetch 形态;
 3. README zh/en dsh 节条目改为"已报告、调查中"(撤回"已知局限=llm-pi-ai 注入 fetch"的断言),给出两个检测信号与启动器规避;
 4. 回归测试:`tests/issue1158-no-model-request-warning.test.ts`(子串保持、一次性语义、entry 分支旧行为不变、文案不得点名单一已确认成因)+ `tests/dsh-native.test.ts` 新增 gate 拒绝日志测试(每端点一次、query 不入日志、不同端点各一行、有归属静默认领)。
+5. **引导失败持久化到 bili.log(同日三次修订)**:owner Linux 全链路复现(headless + chromium 驱动 web GUI)未能复现症状,llm-pi-ai 全部流量均过代理;传输形态假设在 Linux 上出局,残余最大嫌疑 = Windows 特有的 spawn/attach 引导失败静默降级——唯一输出是一次性 console.error,GUI 进程 stderr 不可见。故 dsh-native 所有降级点(bootstrap catch / attach 目标不健康回落 / 三处 respawn onGiveUp)同时经 `persistClientEvent` 以 `[dsh-client]` 标记行追加进共享 bili.log(与代理 tee 日志同文件同行形,best-effort 永不向宿主抛错);console.error 双通道保留。

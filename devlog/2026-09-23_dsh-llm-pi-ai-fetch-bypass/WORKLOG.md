@@ -1,7 +1,7 @@
 # WORKLOG — dsh profile-install zero-traffic sessions: loud one-shot detection + gate-refusal instrumentation (#1158)
 
 ## Date
-2026-09-23 (two commits on this branch)
+2026-09-23 (three commits on this branch)
 
 ## What was done
 
@@ -58,7 +58,45 @@ it is populated. Consequences, all applied here:
   settings-overlay `/bili/` URLs reach the proxy directly, needing neither the
   fetch patch nor the gate).
 
+### Commit 3 — persist bootstrap failures to bili.log (GUI stderr is invisible)
+Owner's Linux repro (dsh 0.1.7-alpha.2 + bili native plugin + llm-pi-ai custom
+provider, mock upstream; BOTH `dsh headless` and real chromium-driven `dsh web`)
+could NOT reproduce the symptom — all llm-pi-ai traffic (incl. side requests)
+routed through the proxy with `x-bili-hop`/`x-bili-tunnel` stamps. Combined
+with their source review (pi-ai constructs `new OpenAI({fetch: undefined})` per
+request in 0.82.1 AND 0.87.1; openai SDK 6.26.0/6.40.0 both resolve globalThis
+fetch at call time), the transport-shape hypothesis is dead on Linux; residual
+top suspect = Windows-specific spawn/attach bootstrap failure degrading
+silently: the only output is a one-shot console.error, invisible in GUI process
+stderr — matching "zero interception, zero logs" exactly. Consequence (owner's
+ask): bootstrap failures must also land in the shared bili.log file.
+- src/agent/dsh-native.ts: new `persistClientEvent(msg)` — best-effort
+  appendFileSync of `<ISO ts> [warn] [dsh-client] <msg>` into `defaultLogFile()`
+  (paths.ts, XDG-overridable, same file+shape as the proxy's tee logger;
+  origin-marked `[dsh-client]` so client lines are greppable apart from proxy
+  lines; appendFileSync reopens by path per call so the proxy's 10MB rotation
+  can't strand writes; all errors swallowed — logging never breaks the host).
+  Call sites: bootstrap() catch (spawn failed → direct send),
+  verifyAttachAndRecover unhealthy attach target (fallback chain start), and
+  all three onGiveUp closures (respawn gave up → direct send). Existing
+  console.error lines unchanged (dual channel: durable file + stderr when
+  visible).
+- tests/dsh-native.test.ts: integration test (dead preset + failing fallback
+  spawn under XDG_STATE_HOME → bili.log contains the standard-shaped
+  [dsh-client] line) + unit test (line shape regex; broken fs target swallows
+  without throwing or partial dir trees).
+- Scope note: the generic native-intercept "proxy not ready" stderr line was
+  left alone — it is shared across agent lanes and its dsh-side fact is now
+  durably recorded by the client-side call sites above at the moment of
+  failure.
+
 ## Behavior / compatibility changes (disclosure)
+- NEW durable log (shared bili.log file): up to one
+  `<ISO ts> [warn] [dsh-client] …` line per degradation event (bootstrap
+  failure, unhealthy attach target, respawn give-up) where previously the only
+  trace was a one-shot console.error invisible to GUI hosts. Old → new:
+  stderr-only, possibly invisible → file + stderr. File shape identical to the
+  proxy's own tee lines (`src/logger.ts`), origin-marked for grep.
 - Log volume, never-registered conversation id: every rejected tool call →
   once per conversation (old text `id never registered (stale shim session id
   after host resume?)` replaced by the richer NO MODEL REQUESTS line). Reason:
@@ -77,10 +115,10 @@ it is populated. Consequences, all applied here:
 
 ## Verification
 - `npm run typecheck`: clean.
-- `npm test`: 2253 total, 2251 pass, 0 fail, 2 skipped (pre-existing gated
-  skips); touched suites (issue1158 + dsh-native) 31/31.
+- `npm test`: 2255 total, 2253 pass, 0 fail, 2 skipped (pre-existing gated
+   skips); touched suites (issue1158 + dsh-native) all green, dsh-native 28/28.
 - `npm run build`: success.
-- Full E2E not run: neither commit touches the request pipeline (server.ts /
+- Full E2E not run: no commit touches the request pipeline (server.ts /
   src/loop/* / adapters / preflight) or any wire shape — diagnostics only on
   already-failing paths. Local repro of the original symptom is impossible here
   (needs Windows + dsh web GUI); the owner is building a real dsh + bili + mock
