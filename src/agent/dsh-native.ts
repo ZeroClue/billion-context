@@ -350,13 +350,31 @@ function maybeRetry(ctx: PluginContext): void {
     void registerTools(ctx).catch(() => {});
 }
 
-function sessionIdOf(ctx: PluginContext): string | undefined {
+// #1158 L2: three-state attribution for the takeover gate. The old bare catch
+// swallowed currentInitiator() exceptions (disposed/closing agent scope) as
+// plain "no attribution", making a throwing ALS boundary indistinguishable
+// from a legitimate agentless lane — both went silent-direct behind one flat
+// log line each. Three states + per-endpoint cumulative counts make the
+// "dozens refused, one passed" distribution diagnosable at a glance.
+type GateAttribution =
+    | { state: "ok"; sid: string }
+    | { state: "none"; initiatorPresent: boolean }
+    | { state: "threw"; message: string };
+
+function attributionOf(ctx: PluginContext): GateAttribution {
     try {
-        const sid = ctx.agents?.currentInitiator?.()?.session?.id;
-        return typeof sid === "string" && sid.length > 0 ? sid : undefined;
-    } catch {
-        return undefined;
+        const init = ctx.agents?.currentInitiator?.();
+        const sid = init?.session?.id;
+        if (typeof sid === "string" && sid.length > 0) return { state: "ok", sid };
+        return { state: "none", initiatorPresent: init !== undefined && init !== null };
+    } catch (err) {
+        return { state: "threw", message: err instanceof Error ? err.message : String(err) };
     }
+}
+
+function sessionIdOf(ctx: PluginContext): string | undefined {
+    const attr = attributionOf(ctx);
+    return attr.state === "ok" ? attr.sid : undefined;
 }
 
 async function statusOutcome(ctx: PluginContext): Promise<CommandOutcome> {
@@ -492,15 +510,17 @@ export function apply(ctx: PluginContext): void {
         state.ready = start();
     }
 
-    // #1158: a refusal sends model traffic DIRECT with zero trace — the exact
-    // silence that made the reported zero-traffic case undiagnosable. Log each
-    // distinct endpoint once per process with the attribution state at refusal
-    // time; legitimate agentless lanes (dsh's withoutInitiator background
-    // drivers, third-party in-process callers) add at most one flat line per
-    // endpoint, so the noise floor stays constant (#1117 silence preserved).
-    const gateRefusedPaths = new Set<string>();
+    // #1158 L2: a refusal sends model traffic DIRECT. First refusal per
+    // endpoint logs once; same-state refusals accumulate silently and re-print
+    // only on an attribution STATE change (none↔threw), always carrying the
+    // cumulative count — bounded noise (#1117 silence preserved) while a
+    // "dozens refused, one passed" distribution becomes visible. The durable
+    // copy goes through persistClientEvent: GUI hosts swallow stderr, which is
+    // exactly how the reported zero-traffic case stayed invisible.
+    const gateRefusals = new Map<string, { state: string; count: number }>();
     state.takeoverGate = (url) => {
-        if (sessionIdOf(ctx) !== undefined) return true;
+        const attr = attributionOf(ctx);
+        if (attr.state === "ok") return true;
         let key: string;
         try {
             const u = new URL(url);
@@ -508,15 +528,22 @@ export function apply(ctx: PluginContext): void {
         } catch {
             key = url;
         }
-        if (gateRefusedPaths.size >= 256) gateRefusedPaths.clear();
-        if (!gateRefusedPaths.has(key)) {
-            gateRefusedPaths.add(key);
-            let init: unknown;
-            try { init = ctx.agents?.currentInitiator?.(); } catch { init = undefined; }
-            const initiatorPresent = init !== undefined && init !== null;
-            console.error(
-                `bili-native-dsh: model request sent DIRECT (uncompressed) — takeover gate refused ${key}: ${initiatorPresent ? "initiator present but missing session id" : "no active initiator attribution (agentless/background lane, third-party in-process caller, or stale attribution after host resume?)"}`,
-            );
+        const prev = gateRefusals.get(key);
+        const count = (prev?.count ?? 0) + 1;
+        const changed = prev !== undefined && prev.state !== attr.state;
+        if (prev === undefined && gateRefusals.size >= 256) gateRefusals.clear();
+        gateRefusals.set(key, { state: attr.state, count });
+        if (prev === undefined || changed) {
+            const reason =
+                attr.state === "threw"
+                    ? `currentInitiator() threw (${attr.message}) — agent scope disposed/closing mid-request?`
+                    : attr.initiatorPresent
+                        ? "initiator present but missing session id"
+                        : "no active initiator attribution (agentless/background lane, third-party in-process caller, or stale attribution after host resume?)";
+            const suffix = prev !== undefined ? ` (state ${prev.state}→${attr.state})` : "";
+            const line = `bili-native-dsh: model request sent DIRECT (uncompressed) — takeover gate refused ${key}: ${reason} — refusals so far: ${count}${suffix}`;
+            console.error(line);
+            persistClientEvent(line);
         }
         return false;
     };
