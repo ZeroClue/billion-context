@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
-import { ACP_READONLY_TOOLS_RESPONSES, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, createCore, createInitialState, defaultConfig } from "acp-kernel";
+import { ACP_READONLY_TOOLS_RESPONSES, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, DECOMPRESS_TOOL_NAME, SEARCH_CONTEXT_TOOL_NAME, createCore, createInitialState, defaultConfig } from "acp-kernel";
 import { anthropicToCore, type AnthropicRequestBody } from "acp-kernel/wire";
 import { BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES } from "../src/compress-tool.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -59,7 +59,7 @@ function paramsOf(entry: FlatTool): Record<string, unknown> {
     return entry.parameters ?? entry.input_schema ?? entry.function?.parameters ?? {};
 }
 
-test("#841 schema: BILI arrays add optional conversation_id to search_context only", () => {
+test("#841 schema: BILI arrays add optional conversation_id to search_context (+ #1179 range args to decompress)", () => {
     const cases: [unknown[], unknown[], "flat" | "openai"][] = [
         [BILI_ACP_TOOLS_ANTHROPIC, ACP_TOOLS_ANTHROPIC, "flat"],
         [BILI_ACP_TOOLS_OPENAI, ACP_TOOLS_OPENAI, "openai"],
@@ -78,8 +78,33 @@ test("#841 schema: BILI arrays add optional conversation_id to search_context on
         const kernelProps = paramsOf(kernelEntry!).properties as Record<string, unknown>;
         assert.equal(kernelProps.conversation_id, undefined, "kernel constant must not be mutated");
 
-        const biliRest = bili.filter((t) => t !== entry);
-        const kernelRest = kernel.filter((t) => t !== kernelEntry);
+        const nameOf = (t: unknown): string | undefined => {
+            const e = t as FlatTool;
+            return shape === "openai" ? e.function?.name : e.name;
+        };
+        // #1179: decompress gains exactly two optional range params; everything else stays identical
+        const stripRange = (e: FlatTool): FlatTool => {
+            const params = paramsOf(e) as Record<string, unknown>;
+            const props = { ...(params.properties as Record<string, unknown>) };
+            delete props.startId;
+            delete props.endId;
+            const p = { ...params, properties: props };
+            if (e.function) return { ...e, function: { ...e.function, parameters: p } };
+            if (e.input_schema) return { ...e, input_schema: p };
+            return { ...e, parameters: p };
+        };
+        const biliDec = bili.find((t) => nameOf(t) === DECOMPRESS_TOOL_NAME) as FlatTool | undefined;
+        const kernelDec = kernel.find((t) => nameOf(t) === DECOMPRESS_TOOL_NAME) as FlatTool | undefined;
+        assert.ok(biliDec && kernelDec, `decompress missing in ${shape} array`);
+        assert.deepEqual(stripRange(biliDec), stripRange(kernelDec), "decompress differs only by the added range params");
+        const biliProps = paramsOf(biliDec).properties as Record<string, Record<string, unknown>>;
+        assert.equal(biliProps.startId?.type, "string");
+        assert.equal(biliProps.endId?.type, "string");
+        const decRequired = paramsOf(biliDec).required as string[] | undefined;
+        assert.ok(!decRequired?.includes("startId") && !decRequired?.includes("endId"), "range args must stay optional");
+
+        const biliRest = bili.filter((t) => t !== entry && nameOf(t) !== DECOMPRESS_TOOL_NAME);
+        const kernelRest = kernel.filter((t) => t !== kernelEntry && nameOf(t) !== DECOMPRESS_TOOL_NAME);
         assert.deepEqual(biliRest, kernelRest, "no other tool may change");
     }
     const ro = searchEntry(BILI_ACP_READONLY_TOOLS_RESPONSES, "flat")!;
