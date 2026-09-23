@@ -176,6 +176,25 @@ def probe_proxy(origin: str) -> bool:
     return isinstance(manifest, dict) and bool(manifest.get("version"))
 
 
+def register_watcher(origin: str) -> None:
+    """Register this host pid as a watchdog owner of a shared proxy (#1199). The spawner's
+    BILI_PARENT_PID watches only the FIRST session's process; without this, the shared proxy
+    exits when that session dies while this one still runs. Same policy as the TS launcher:
+    409 = daemon proxy (no watchdog) → nothing to do; any other failure degrades to the
+    single-owner watchdog and never blocks session start."""
+    try:
+        status, _body = http_post_json(origin + "/__bili/watcher", {"pid": os.getpid()}, HEALTH_PROBE_TIMEOUT_S)
+        if status is None:
+            logger.warning("billion-context: watcher registration failed (no response from %s) — "
+                           "the shared proxy may exit when its first owner does", origin)
+        elif status != 200 and status != 409:
+            logger.warning("billion-context: watcher registration returned HTTP %s — "
+                           "the shared proxy may exit when its first owner does", status)
+    except Exception as exc:
+        logger.warning("billion-context: watcher registration failed (%s) — "
+                       "the shared proxy may exit when its first owner does", exc)
+
+
 # — instance discovery (written by the bili proxy itself) ----------------------
 
 def read_instance_file() -> Optional[Dict[str, Any]]:
@@ -371,20 +390,25 @@ def _spawn_child(sidecar: Dict[str, str], port: int, token: str) -> Optional[sub
         return None
 
 
+def _attach(origin: str) -> str:
+    """Record the attach and register this host as a watchdog owner (see register_watcher)."""
+    _state.update(origin=origin, mode="attach")
+    register_watcher(origin)
+    return origin
+
+
 def ensure_origin(sidecar: Dict[str, str]) -> Optional[str]:
     """Return a healthy proxy origin. Attach when possible (explicit target, then any recorded
     instance); otherwise spawn our own behind the starting-marker arbiter."""
     attach = (os.environ.get(ATTACH_ENV) or "").strip().rstrip("/")
     if attach:
         if probe_proxy(attach):
-            _state.update(origin=attach, mode="attach")
-            return attach
+            return _attach(attach)
         logger.warning("billion-context: %s %s is not healthy — falling back to local bootstrap", ATTACH_ENV, attach)
 
     found = discover_instance()
     if found:
-        _state.update(origin=found, mode="attach")
-        return found
+        return _attach(found)
 
     port = pick_port()
     if port is None:
@@ -396,8 +420,7 @@ def ensure_origin(sidecar: Dict[str, str]) -> Optional[str]:
         while time.monotonic() < deadline:
             found = discover_instance()
             if found:
-                _state.update(origin=found, mode="attach")
-                return found
+                return _attach(found)
             marker = _read_marker()
             if marker is None or _marker_is_stale(marker):
                 break
