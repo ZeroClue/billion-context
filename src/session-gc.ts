@@ -47,7 +47,12 @@ import { dropSessionForGc, peekSession } from "./session.js";
  * it holds lossless payload bytes (originals of oversized tool results), so
  * deleting the session loses exactly those bytes, the class of file this
  * sweep exists to clean:
- *   - co-deleted with its session file (the sweep never leaves orphans);
+ *   - co-deleted with its session file (the sweep never leaves orphans) —
+ *     except when a surviving twin of the same id lacks its own store: after
+ *     meta fill-once migrates _unknown/ -> ns/ without cleaning the old path
+ *     (kernel writes never delete), the stale duplicate's sibling may still be
+ *     the live fallback store; it is kept then and orphan-swept once the twin
+ *     goes;
  *   - swept directly when orphaned (session file already gone — leftovers
  *     from versions that deleted sessions without their stores);
  *   - its token footprint (unique-content chars ÷ 4) counts toward the size
@@ -279,13 +284,43 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         if (compSt) {
             // Co-delete the companion so the sweep never leaves orphans. On
             // failure it surfaces as an orphan on the very next pass below.
-            try {
-                await rm(companion, { force: true });
-                loggerLog("info", `[gc] removed content store ${path.relative(dir, companion)} (${compSt.size} B)`);
-                result.bytesFreed += compSt.size;
-                result.companionsRemoved++;
-                coDeleted.add(companion);
-            } catch { /* orphan pass retries */ }
+            // Cross-namespace exception: meta fill-once can migrate a session
+            // _unknown/<h>.json -> ns/host_<h>.json without cleaning the old
+            // path (kernel writes never delete the previous relPath), and
+            // saveContentStore only rewrites when dirty — so a moved session
+            // whose store was not re-saved since the move still reads its LIVE
+            // store from this stale duplicate's sibling (loadContentStore
+            // probes _unknown/ when the namespaced store is absent, and stops
+            // at the first EXISTING candidate). Co-deleting it here would lose
+            // retrievable originals. Skip when a surviving twin shares the
+            // hash stem and has no store of its own; the bytes stay referenced
+            // until the twin is swept, then the orphan pass collects them.
+            const stem = path.basename(file, ".json");
+            let keepCompanion = false;
+            for (const sf of sessionFiles) {
+                if (sf === file || deletedSessions.has(sf)) continue;
+                if (!path.basename(sf).endsWith(stem + ".json")) continue;
+                let twinHasOwnStore = false;
+                try {
+                    const s2 = await stat(sf.slice(0, -".json".length) + companionSuffix);
+                    twinHasOwnStore = s2.isFile();
+                } catch { /* no sibling */ }
+                if (!twinHasOwnStore) {
+                    keepCompanion = true;
+                    break;
+                }
+            }
+            if (keepCompanion) {
+                loggerLog("info", `[gc] kept content store ${path.relative(dir, companion)} (${compSt.size} B): live fallback store of a surviving twin`);
+            } else {
+                try {
+                    await rm(companion, { force: true });
+                    loggerLog("info", `[gc] removed content store ${path.relative(dir, companion)} (${compSt.size} B)`);
+                    result.bytesFreed += compSt.size;
+                    result.companionsRemoved++;
+                    coDeleted.add(companion);
+                } catch { /* orphan pass retries */ }
+            }
         }
         const parent = path.dirname(file);
         if (parent !== dir) await rmdir(parent).catch(() => {});
