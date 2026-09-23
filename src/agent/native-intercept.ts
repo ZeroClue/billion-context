@@ -57,6 +57,17 @@ export interface NativeInterceptState {
 
 const INTERCEPT_FLAG = "__biliNativeFetchIntercept";
 
+/** #1158 escape hatch: `BILI_RECLAIM_FETCH_PATCH=0` keeps the classic direct
+ *  install — a third-party re-arm (dsh-http-proxy refresh) then wins and
+ *  bili stops seeing model traffic (documented degradation, visible instead
+ *  of silently healed) for setups that NEED the third-party chain on top
+ *  (e.g. a socks egress bili's upstream proxying does not support). */
+function shouldReclaimFetchPatch(): boolean {
+    const raw = process.env.BILI_RECLAIM_FETCH_PATCH;
+    if (raw === undefined) return true;
+    return !/^(0|false|off|no)$/i.test(raw.trim());
+}
+
 /** #1158 self-heal: the property descriptor captured before we installed the
  *  guarded accessor, so _resetForTest can restore a plain writable data
  *  property. Undefined before the first install in a process. */
@@ -467,8 +478,9 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
     const desc = Object.getOwnPropertyDescriptor(globalThis, "fetch");
     let rearmCount = 0;
     const REARM_LIMIT = 16;
+    const guard = desc === undefined || desc.configurable;
     let top = makeChain(orig);
-    if (desc === undefined || desc.configurable) {
+    if (guard && shouldReclaimFetchPatch()) {
         preInstallDesc = desc;
         Object.defineProperty(globalThis, "fetch", {
             configurable: true,
@@ -476,6 +488,12 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             get: () => top,
             set: (v: unknown) => {
                 if (typeof v !== "function" || v === top) return;
+                // Visibility (#1158): an evict attempt used to be silent —
+                // log it so "un-routed by a third party" is diagnosable even
+                // when the heal itself is not wanted/limited away.
+                if (rearmCount < REARM_LIMIT) {
+                    console.warn(`[bili-native] third-party globalThis.fetch install detected (#1158) — re-chaining as downstream (evict attempt ${rearmCount + 1})`);
+                }
                 if (rearmCount >= REARM_LIMIT) {
                     // A fighting patch (two self-healers) would loop forever;
                     // past the limit stop guarding and let the winner stand.
@@ -487,7 +505,8 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             },
         });
     } else {
-        // Non-configurable host property: keep the classic direct install
+        // Non-configurable host property or reclaim disabled
+        // (BILI_RECLAIM_FETCH_PATCH=0): keep the classic direct install
         // (no guard, the old behavior).
         globalThis.fetch = top;
     }

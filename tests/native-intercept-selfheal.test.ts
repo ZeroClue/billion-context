@@ -81,3 +81,31 @@ test("#1158 self-heal: non-function and self writes are ignored by the guard", a
     });
     assert.deepEqual(sink, ["http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"]);
 });
+
+test("#1158 escape hatch: BILI_RECLAIM_FETCH_PATCH=0 keeps the classic direct install", async () => {
+    process.env.BILI_RECLAIM_FETCH_PATCH = "0";
+    try {
+        const saved = globalThis.fetch;
+        const { _resetForTest } = await import("../src/agent/native-intercept.js");
+        _resetForTest();
+        const sink: string[] = [];
+        globalThis.fetch = fakeFetch(sink);
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") };
+        try {
+            assert.equal(installNativeFetchIntercept(state), true);
+            // A plain writable data property again (no accessor guard).
+            assert.equal(Object.getOwnPropertyDescriptor(globalThis, "fetch")?.writable, true);
+            const thirdParty = fakeFetch([]);
+            globalThis.fetch = thirdParty;
+            // The third party wins: direct send, no bili rewrite.
+            assert.equal(globalThis.fetch, thirdParty);
+            const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages");
+            assert.equal(res.status, 200);
+        } finally {
+            globalThis.fetch = saved;
+            _resetForTest();
+        }
+    } finally {
+        delete process.env.BILI_RECLAIM_FETCH_PATCH;
+    }
+});
