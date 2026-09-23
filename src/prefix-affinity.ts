@@ -162,6 +162,27 @@ function lcpLength(a: string[], b: string[]): number {
     return i;
 }
 
+/** Strip the leading contiguous run of system/developer-role messages
+ *  (#1148). OpenAI-style anonymous clients place their system prompt as
+ *  messages[0]; a harness that injects per-turn state into it (date, cwd,
+ *  token budget) would otherwise bake those bytes into the identity chain
+ *  at depth 0 and mint a fresh session EVERY turn. The other three
+ *  protocols carry system text in top-level fields outside the hashed array
+ *  (anthropic `system`, responses `instructions`, google `systemInstruction`),
+ *  so dropping the leading run aligns OpenAI with them. Only the LEADING
+ *  run is dropped — a system/developer item mid-conversation is data. */
+function normalizeAffinityMessages(messages: unknown[]): unknown[] {
+    let i = 0;
+    while (i < messages.length) {
+        const m = messages[i];
+        if (!m || typeof m !== "object") break;
+        const role = (m as { role?: unknown }).role;
+        if (role !== "system" && role !== "developer") break;
+        i++;
+    }
+    return i === 0 ? messages : messages.slice(i);
+}
+
 export class PrefixAffinityResolver {
     private trackedChains = new Map<string, ChainEntry>();
 
@@ -170,7 +191,8 @@ export class PrefixAffinityResolver {
      * Returns null when the request carries no usable conversation signal
      * (caller keeps the #286 explicit 400).
      */
-    resolve(messages: unknown[]): AnonymousAffinity | null {
+    resolve(input: unknown[]): AnonymousAffinity | null {
+        const messages = normalizeAffinityMessages(input);
         const hashes = chainHashes(messages);
         if (hashes.length === 0 || !hasUserMessage(messages)) return null;
         const incomingDepth = hashes.length;

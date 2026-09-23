@@ -125,6 +125,39 @@ test("prefix-affinity: system+user openai shape (shared system must not collide)
     assert.notEqual(b!.sessionId, a!.sessionId, "identical system prefix must not merge distinct conversations");
 });
 
+test("prefix-affinity: rotating inline system prompt keeps the session (#1148)", () => {
+    const r = new PrefixAffinityResolver();
+    const sysV1 = { role: "system", content: "You are a harness. date=2026-09-23 cwd=/home/x budget=50000" };
+    const sysV2 = { role: "system", content: "You are a harness. date=2026-09-24 cwd=/home/y budget=12000" };
+    const a = r.resolve([sysV1, user("first question about caching layers")]);
+    assert.ok(a);
+    r.note(a.sessionId, a.incomingDepth, a.tailHash, a.itemHashes);
+    const b = r.resolve([sysV2, user("first question about caching layers"), user("follow-up after the system rotated")]);
+    assert.ok(b);
+    assert.equal(b.sessionId, a.sessionId, "dynamic inline system must not fork the session every turn");
+    assert.equal(b.via, "prefix");
+    assert.equal(b.matchedDepth, a.incomingDepth, "match is measured on the system-stripped chain");
+});
+
+test("prefix-affinity: leading developer+system run is stripped together (#1148)", () => {
+    const r = new PrefixAffinityResolver();
+    const a = r.resolve([{ role: "developer", content: "policy revision 7" }, user("the actual question")]);
+    assert.ok(a);
+    r.note(a.sessionId, a.incomingDepth, a.tailHash, a.itemHashes);
+    const b = r.resolve([{ role: "developer", content: "policy revision 9" }, { role: "system", content: "base prompt v3" }, user("the actual question")]);
+    assert.equal(b!.sessionId, a.sessionId, "leading system/developer items are identity-invisible");
+    // System-only requests stay rejected: the stripped array is empty.
+    assert.equal(r.resolve([{ role: "system", content: "only system, however long this text is" }]), null);
+});
+
+test("prefix-affinity: mid-conversation system items remain identity data (#1148)", () => {
+    const r = new PrefixAffinityResolver();
+    const a = r.resolve([user("opening turn"), { role: "assistant", content: "answer one" }]);
+    r.note(a!.sessionId, a!.incomingDepth, a!.tailHash, a!.itemHashes);
+    const b = r.resolve([user("opening turn"), { role: "system", content: "course correction mid-chat" }, user("next turn")]);
+    assert.notEqual(b!.sessionId, a!.sessionId, "a system item INSIDE the chain is conversation data, not a top-level system field");
+});
+
 test("prefix-affinity: LRU cap bounds tracked sessions", () => {
     const r = new PrefixAffinityResolver();
     for (let i = 0; i < 262; i++) {
