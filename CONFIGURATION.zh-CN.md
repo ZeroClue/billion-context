@@ -378,13 +378,13 @@
 - **类型：** `object`（`{ enabled?, minTokens?, maxDimension?, quality?, format? }`）
 - **默认值：** *（关闭 —— 除非你设置 `enabled: true`，否则功能完全关闭）*
 - **状态：** ACTIVE（v1 —— 仅代理模式）
-- **说明：** 面向截图密集型工具结果的可选**图像预压缩**（issue #1095，经 `acp-kernel` image-compression API，需 acp-kernel >= 0.0.84）。多模态供应商按像素面积计费，一张手机截图比一大段代码更贵。启用后，工具结果中的截图类图像（确定性启发式分类器：竖屏宽高比落在区间内 + 最短边下限）会在**到达时降采样一次**——进入线上之前——模型仍能看到 UI，但计费像素降到原来的零头。非截图图像逐字节原样透传。路由决策（直过 vs 降采样 + recipe）由内核逐图做出；宿主用可选的 `sharp` 依赖执行编码（懒加载；缺失或失败 ⇒ 原图透传，绝不阻塞主链路）。**天然有损**——与文本 CCR 不同，降采样后的像素无法找回；缓解手段：原图缓存在内存中（64 MB 上限，FIFO），注入的 `image_full` 工具允许模型在看不清细节时为整个会话恢复原始分辨率（粘性、幂等；恢复状态随 shrink 记录跨重启持久化）。逐图节省量以 `[acp-image] …` 日志行输出，并汇总进 `[acp-usage]` 后缀（`img-saved=Ntok/MKB xK`）。子字段（按字段最深层级胜出，与其他 CompressSettings 字段一致）：
+- **说明：** 面向截图密集型工具结果的可选**图像预压缩**（issue #1095，经 `acp-kernel` image-compression API，需 acp-kernel >= 0.0.84）。多模态供应商按像素面积计费，一张手机截图比一大段代码更贵。启用后，工具结果中的截图类图像（确定性启发式分类器：竖屏宽高比落在区间内 + 最短边下限）会在**到达时降采样一次**——进入线上之前——模型仍能看到 UI，但计费像素降到原来的零头。非截图图像逐字节原样透传。路由决策（直过 vs 降采样 + recipe）由内核逐图做出；宿主用可选的 `sharp` 依赖执行编码（懒加载；缺失或失败 ⇒ 原图透传，绝不阻塞主链路）。**天然有损**——与文本 CCR 不同，降采样后的像素无法找回；缓解手段：注入的 `image_full` 工具允许模型在看不清细节时为整个会话恢复原始分辨率（粘性、幂等；恢复状态随 shrink 记录跨重启持久化）。无需代理侧存储原图：客户端自己的历史仍持有原始字节（它从未见过降采样形态），因此已恢复的 ref 只需停止被重新路由，原图即重新回到 wire。逐图节省量以 `[acp-image] …` 日志行输出，并汇总进 `[acp-usage]` 后缀（`img-saved=Ntok/MKB xK`）。子字段（按字段最深层级胜出，与其他 CompressSettings 字段一致）：
   - `enabled: boolean` — 总开关；非 `true` 一律保持完全关闭（逐字节透传，线上不出现 `image_full` 工具）。
   - `minTokens: number` — 只对计费感知的 token 估算 ≥ 此值的图像做路由（内核默认 `512`）。
   - `maxDimension: number` — 降采样 recipe 的最长边（px，内核默认 `1280`）。
   - `quality: number` — recipe 的有损编码质量 1–100（内核默认 `80`）。
   - `format: "webp" | "jpeg" | "png"` — recipe 的编码格式（内核默认 `"webp"`）。
-  四种 wire 载体都在 forward 边界改写：Anthropic `image` block、OpenAI `image_url` part（含单字符串 data-URL 消息；远程 URL 永不触碰）、Responses `input_image`、Google `inlineData`。确定性契约（与 CCR #1097 同一不变量）：到达时被替换的字节就是长期 wire 内容——守卫拒绝把已 shrink ref 的非已知原图指纹载荷再次路由，因此重新进入 pass 的处理后消息（折叠重请求）不会二次降采样击穿 prefix cache。注意内核的 pixel-tile token 估算是粗粒度且有上限的（大截图约 2k token）：一次缩放可能省下真实 wire 字节但省不下估算 token——两个数字都会出现在日志里。原图仅存内存（不持久化）：重启后，此前已恢复的 ref 会被重新降采样，直到模型再次申请。v1 范围门控：**仅代理模式**（插件 agent 需要先在插件清单中声明 `image_full`）。要求 `acp-kernel` >= 0.0.84 以及可选的 `sharp` 包才能真正缩放（没有它所有图像原样透传）。
+  四种 wire 载体都在 forward 边界改写：Anthropic `image` block、OpenAI `image_url` part（含单字符串 data-URL 消息；远程 URL 永不触碰）、Responses `input_image`、Google `inlineData`。确定性契约（与 CCR #1097 同一不变量）：到达时被替换的字节就是长期 wire 内容——守卫拒绝把已 shrink ref 的非已知原图指纹载荷再次路由，因此重新进入 pass 的处理后消息（折叠重请求）不会二次降采样击穿 prefix cache。注意内核的 pixel-tile token 估算是粗粒度且有上限的（大截图约 2k token）：一次缩放可能省下真实 wire 字节但省不下估算 token——两个数字都会出现在日志里。指纹簿记仅存内存（不持久化）：代理重启后，此前已 shrink（未恢复）的 ref 会以原始分辨率透传，直到会话重置——双收缩守卫不会重新路由它无法验证为已知原图的载荷，因此这些 ref 的节省量暂停而非冒险二次降采样（重置会清除记录，下次到达时确定性重新 shrink）；此前已恢复的 ref 保持已恢复状态。v1 范围门控：**仅代理模式**（插件 agent 需要先在插件清单中声明 `image_full`）。要求 `acp-kernel` >= 0.0.84 以及可选的 `sharp` 包才能真正缩放（没有它所有图像原样透传）。
 
 #### `rules`
 
