@@ -224,6 +224,32 @@ export type CompressSettings = {
          *  the client's own tool names or the agent will call its own tool. */
         toolName?: string;
     };
+    /** [#1097] Kernel CCR content store (kernel `Config.ccr`, acp-kernel
+     *  0.0.84). When `enabled`, oversized tool results (>= minToolTokens) are
+     *  ID-referenced at arrival by the kernel's ccr-store node (prune →
+     *  ccr-store → absorb): the wire keeps a deterministic `[acp-stored` …
+     *  placeholder and the original goes into the session's kernel
+     *  `MessageContentStore`, retrievable via the injected retrieve tool.
+     *  Lossless by default — a retrieve not made costs one cheap tool call,
+     *  whereas a distilled-away detail is gone for good. ID-reference wins
+     *  over absorb (kernel ordering). Off unless explicitly enabled at some
+     *  level. Merged sub-field-wise across the three levels like `absorb`. */
+    ccr?: {
+        /** Enable CCR for this scope. Absent/false = off (kernel semantics). */
+        enabled?: boolean;
+        /** Tool results smaller than this many tokens stay verbatim
+         *  (kernel default 4000). */
+        minToolTokens?: number;
+        /** Tool-name patterns (glob suffix allowed) never CCR-stored
+         *  (kernel default: none). */
+        excludeTools?: string[];
+        /** Rename the retrieve tool (default "acp_retrieve"). Must stay unique
+         *  against the client's own tool names. */
+        toolName?: string;
+        /** Max characters for the placeholder head/command preview (kernel
+         *  default 96). */
+        maxHeadChars?: number;
+    };
     /** Persistent rule reminders (kernel `Config.rules`, acp-kernel >= 0.0.70).
      *  When `enabled`, an `acp_rule` tool is injected (or advertised in the
      *  plugin manifest): passing a short `rule` records a principle-level
@@ -1008,6 +1034,33 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
                 }
             }
             if (ok) out.absorb = cleaned;
+        }
+    }
+    if ("ccr" in obj && obj.ccr !== undefined) {
+        const c = obj.ccr;
+        if (!c || typeof c !== "object" || Array.isArray(c)) {
+            ok = false;
+        } else {
+            const co = c as Record<string, unknown>;
+            const cleaned: NonNullable<CompressSettings["ccr"]> = {};
+            for (const key of ["enabled", "minToolTokens", "excludeTools", "toolName", "maxHeadChars"] as const) {
+                if (!(key in co)) continue;
+                const v = co[key];
+                if (key === "enabled") {
+                    if (typeof v !== "boolean") { ok = false; continue; }
+                    cleaned.enabled = v;
+                } else if (key === "minToolTokens" || key === "maxHeadChars") {
+                    if (typeof v !== "number" || !Number.isFinite(v)) { ok = false; continue; }
+                    cleaned[key] = v;
+                } else if (key === "excludeTools") {
+                    if (!Array.isArray(v) || v.some((x) => typeof x !== "string")) { ok = false; continue; }
+                    cleaned.excludeTools = [...v] as string[];
+                } else {
+                    if (typeof v !== "string" || v.trim().length === 0) { ok = false; continue; }
+                    cleaned.toolName = v.trim();
+                }
+            }
+            if (ok) out.ccr = cleaned;
         }
     }
     if ("prompts" in obj && obj.prompts !== undefined) {

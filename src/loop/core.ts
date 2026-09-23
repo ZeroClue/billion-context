@@ -15,6 +15,7 @@ import {
 } from "../compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "../absorb.js";
 import { effectiveRulesConfig, executeRule } from "../rules-feature.js";
+import { ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "../store.js";
 import { applyRanges } from "../stream.js";
 import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
 import { buildVisibilityMarker } from "../compress-loop.js";
@@ -184,6 +185,9 @@ export function executeProxyTool(
     }
     if (effectiveRulesConfig(ctx.session, ctx.config)?.enabled === true && toolName === RULE_TOOL_NAME) {
         return executeRule(args, ctx);
+    }
+    if (ccrEnabled(ctx.session) && toolName === retrieveToolName(ctx.session)) {
+        return executeRetrieve(args, ctx.session);
     }
     return `[Unknown proxy tool: ${toolName}]`;
 }
@@ -688,6 +692,13 @@ export async function* runCompressLoop(
                             text: buildVisibilityMarker(pr.name, pr.result),
                         });
                     }
+                }
+                // #1097: retrieval injections ride the same re-request channel
+                // as the ack pairs above — ack first, full text second. Their
+                // ids (acp_retrieved_*) are structurally excluded from ref
+                // assignment, so they never consume message numbers.
+                for (const injection of drainPendingRetrievals(ctx.session)) {
+                    coreMessages.push(injection);
                 }
                 const anyCompressFailed = proxyResults.some(
                     (pr) => (pr.name === "compress" || pr.name === "decompress") && pr.result.includes("FAILED"),

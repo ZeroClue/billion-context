@@ -12,6 +12,7 @@ import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsMarkerLineText, containsRenderTagText, createMarkerLineFilter, createTagEchoFilter, mayStartMarkerLine, mayStartRenderTag, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
+import { ccrEnabled, contentStoreOf } from "./store.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
 import { warnCacheCollapse } from "./cache-warn.js";
@@ -653,12 +654,14 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
             // #833: base kernelConfig carries no file/provider/model compress
             // settings — render from the session's last resolved Config so the
             // panel matches actual injection behavior.
+            const pluginCfg = effectiveConfig(session, deps.config);
             nudge = deps.core.processTurn({
                 messages,
                 state: session.state,
-                config: effectiveConfig(session, deps.config),
+                config: ccrEnabled(session) ? pluginCfg : { ...pluginCfg, ccr: undefined },
                 tokenCount: session.stats.lastInputTokens,
                 renderTags: "none",
+                contentStore: contentStoreOf(session),
             }).nudge;
         }
     } catch {

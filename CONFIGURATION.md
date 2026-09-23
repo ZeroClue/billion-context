@@ -360,6 +360,19 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
   - `toolName: string` — rename the injected tool (default `"absorb"`); the schema, system-prompt section and per-session adjudication all follow the name.
   Injection follows the wire's native-tool surface: proxy mode injects the tool + a static system-prompt section on the anthropic/openai/responses native-tools wires, plugin mode advertises it in the plugin manifest (the MCP shell picks it up for free). Responses **marker/text-protocol** routes are not supported (no native tool surface — the REQUIRED absorb instruction would be unsatisfiable), and title-generation requests (`max_tokens ≤ 200`) skip injection like the compress prompt does. Absorbed pairs stay hidden across restarts (persisted in the session state).
 
+#### `ccr`
+
+- **Type:** `object` (`{ enabled?, minToolTokens?, excludeTools?, toolName?, maxHeadChars? }`)
+- **Default:** *(disabled — the feature is off unless you set `enabled: true`)*
+- **Status:** ACTIVE (v1 — proxy mode, native-tools wires only)
+- **Description:** Opt-in **content-addressed message store** / built-in CCR (issue #1097, via the `acp-kernel` CCR API, acp-kernel >= 0.0.84). Instead of force-distilling oversized tool results (like `absorb`) or carrying them on the wire forever, the kernel ID-references them at arrival (the ccr-store node runs between prune and absorb within `processTurn` — ID-referencing wins over distillation): the wire keeps a deterministic, byte-stable placeholder (`📦 [acp-stored #m00423 · shell output · 4,213 tok] \`npm run build\`\n   → acp_retrieve("m00423") returns the full text`) and the original goes into the session's content store. The model retrieves the full original on demand via the injected `acp_retrieve` tool; a retrieve is ephemeral (it rides the intra-request tool-result channel, never enters fold space, consumes no message ref). Lossless by default: a retrieve not made costs one cheap tool call; a detail distilled away by absorb is gone for good. Sub-fields (merged deepest-wins like every other CompressSettings field):
+  - `enabled: boolean` — master switch; anything other than `true` keeps the feature fully off (no placeholders, no tool).
+  - `minToolTokens: number` — only tool results at or above this many tokens are ID-referenced (kernel default `4000`); smaller results stay verbatim.
+  - `excludeTools: string[]` — tool-name patterns never stored (glob suffixes allowed; kernel default: none).
+  - `toolName: string` — rename the retrieval tool (default `"acp_retrieve"`); declaration, dispatch and the placeholder hint all follow the name. Must stay unique against the client's own tool names.
+  - `maxHeadChars: number` — head/command preview length inside the placeholder (kernel default `96`).
+  The store persists as a single envelope file (`.content-store.json`) next to the session JSON, using the same at-rest codec as the session file when `BILI_ENCRYPTION_KEY` is set; entries are deduped by content hash and lazily loaded per session. Only the *content* inside a `tool` result shrinks — pairing with the assistant `tool_calls` is untouched. v1 scope gates: **proxy mode only** (plugin agents would need `acp_retrieve` advertised in their plugin manifest before a placeholder could be emitted — otherwise silent loss), and **native-tools wires only**: responses marker/text-protocol routes and `ACP_NO_INJECT_TOOL` have no channel to execute the retrieve, so the store disarms itself there instead of losing content. Known limitation: no eviction policy yet — the envelope grows with the unique originals held (tracked as a follow-up). Per-session stats (stored bytes, current wire bytes saved, retrieve rate) surface in `acp_status`; each retrieve logs a `[ccr] retrieve …` line.
+
 #### `rules`
 
 - **Type:** `boolean`

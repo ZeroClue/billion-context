@@ -3,6 +3,7 @@ import type { GooglePart } from "acp-kernel/wire";
 import type { Session } from "./session.js";
 import { isProxyToolFor } from "./absorb.js";
 import { executeProxyTool } from "./loop/core.js";
+import { drainPendingRetrievals } from "./store.js";
 import type { RewriteCtx } from "./stream.js";
 import { containsMarkerLineText, containsRenderTagText, stripAcpTags } from "./loop/tag-echo-filter.js";
 
@@ -34,6 +35,11 @@ export function rewriteGoogleJsonResponse(body: unknown, ctx: RewriteCtx): unkno
             part.text = stripAcpTags(part.text);
         }
         keptParts.push(part);
+    }
+    // #1097: non-stream has no re-request to ride — retrieval full text rides
+    // inline after the ack, same as the anthropic rewrite twin.
+    for (const injection of drainPendingRetrievals(ctx.session)) {
+        if (typeof injection.text === "string") noteParts.push(injection.text);
     }
     if (!converted) return body;
     // The tool result is a NEW text part: an existing text part may carry a

@@ -1,4 +1,4 @@
-import { createInitialState, type CompressionState, type Config, type CoreMessage } from "acp-kernel";
+import { createInitialState, type CompressionState, type Config, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import { createHash } from "node:crypto";
 import { getStore } from "./persist.js";
 import type { WireProtocol } from "./util.js";
@@ -128,6 +128,16 @@ export type Session = {
          *  Cleared by resetSessionCompression (native-compaction boundary).
          *  Persisted (survives restart like the rest of stats). */
         localInputEstimate?: number;
+        /** #1097 content store: total acp_retrieve calls issued this session. */
+        retrieveCalls: number;
+        /** #1097: acp_retrieve calls that resolved to stored content. */
+        retrieveHits: number;
+        /** #1097: acp_retrieve calls that missed (unknown/hallucinated ref). */
+        retrieveMisses: number;
+        /** #1097: cumulative bytes of unique originals held in the store. */
+        storedBytes: number;
+        /** #1097: cumulative wire bytes saved by placeholder substitution. */
+        storeBytesSaved: number;
     };
     /** Free-form escape hatch for future fields not yet promoted to typed
      *  members. Persisted as-is (must be JSON-serializable). Use sparingly —
@@ -163,6 +173,19 @@ export type Session = {
      *  the state ranges). Cleared by snapshotMessages on the next live
      *  request — the client re-sends full raw history, restoring the invariant. */
     lastMessagesFolded?: boolean;
+    /** Kernel CCR envelope (#1097): originals of ID-referenced tool results,
+    *  owned and mutated only by kernel processTurn (ccr-store node) via
+    *  adoptContentStore. Lazily loaded from the session's content-store.json;
+    *  NOT part of session.state (separate file, separate lifecycle — reset on
+    *  full-state rebase). In-memory only here; buildRecord omits it. */
+    contentStore?: MessageContentStore;
+    /** In-memory only (NOT persisted): content-store.json is rewritten only
+    *  while this is set (adopt grew entries / reset cleared the store). */
+    contentStoreDirty?: boolean;
+    /** In-memory only (NOT persisted): full-text retrieval injections queued by
+    *  executeRetrieve, drained into the next re-request after the tool-result
+    *  pair (request-only, same channel as nudges). */
+    pendingRetrievals: CoreMessage[];
     /** Number of in-flight requests using this session. A session with
      *  inFlight > 0 must NOT be LRU-evicted: evicting it mid-stream flushes a
      *  half-mutated snapshot and then a miss reloads a SECOND Session object,
@@ -283,7 +306,7 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
     const session: Session = {
         id,
         meta: { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin, label: meta?.label },
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -291,6 +314,7 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
+        pendingRetrievals: [],
     };
     sessions.set(id, session);
     return session;
@@ -444,6 +468,13 @@ export function cacheBlockContent(session: Session, blockId: string, content: Bl
 export function resetSessionCompression(session: Session): void {
     session.state = createInitialState();
     session.blockContents.clear();
+    // The kernel contract ties the store to the state ('host resets the store
+    // with the state'): a full rebase restarts refs at m00001, so old entries
+    // would misattribute under reused numbers. contentStoreDirty + markDirty
+    // deletes the on-disk envelope on the next save.
+    session.contentStore = undefined;
+    session.contentStoreDirty = true;
+    session.pendingRetrievals.length = 0;
     session.stats.lastInputTokens = 0;
     // #857: a zeroed baseline carries no provenance — drop any stale flag.
     delete session.stats.lastInputTokensSource;
