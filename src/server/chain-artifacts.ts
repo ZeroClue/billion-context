@@ -8,7 +8,7 @@
 // clients — the client re-sends render tags verbatim, and the tool names sit
 // in the tools array of every plugin-mode request even when never called —
 // so a single-instance setup judged EVERY turn as a chain and the compression
-// kernel stopped running permanently (#1086). Two corrections:
+// kernel stopped running permanently (#1086). Corrections:
 //   1. Tool names only count when they appear in HISTORY tool-call items
 //      (an actual prior invocation), never from the tools declaration array
 //      alone — declarations are the normal shape of a bili-managed client.
@@ -16,6 +16,16 @@
 //      session identity is resolved: when THIS instance holds processed
 //      compression state for the session, the artifacts are self-produced
 //      and the request runs through the kernel normally.
+//   3. Render tags only count from HISTORY message content — a client-authored
+//      system/developer/instructions block may legitimately quote a tag-shaped
+//      example (this repo's AGENTS.md does), which the old whole-body scan
+//      misread as a chain and passed through forever, silently disabling
+//      compression (#1197). An unparseable body has no structure, so it keeps
+//      the whole-body fallback.
+//   4. Cooperative plugin requests (x-bili-plugin) are exempt from the content
+//      fallback entirely in server.ts — plugin mode re-sends the agent's own
+//      compress calls/results by design; real bili→bili chains stay guarded by
+//      the x-bili-hop marker above (#1197).
 
 const ACP_TAG_RE = /\x3cacp\s+tokens=\\"?[0-9]+(?:\.[0-9]+)?K?\\"?\s+type=\\"?[^\\"]*\\"?\s*\x3em[0-9]{1,8}\x3c\/acp\x3e/;
 
@@ -33,14 +43,43 @@ export function artifactSeedHit(body: Buffer): boolean {
 
 /** Verify which ACP artifact family is actually present in the request.
  *  `parsed` is the already-parsed body (null when unparseable — then only
- *  the tag check can fire). Returns null when neither family is present. */
+ *  the tag check can fire, over the whole body). Returns null when neither
+ *  family is present. */
 export function detectAcpArtifacts(body: Buffer, parsed: unknown): AcpArtifactKind | null {
-    if (body.includes("\x3cacp ") && ACP_TAG_RE.test(body.toString("utf8"))) return "tags";
+    if (body.includes("\x3cacp ")) {
+        // #1197: render tags only ever sit in HISTORY message content. Scope the
+        // tag family there so a client-authored system/instructions example does
+        // not read as a chain; an unparseable body has no structure to scope to.
+        const hist = (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed))
+            ? historyTagContainer(parsed as Record<string, unknown>)
+            : null;
+        if (ACP_TAG_RE.test(hist !== null ? JSON.stringify(hist) : body.toString("utf8"))) return "tags";
+    }
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         const names = historyToolCallNames(parsed as Record<string, unknown>);
         if (names.has("acp_status") && names.has("search_context")) return "tool-history";
     }
     return null;
+}
+
+/** HISTORY messages only, re-serializable for the wire-escaped tag regex:
+ *  the container (messages/input/contents) minus client-authored
+ *  system/developer-role items. Top-level Anthropic `system`, Responses
+ *  `instructions` and Gemini `systemInstruction` never live in the container,
+ *  so they are excluded by construction. A client-authored context block may
+ *  quote a render-tag example (this repo's AGENTS.md does) — that is not chain
+ *  evidence (#1197). Returns null when the body has no recognizable container. */
+function historyTagContainer(parsed: Record<string, unknown>): unknown[] | null {
+    const container = Array.isArray(parsed.messages) ? parsed.messages
+        : Array.isArray(parsed.input) ? parsed.input
+        : Array.isArray(parsed.contents) ? parsed.contents
+        : null;
+    if (!container) return null;
+    return container.filter((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return true;
+        const role = (item as Record<string, unknown>).role;
+        return role !== "system" && role !== "developer";
+    });
 }
 
 /** Collect tool names invoked in HISTORY items only: OpenAI

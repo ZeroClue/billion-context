@@ -656,3 +656,139 @@ test("#1101 T9: BILI_CHAIN_CONTENT env parse — default ON, 0 disables, env win
         rmSync(root, { recursive: true, force: true });
     }
 });
+
+// #1197: the tag family used to scan the WHOLE body, so a client-authored
+// system/developer/instructions block quoting a render-tag example (this repo's
+// own AGENTS.md does; pi injects it) read as a bili→bili chain and a fresh
+// session was passed through forever — compression silently off, /acp armed-idle.
+// Layer 1 scopes tags to HISTORY; Layer 2 exempts cooperative plugins.
+
+const docTag = "\x3cacp tokens=\"2\" type=\"text\"\x3em00001\x3c/acp\x3e";
+
+test("#1197 detector: a render-tag example in client-authored context is NOT an artifact (all wires)", () => {
+    const openaiSystem = { model: MODEL, messages: [
+        { role: "system", content: `Each message is cited like ${docTag} in history.` },
+        { role: "user", content: "hello" },
+    ] };
+    assert.equal(detectAcpArtifacts(Buffer.from(JSON.stringify(openaiSystem)), openaiSystem), null, "system-role message example is not chain evidence");
+
+    const anthropicSystem = { model: MODEL, system: `Render tags look like ${docTag}.`, messages: [{ role: "user", content: "hello" }] };
+    assert.equal(detectAcpArtifacts(Buffer.from(JSON.stringify(anthropicSystem)), anthropicSystem), null, "top-level system field is client-authored");
+
+    const responsesInstr = { model: MODEL, instructions: `Example: ${docTag}`, input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] }] };
+    assert.equal(detectAcpArtifacts(Buffer.from(JSON.stringify(responsesInstr)), responsesInstr), null, "top-level instructions is client-authored");
+
+    const geminiSys = { model: MODEL, systemInstruction: { parts: [{ text: `See ${docTag}` }] }, contents: [{ role: "user", parts: [{ text: "hello" }] }] };
+    assert.equal(detectAcpArtifacts(Buffer.from(JSON.stringify(geminiSys)), geminiSys), null, "top-level systemInstruction is client-authored");
+});
+
+test("#1197 detector: a real render tag in HISTORY (assistant/tool) still IS an artifact; developer role is excluded", () => {
+    const inAssistant = { model: MODEL, messages: [
+        { role: "system", content: "plain system" },
+        { role: "assistant", content: `done ${docTag}` },
+    ] };
+    assert.equal(detectAcpArtifacts(Buffer.from(JSON.stringify(inAssistant)), inAssistant), "tags", "tag in assistant history is an artifact");
+
+    const inToolResult = { model: MODEL, messages: [
+        { role: "tool", tool_call_id: "c1", content: `result ${docTag}` },
+    ] };
+    assert.equal(detectAcpArtifacts(Buffer.from(JSON.stringify(inToolResult)), inToolResult), "tags", "tag in tool-result history is an artifact");
+
+    const devRole = { model: MODEL, messages: [
+        { role: "developer", content: `dev note ${docTag}` },
+        { role: "user", content: "hi" },
+    ] };
+    assert.equal(detectAcpArtifacts(Buffer.from(JSON.stringify(devRole)), devRole), null, "developer-role context is excluded like system");
+});
+
+test("#1197 T10: fresh non-plugin session with a render-tag example in SYSTEM is processed, not passed through", async () => {
+    // Enabled store over an empty dir ⇒ truly no local state (hasProcessedState
+    // false). Pre-#1197 the whole-body tag scan tripped on the system example and
+    // forwarded verbatim, creating no session (/acp armed-idle forever).
+    const dir = mkdtempSync(join(tmpdir(), "bili-chain-t10-"));
+    const store = new SessionStore({ dir, debounceMs: 5, enabled: true });
+    _setStoreForTest(store);
+    _resetSessionsForTest();
+    _resetChainWarningsForTest();
+    setRegistryForTest({});
+    const logs: LogRec[] = [];
+    setLogCapture((level, msg) => logs.push({ level, msg }));
+    const captured: Captured[] = [];
+    const upstream = makeUpstream(captured);
+    upstream.listen(0, "127.0.0.1");
+    await listen(upstream);
+    const proxy = await startServer(makeOpts(`http://127.0.0.1:${(upstream.address() as { port: number }).port}`));
+    await listen(proxy);
+    try {
+        const raw = JSON.stringify({
+            model: MODEL,
+            stream: false,
+            messages: [
+                { role: "system", content: `Each message is tagged like \x3cacp tokens="2" type="text"\x3em00001\x3c/acp\x3e so you can cite refs.` },
+                { role: "user", content: "hello world, what can you do?" },
+            ],
+        });
+        const resp = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "sys-tag-1" },
+            body: raw,
+        });
+        assert.equal(resp.status, 200);
+        await resp.text();
+        assert.equal(captured.length, 1);
+        assert.notEqual(sha(captured[0]!.body), sha(raw), "#1197: a system-prompt tag example must NOT trip the content fallback — kernel processes");
+        assert.equal(chainWarns(logs, "sys-tag-1").length, 0, "no chain warning may fire for a client-authored system example");
+        assert.equal(peekSession("sys-tag-1")?.stats.requests, 1, "session must be created and processed (was: passed through, /acp armed-idle forever)");
+    } finally {
+        setLogCapture(null);
+        proxy.closeAllConnections?.();
+        await close(proxy);
+        upstream.closeAllConnections?.();
+        await close(upstream);
+        store.cancelAll();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("#1197 T11: cooperative plugin (x-bili-plugin) carrying history artifacts without local state is processed, not passed through", async () => {
+    // Layer 2: plugin mode re-sends the agent's OWN compress calls/results in
+    // history by design. Without local state (cross-instance replay / fresh
+    // instance) the old content fallback judged this a foreign bili→bili chain
+    // and passed it through verbatim. The x-bili-plugin header must exempt it;
+    // real chains stay guarded by x-bili-hop (T3 keeps the non-plugin path).
+    const dir = mkdtempSync(join(tmpdir(), "bili-chain-t11-"));
+    const store = new SessionStore({ dir, debounceMs: 5, enabled: true });
+    _setStoreForTest(store);
+    _resetSessionsForTest();
+    _resetChainWarningsForTest();
+    setRegistryForTest({});
+    const logs: LogRec[] = [];
+    setLogCapture((level, msg) => logs.push({ level, msg }));
+    const captured: Captured[] = [];
+    const upstream = makeUpstream(captured);
+    upstream.listen(0, "127.0.0.1");
+    await listen(upstream);
+    const proxy = await startServer(makeOpts(`http://127.0.0.1:${(upstream.address() as { port: number }).port}`));
+    await listen(proxy);
+    try {
+        const raw = incidentBody();
+        const resp = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "plugin-replay-1", "x-bili-plugin": "pi" },
+            body: raw,
+        });
+        assert.equal(resp.status, 200);
+        await resp.text();
+        assert.equal(captured.length, 1);
+        assert.equal(chainWarns(logs, "plugin-replay-1").length, 0, "a cooperative plugin must never be judged a foreign chain");
+        assert.equal(peekSession("plugin-replay-1")?.stats.requests, 1, "session must be created and processed (was: passed through, /acp armed-idle)");
+    } finally {
+        setLogCapture(null);
+        proxy.closeAllConnections?.();
+        await close(proxy);
+        upstream.closeAllConnections?.();
+        await close(upstream);
+        store.cancelAll();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});

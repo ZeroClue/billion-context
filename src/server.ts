@@ -1566,7 +1566,13 @@ async function handle(
         // so a foreign session leaves no trace in this instance.
         if (artifactSeed) {
             const artifactKind = detectAcpArtifacts(bodyBuffer, parsed);
-            if (artifactKind !== null && !hasProcessedState(sessionId, { protocol })) {
+            // #1197: a cooperative plugin (x-bili-plugin) OWNS compression — its
+            // history legitimately re-sends the agent's own compress calls/results,
+            // so those artifacts are never evidence of a foreign bili. Real
+            // bili→bili chains stay caught by the x-bili-hop guard above; the
+            // content fallback remains active only for non-cooperative clients.
+            const cooperativePlugin = pluginAgent !== undefined;
+            if (artifactKind !== null && !cooperativePlugin && !hasProcessedState(sessionId, { protocol })) {
                 if (!warnedChainSessions.has(sessionId)) {
                     warnedChainSessions.add(sessionId);
                     if (warnedChainSessions.size > WARNED_CHAIN_SESSION_CAP) {
@@ -1578,7 +1584,9 @@ async function handle(
                 return;
             }
             if (artifactKind !== null) {
-                log("debug", `[chain] ACP artifacts (${artifactKind}) belong to this instance's own session ${sessionId} — self-produced, processing normally (#1086)`);
+                log("debug", cooperativePlugin
+                    ? `[chain] ACP artifacts (${artifactKind}) from cooperative plugin — agent-owned compression, processing normally (#1197)`
+                    : `[chain] ACP artifacts (${artifactKind}) belong to this instance's own session ${sessionId} — self-produced, processing normally (#1086)`);
             }
         }
         // Two separate uses of the conversation signal:
