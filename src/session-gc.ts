@@ -1,4 +1,5 @@
 import { readdir, rm, rmdir, stat } from "node:fs/promises";
+import type { Stats } from "node:fs";
 import path from "node:path";
 import { log as loggerLog } from "./logger.js";
 import { getStore, type SessionStore } from "./persist.js";
@@ -40,6 +41,20 @@ import { dropSessionForGc, peekSession } from "./session.js";
  * are decoded (any codec-framed file — encrypted today, zstd-compressed
  * once #1083 lands — works via the store's format-agnostic reader).
  * Corrupt/unreadable files are left in place, never guessed at.
+ *
+ * #1180: the per-session CCR content store (#1097) lives next to its session
+ * file as `<hash>.content-store.json` and shares the session's lifecycle —
+ * it holds lossless payload bytes (originals of oversized tool results), so
+ * deleting the session loses exactly those bytes, the class of file this
+ * sweep exists to clean:
+ *   - co-deleted with its session file (the sweep never leaves orphans);
+ *   - swept directly when orphaned (session file already gone — leftovers
+ *     from versions that deleted sessions without their stores);
+ *   - its token footprint (unique-content chars ÷ 4) counts toward the size
+ *     gate, so a tiny session with a huge store does not slip under it;
+ *   - attached to a kept session → kept untouched; an unreadable/foreign
+ *     companion next to an otherwise-eligible session → both kept (never
+ *     guess at unreadable files).
  */
 
 export interface GcConfig {
@@ -82,6 +97,8 @@ interface FileView {
     contextTokens: number;
     everCompressed: boolean;
     rawInputTokens: number | null;
+    /** #1180: companion content-store (#1097) footprint folded into the size gate by isGcEligible; absent = no companion */
+    storedTokens?: number;
 }
 
 function asRecord(v: unknown): Record<string, unknown> | null {
@@ -118,12 +135,30 @@ export function viewFromParsed(parsed: unknown): FileView | null {
     return { id, savedAt, contextTokens, everCompressed, rawInputTokens };
 }
 
+/** Approximate token footprint of a parsed CCR content-store envelope
+ *  (#1097): unique-content chars (byHash values) ÷ 4, matching bili's default
+ *  char-based estimator. Null when the value is not a store envelope — the
+ *  caller keeps the session rather than guessing at an unknown companion. */
+export function contentStoreTokens(parsed: unknown): number | null {
+    const rec = asRecord(parsed);
+    if (!rec || rec.version !== 1) return null;
+    const byHash = asRecord(rec.byHash);
+    const byRef = asRecord(rec.byRef);
+    if (!byHash || !byRef) return null;
+    let chars = 0;
+    for (const text of Object.values(byHash)) {
+        if (typeof text === "string") chars += text.length;
+    }
+    return Math.ceil(chars / 4);
+}
+
 export function isGcEligible(view: FileView, now: number, cfg: Pick<GcConfig, "maxAgeMs" | "maxTokens">): boolean {
     if (now - view.savedAt < cfg.maxAgeMs) return false;
     if (view.everCompressed) return false;
-    return view.rawInputTokens !== null
-        ? view.rawInputTokens <= cfg.maxTokens
-        : view.contextTokens <= cfg.maxTokens;
+    // #1180: the companion store's lossless originals die with this file, so
+    // its footprint joins the re-send size in the gate.
+    const base = view.rawInputTokens !== null ? view.rawInputTokens : view.contextTokens;
+    return base + (view.storedTokens ?? 0) <= cfg.maxTokens;
 }
 
 async function walkSessionFiles(dir: string): Promise<string[]> {
@@ -145,10 +180,12 @@ export interface GcResult {
     kept: number;
     unreadable: number;
     bytesFreed: number;
+    /** #1180: content-store companion files removed (co-deletions + orphan sweeps) */
+    companionsRemoved: number;
 }
 
 export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore; now?: number }): Promise<GcResult> {
-    const result: GcResult = { removed: 0, kept: 0, unreadable: 0, bytesFreed: 0 };
+    const result: GcResult = { removed: 0, kept: 0, unreadable: 0, bytesFreed: 0, companionsRemoved: 0 };
     const cfg = gcConfigFromEnv();
     if (!cfg.enabled) return result;
     const store = opts?.store ?? getStore();
@@ -161,7 +198,18 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
     } catch {
         return result;
     }
-    for (const file of files) {
+    // #1180: split sessions from CCR companions (#1097); companion path is the
+    // deterministic sibling per contentStoreRelPathFor — no decode to pair them.
+    const companionSuffix = ".content-store.json";
+    const sessionFiles: string[] = [];
+    const companions: string[] = [];
+    for (const f of files) {
+        if (f.endsWith(companionSuffix)) companions.push(f);
+        else sessionFiles.push(f);
+    }
+    const deletedSessions = new Set<string>();
+    const coDeleted = new Set<string>();
+    for (const file of sessionFiles) {
         let st;
         try {
             st = await stat(file);
@@ -177,6 +225,26 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         if (!view) {
             result.unreadable++;
             continue;
+        }
+        // #1180: measure the companion BEFORE judging "small enough" — its
+        // lossless originals die with this file, so they are part of what a
+        // deletion loses.
+        const companion = file.slice(0, -".json".length) + companionSuffix;
+        let compSt: Stats | undefined;
+        try {
+            const s = await stat(companion);
+            if (s.isFile()) compSt = s;
+        } catch { /* no companion */ }
+        if (compSt) {
+            const stored = contentStoreTokens(await store.readRawFile(companion));
+            if (stored === null) {
+                // Companion present but not a recognizable store envelope —
+                // cannot verify what deletion would lose. Keep both (same rule
+                // as unreadable session files: never guess).
+                result.kept++;
+                continue;
+            }
+            view.storedTokens = stored;
         }
         if (!isGcEligible(view, now, cfg)) {
             result.kept++;
@@ -202,17 +270,75 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
             result.kept++;
             continue;
         }
-        // Audit trail (owner requirement #1082): every deletion is individually
-        // traceable — which file, how big, how old.
+        // Audit trail (owner requirement #1082/#1180): every deletion is
+        // individually traceable — which file, how big, how old.
         loggerLog("info", `[gc] removed ${path.relative(dir, file)} (${st.size} B, age ${Math.round((now - view.savedAt) / DAY_MS)}d)`);
         result.removed++;
         result.bytesFreed += st.size;
+        deletedSessions.add(file);
+        if (compSt) {
+            // Co-delete the companion so the sweep never leaves orphans. On
+            // failure it surfaces as an orphan on the very next pass below.
+            try {
+                await rm(companion, { force: true });
+                loggerLog("info", `[gc] removed content store ${path.relative(dir, companion)} (${compSt.size} B)`);
+                result.bytesFreed += compSt.size;
+                result.companionsRemoved++;
+                coDeleted.add(companion);
+            } catch { /* orphan pass retries */ }
+        }
         const parent = path.dirname(file);
         if (parent !== dir) await rmdir(parent).catch(() => {});
     }
-    if (result.removed > 0 || result.unreadable > 0) {
+    // #1180: orphaned companions — the session file is already gone (leftovers
+    // from versions that deleted sessions without their stores). Unreferenced
+    // payload garbage once old enough; the mtime pre-filter keeps live saves safe.
+    for (const companion of companions) {
+        if (coDeleted.has(companion)) continue;
+        let st;
+        try {
+            st = await stat(companion);
+        } catch {
+            continue;
+        }
+        if (!st.isFile() || now - st.mtimeMs < cfg.maxAgeMs) {
+            result.kept++;
+            continue;
+        }
+        // Referenced when ANY surviving session file shares the hash stem —
+        // namespaced `host_<hash>.json` and flat `_unknown/<hash>.json` both end
+        // with `<hash>.json`, and meta fill-once can migrate a session between
+        // those namespaces without cleaning the old path: sibling-only matching
+        // would false-orphan (delete live store bytes) across that move.
+        const stem = path.basename(companion).slice(0, -companionSuffix.length);
+        let referenced = false;
+        for (const sf of sessionFiles) {
+            if (deletedSessions.has(sf)) continue;
+            if (path.basename(sf).endsWith(stem + ".json")) {
+                referenced = true;
+                break;
+            }
+        }
+        if (referenced) {
+            result.kept++;
+            continue;
+        }
+        try {
+            await rm(companion, { force: true });
+        } catch {
+            result.kept++;
+            continue;
+        }
+        loggerLog("info", `[gc] removed orphaned content store ${path.relative(dir, companion)} (${st.size} B)`);
+        // Companions count in their own field — `removed` stays "session files".
+        result.companionsRemoved++;
+        result.bytesFreed += st.size;
+        const parent = path.dirname(companion);
+        if (parent !== dir) await rmdir(parent).catch(() => {});
+    }
+    if (result.removed > 0 || result.unreadable > 0 || result.companionsRemoved > 0) {
         loggerLog(result.unreadable > 0 ? "warn" : "info",
-            `[gc] removed ${result.removed} stale session file(s) (age>${Math.round(cfg.maxAgeMs / DAY_MS)}d, ≤${cfg.maxTokens}tok), freed ${(result.bytesFreed / 1024).toFixed(1)} KB${result.unreadable > 0 ? `; left ${result.unreadable} unreadable file(s) in place` : ""}`);
+            `[gc] removed ${result.removed} stale session file(s)${result.companionsRemoved > 0 ? ` + ${result.companionsRemoved} content store file(s)` : ""} (age>${Math.round(cfg.maxAgeMs / DAY_MS)}d, ≤${cfg.maxTokens}tok), freed ${(result.bytesFreed / 1024).toFixed(1)} KB${result.unreadable > 0 ? `; left ${result.unreadable} unreadable file(s) in place` : ""}`);
     }
     return result;
 }

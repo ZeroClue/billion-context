@@ -1111,8 +1111,12 @@ compressed (no folded blocks) with its newest request body ≤
 `BILI_SESSION_GC_MAX_TOKENS` tokens (default 1M; unrecorded legacy files use
 `contextTokens`) — so deletion loses nothing but bytes: resuming rebuilds the
 context from the client's own history at the cost of one cold rebuild.
-Compressed sessions are never deleted (their summaries cannot be rebuilt
-losslessly). Every deletion is audit-logged individually, plus one summary
+CCR content stores (#1097) live next to their session file as
+`<hash>.content-store.json` and follow the same lifecycle (#1180): a store is
+deleted together with its session file, an orphaned store (session file
+already gone) is swept once past the age gate, and the store's token footprint
+(unique-content chars ÷ 4) counts toward the size ceiling above. Compressed
+sessions are never deleted (their summaries cannot be rebuilt losslessly). Every deletion is audit-logged individually, plus one summary
 line per non-empty sweep. Live sessions, unreadable files, and encrypted
 files are handled conservatively (decoded via `BILI_ENCRYPTION_KEY` before
 judging). Details in [CONFIGURATION.md](CONFIGURATION.md#environment-variables).
