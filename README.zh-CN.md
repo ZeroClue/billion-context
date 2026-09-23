@@ -70,7 +70,7 @@ QQ群:
 
 可选的第五个工具 `absorb`(`compress.absorb.enabled: true` —— 见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md))对**各个工具结果即时压缩**:大结果(构建、日志、grep)被附带强制吸收指令,模型将各自蒸馏为紧凑摘要,原配对从下一轮起从线上隐藏 —— 使折叠轮之间的中间会话压力更低(#605)。
 
-可选的第六个工具 `acp_rule`(`compress.rules: true` —— 见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md))记录**持久化的原则级提醒**:模型记录的简短规则(用户强调的教训、要求记住的行为、撞到的大坑)受硬性保护不被压缩——调用及结果在每次折叠中都保留在上下文中——省略参数则列出已记录规则([ranxianglei/billion-context-pi#433](https://github.com/ranxianglei/billion-context-pi/issues/433))。
+可选的第六个工具 `acp_rule`(`compress.rules: true` —— 见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md))记录**持久化的原则级提醒**:模型记录的简短规则(用户强调的教训、要求记住的行为、撞到的大坑)受硬性保护不被压缩——调用及结果在每次折叠中都保留在上下文中——省略参数则列出已记录规则;传入 `delete`(规则 id,如 `"rule3"`)删除单条规则,传入 `clear: true` 清空全部规则([ranxianglei/billion-context-pi#433](https://github.com/ranxianglei/billion-context-pi/issues/433))。
 
 同族的保护开关 `compress.protectedLatestTools`(见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md))让累积型工具(客户端的 todo/任务清单,如 `["todo_list", "TodoWrite"]`)的**最新**快照永远不被压缩,旧实例照常折叠 —— agent 的活跃任务清单不会在折叠中丢失(#639)。其全历史对应项 `compress.protectedTools` 对工具的**全部实例**做硬排除 —— 适用于各次结果相互独立、后续结果不会取代旧结果的内容(如 opencode/pi 的 `skill` 加载);对高频或累积快照型工具保护全部实例会让上下文无界增长(#639),请只用于低频高价值工具。
 

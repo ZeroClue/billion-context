@@ -137,11 +137,13 @@ export const ABSORB_TOOL_RESPONSES = {
 // The reconciled kernel (acp-kernel#332) ships RULE_TOOL_NAME + the rule state
 // helpers but no wire tool objects. Synthesize all four wire shapes here so
 // every injection point (wire helpers, plugin manifest) serves one definition.
-const RULE_TOOL_DESCRIPTION = "Record a short, principle-level reminder so it survives context compression — the call and its result are protected and stay in context. Record when: the user calls out or repeatedly emphasizes a lesson; the user asks you to remember or follow a behavior; you personally hit a major pitfall worth remembering long-term. Keep each rule to one short line. Omit the rule argument to list recorded rules.";
+const RULE_TOOL_DESCRIPTION = "Record a short, principle-level reminder so it survives context compression — the call and its result are protected and stay in context. Record when: the user calls out or repeatedly emphasizes a lesson; the user asks you to remember or follow a behavior; you personally hit a major pitfall worth remembering long-term. Keep each rule to one short line. Omit the rule argument to list recorded rules. To remove a recorded rule pass delete with its id (e.g. \"rule3\"); to remove every recorded rule pass clear: true. delete and clear are mutually exclusive with each other and with rule — use one operation per call.";
 const RULE_PARAM_SCHEMA = {
     type: "object",
     properties: {
         rule: { type: "string", description: "Short principle-level reminder to record. Omit to list recorded rules." },
+        delete: { type: "string", description: "Id of a recorded rule to remove (e.g. \"rule3\"). Mutually exclusive with rule and clear." },
+        clear: { type: "boolean", description: "Remove every recorded rule at once. Mutually exclusive with rule and delete." },
     },
 };
 export const RULE_TOOL = { name: RULE_TOOL_NAME, description: RULE_TOOL_DESCRIPTION, input_schema: RULE_PARAM_SCHEMA };
