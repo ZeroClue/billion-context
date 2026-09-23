@@ -217,10 +217,14 @@ export function hasCompressSettings(s: CompressSettings): boolean {
   *    stays off unless some level enables it.
   *  - `rules` → `rules = { enabled }` (kernel RuleFeatureConfig; limits stay
   *    at kernel defaults). Absent `s.rules` leaves `base.rules` untouched.
-   *  - `ccr` → `ccr` (kernel CcrConfig, acp-kernel >= 0.0.84; the kernel runs
-   *    the ccr-store node inside processTurn between prune and absorb).
-   *    Unset fields inherit DEFAULT_CCR_CONFIG. Absent `s.ccr` leaves
-   *    `base.ccr` untouched — the feature stays off unless some level enables it.
+  *  - `ccr` → `ccr` (kernel CcrConfig, acp-kernel >= 0.0.84; the kernel runs
+  *    the ccr-store node inside processTurn between prune and absorb).
+  *    Unset fields inherit DEFAULT_CCR_CONFIG. CCR is ON BY DEFAULT (#1179):
+  *    absent `s.ccr` resolves to enabled=true, inheriting the other fields
+  *    from base.ccr then kernel defaults; an explicit `ccr: { enabled: false }`
+  *    at any level still wins. Host arming (server.ts) further gates it
+  *    behind the retrieve tool channel, so plugin mode / no-channel wires
+  *    stay inert regardless.
    *  - `imageCompression` → `imageCompression` (kernel ImageCompressionConfig,
    *    acp-kernel >= 0.0.84; #1095 pre-compression of image blocks). Unset
    *    fields inherit DEFAULT_IMAGE_COMPRESSION_CONFIG. Absent
@@ -252,7 +256,7 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
             excludeTools: s.absorb.excludeTools ?? [...d.excludeTools],
         };
     }
-    let ccr: CcrConfig | undefined;
+    let ccr: CcrConfig;
     if (s.ccr !== undefined) {
         const d = DEFAULT_CCR_CONFIG;
         ccr = {
@@ -261,6 +265,18 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
             minToolTokens: s.ccr.minToolTokens ?? d.minToolTokens,
             excludeTools: s.ccr.excludeTools ?? [...d.excludeTools],
             maxHeadChars: s.ccr.maxHeadChars ?? d.maxHeadChars,
+        };
+    } else {
+        // #1179 default-on: unset means enabled; other fields inherit
+        // base.ccr (advanced kernelConfig passthrough), then kernel defaults.
+        const d = DEFAULT_CCR_CONFIG;
+        const b = base.ccr;
+        ccr = {
+            enabled: true,
+            toolName: b?.toolName ?? d.toolName,
+            minToolTokens: b?.minToolTokens ?? d.minToolTokens,
+            excludeTools: b?.excludeTools ?? [...d.excludeTools],
+            maxHeadChars: b?.maxHeadChars ?? d.maxHeadChars,
         };
     }
     let imageCompression: ImageCompressionConfig | undefined;
@@ -289,7 +305,7 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         protectedLatestTools: s.protectedLatestTools ?? base.protectedLatestTools,
         protectedTools: s.protectedTools ?? base.protectedTools,
         ...(absorb !== undefined ? { absorb } : {}),
-        ...(ccr !== undefined ? { ccr } : {}),
+        ccr,
         ...(imageCompression !== undefined ? { imageCompression } : {}),
         ...(s.rules !== undefined ? { rules: { enabled: s.rules === true } } : {}),
     };
@@ -308,7 +324,8 @@ function parsePercent(v: number | string): number {
  *  context window (the caller handles the async registry lookup), this merges
  *  global → provider → model compress settings and applies them onto `base`,
  *  returning the tuned Config (or `base` unchanged when nothing is configured
- *  and the limit is unchanged). This is the exact function the proxy calls for
+ *  and the limit is unchanged and the CCR default-on (#1179) is already
+ *  reflected in the base). This is the exact function the proxy calls for
  *  every request, extracted so the three-level cascade is testable end-to-end
  *  without spinning up the HTTP server. */
 export function resolveRequestConfig(
@@ -321,6 +338,6 @@ export function resolveRequestConfig(
 ): Config {
     const compress = resolveCompress(routes, embeddedUrl, model, globalCompress);
     const limit = resolveContextLimitValue(compress.modelContextLimit, native ?? base.modelContextLimit);
-    if (!hasCompressSettings(compress) && limit === base.modelContextLimit) return base;
+    if (!hasCompressSettings(compress) && limit === base.modelContextLimit && base.ccr?.enabled === true) return base;
     return applyCompressSettings(base, limit, compress);
 }

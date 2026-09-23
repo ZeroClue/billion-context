@@ -66,10 +66,13 @@ test("e2e compress cascade: modelContextLimit resolves percent of native window"
     assert.equal(cfg.modelContextLimit, 100_000, "modelContextLimit '50%' → half of the 200000 native window");
 });
 
-test("e2e compress cascade: with nothing configured at any level, base Config is returned unchanged", () => {
+test("e2e compress cascade: nothing configured → CCR default-on applied, fast path once reflected in base", () => {
     const plain: ProviderRoutes = { [UPSTREAM]: { models: { "m": { context: 200_000 } } } };
     const cfg = resolveRequestConfig(BASE, plain, UPSTREAM, "m", 200_000, undefined);
-    assert.equal(cfg, BASE, "no compress settings + limit unchanged → same base object (no allocation)");
+    assert.notEqual(cfg, BASE, "default-on flips ccr → fresh config (#1179)");
+    assert.equal(cfg.ccr?.enabled, true, "unset ccr resolves to on");
+    const again = resolveRequestConfig(cfg, plain, UPSTREAM, "m", 200_000, undefined);
+    assert.equal(again, cfg, "base already reflecting the default → same object (no allocation)");
 });
 
 test("e2e compress cascade: a single resolver call resolves differently per model (proves per-request, not static)", () => {
