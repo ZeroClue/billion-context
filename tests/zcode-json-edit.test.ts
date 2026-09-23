@@ -10,7 +10,7 @@ import {
     resolveZcodeDataDir,
     stampZcodePluginHeader,
     unrouteZcodeText,
-    zcodeStoreFile,
+    zcodeStoreCandidates,
     ZCODE_BIGMODEL_ANTHROPIC_UPSTREAM,
 } from "../src/zcode/json-edit.ts";
 
@@ -26,22 +26,44 @@ function dataDir(): string {
     return mkdtempSync(path.join(tmpdir(), "zcode-json-edit-"));
 }
 
-test("resolveZcodeDataDir honors ZCODE_DATA_BASE_DIR and falls back to ~/.zcode", () => {
-    assert.equal(resolveZcodeDataDir({ ZCODE_DATA_BASE_DIR: "/data" }), "/data");
+test("resolveZcodeDataDir derives the .zcode root upstream-style (base dir, not the root itself)", () => {
+    assert.equal(resolveZcodeDataDir({ ZCODE_DATA_BASE_DIR: "/data" }), path.join("/data", ".zcode"));
     assert.equal(path.basename(resolveZcodeDataDir({})), ".zcode");
 });
 
-test("zcodeStoreFile maps kinds to their v2 paths", () => {
-    assert.equal(zcodeStoreFile("/d", "legacy"), path.join("/d", "v2", "config.json"));
-    assert.equal(zcodeStoreFile("/d", "new"), path.join("/d", "v2", "provider_config.json"));
+test("zcodeStoreCandidates maps kinds to v2 paths; explicit personal override ranks first (#1151)", () => {
+    assert.deepEqual(zcodeStoreCandidates("/d", "legacy"), [path.join("/d", "v2", "config.json")]);
+    assert.deepEqual(zcodeStoreCandidates("/d", "new"), [path.join("/d", "v2", "provider_config.json")]);
+    assert.deepEqual(zcodeStoreCandidates("/d", "new", { ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: "/alt/p.json" }), [
+        "/alt/p.json",
+        path.join("/d", "v2", "provider_config.json"),
+    ]);
+    assert.deepEqual(zcodeStoreCandidates("/d", "legacy", { ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: "/alt/p.json" }), [
+        path.join("/d", "v2", "config.json"),
+    ]);
+});
+
+test("detectZcodeStore honors an explicit personal-file override outside the v2 dir (#1151)", () => {
+    const dir = dataDir();
+    try {
+        mkdirSync(path.join(dir, "v2"), { recursive: true });
+        writeFileSync(zcodeStoreCandidates(dir, "legacy")[0], JSON.stringify({ provider: {} }));
+        assert.equal(detectZcodeStore(dir).kind, "legacy");
+        const alt = path.join(dir, "alt-personal.json");
+        writeFileSync(alt, JSON.stringify({ schemaVersion: 1, config: { providerConfigRules: { providerRules: [] } } }));
+        const env = { ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: alt };
+        assert.deepEqual(detectZcodeStore(dir, env), { kind: "new", file: alt });
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
 });
 
 test("detectZcodeStore prefers a valid new store and falls back to legacy", () => {
     const dir = dataDir();
     try {
         mkdirSync(path.join(dir, "v2"), { recursive: true });
-        const legacy = zcodeStoreFile(dir, "legacy");
-        const fresh = zcodeStoreFile(dir, "new");
+        const legacy = zcodeStoreCandidates(dir, "legacy")[0];
+        const fresh = zcodeStoreCandidates(dir, "new")[0];
 
         assert.deepEqual(detectZcodeStore(dir), { kind: "legacy", file: legacy });
 
@@ -193,10 +215,10 @@ test("inspectZcodeRouting reports the routed entries per store kind", () => {
         assert.equal(inspectZcodeRouting(dir), undefined);
 
         const legacyDoc = { provider: { "builtin:bigmodel-coding-plan": { options: { baseURL: `${ORIGIN_A}/bili/${UPSTREAM}` } } } };
-        writeFileSync(zcodeStoreFile(dir, "legacy"), JSON.stringify(legacyDoc));
+        writeFileSync(zcodeStoreCandidates(dir, "legacy")[0], JSON.stringify(legacyDoc));
         assert.deepEqual(inspectZcodeRouting(dir), {
             kind: "legacy",
-            file: zcodeStoreFile(dir, "legacy"),
+            file: zcodeStoreCandidates(dir, "legacy")[0],
             wrapped: [{ id: "builtin:bigmodel-coding-plan", upstream: UPSTREAM }],
         });
 
@@ -208,11 +230,11 @@ test("inspectZcodeRouting reports the routed entries per store kind", () => {
                 },
             },
         };
-        writeFileSync(zcodeStoreFile(dir, "new"), JSON.stringify(newDoc));
+        writeFileSync(zcodeStoreCandidates(dir, "new")[0], JSON.stringify(newDoc));
         const fresh = inspectZcodeRouting(dir);
         assert.equal(fresh?.kind, "new");
         assert.deepEqual(fresh?.wrapped, [{ id: "account:bigmodel-individual-coding-plan", upstream: UPSTREAM }]);
-        assert.equal(readFileSync(zcodeStoreFile(dir, "new"), "utf8").includes("schemaVersion"), true);
+        assert.equal(readFileSync(zcodeStoreCandidates(dir, "new")[0], "utf8").includes("schemaVersion"), true);
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }

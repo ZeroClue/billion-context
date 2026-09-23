@@ -8,8 +8,8 @@
 // never merge into defaults, never partial-write (§7.3).
 
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { zcodeDataRoot } from "../client-config.js";
 
 export type ZcodeStoreKind = "legacy" | "new";
 
@@ -54,24 +54,31 @@ const ZCODE_NEW_CREATE_IDS: readonly string[] = [
 const WRAPPED_URL_RE = /^https?:\/\/[^/]+\/bili\/(https?:\/\/.+)$/;
 
 export function resolveZcodeDataDir(env: NodeJS.ProcessEnv = process.env): string {
-    const base = env.ZCODE_DATA_BASE_DIR;
-    return base !== undefined && base.length > 0 ? base : path.join(os.homedir(), ".zcode");
+    return zcodeDataRoot(env);
 }
 
-export function zcodeStoreFile(dataDir: string, kind: ZcodeStoreKind): string {
-    return path.join(dataDir, "v2", kind === "new" ? "provider_config.json" : "config.json");
+/** Candidate store files in precedence order. An explicit
+ *  ZCODE_PERSONAL_PROVIDER_CONFIG_FILE (absolute file override, upstream
+ *  provider-runtime-env.ts) outranks the derived path; dataDir stays the
+ *  single source when callers inject it (tests). */
+export function zcodeStoreCandidates(dataDir: string, kind: ZcodeStoreKind, env: NodeJS.ProcessEnv = process.env): string[] {
+    const local = path.join(dataDir, "v2", kind === "new" ? "provider_config.json" : "config.json");
+    if (kind !== "new") return [local];
+    const explicit = env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE?.trim();
+    return explicit !== undefined && explicit.length > 0 ? [explicit, local] : [local];
 }
 
 /** Pick the store the running client actually honors: the new personal store
  *  when it exists AND parses with the expected shape, else the legacy file
  *  (both readers stay live in current builds during the migration window). */
-export function detectZcodeStore(dataDir: string): { kind: ZcodeStoreKind; file: string } {
-    const newFile = zcodeStoreFile(dataDir, "new");
-    try {
-        assertNewStoreShape(JSON.parse(fs.readFileSync(newFile, "utf8")));
-        return { kind: "new", file: newFile };
-    } catch {}
-    return { kind: "legacy", file: zcodeStoreFile(dataDir, "legacy") };
+export function detectZcodeStore(dataDir: string, env: NodeJS.ProcessEnv = process.env): { kind: ZcodeStoreKind; file: string } {
+    for (const newFile of zcodeStoreCandidates(dataDir, "new", env)) {
+        try {
+            assertNewStoreShape(JSON.parse(fs.readFileSync(newFile, "utf8")));
+            return { kind: "new", file: newFile };
+        } catch {}
+    }
+    return { kind: "legacy", file: zcodeStoreCandidates(dataDir, "legacy", env)[0] };
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -313,8 +320,8 @@ export function unrouteZcodeText(text: string, kind: ZcodeStoreKind): { text: st
 
 /** Read-only inspection for status reporting: which store exists and which
  *  entries currently route through a bili origin. */
-export function inspectZcodeRouting(dataDir: string): { kind: ZcodeStoreKind; file: string; wrapped: ZcodeWrappedEntry[] } | undefined {
-    const { kind, file } = detectZcodeStore(dataDir);
+export function inspectZcodeRouting(dataDir: string, env: NodeJS.ProcessEnv = process.env): { kind: ZcodeStoreKind; file: string; wrapped: ZcodeWrappedEntry[] } | undefined {
+    const { kind, file } = detectZcodeStore(dataDir, env);
     let text: string;
     try {
         text = fs.readFileSync(file, "utf8");

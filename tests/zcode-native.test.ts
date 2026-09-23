@@ -13,7 +13,7 @@ import {
     routeZcodeConfig,
     unrouteZcode,
 } from "../src/zcode/native.ts";
-import { zcodeStoreFile } from "../src/zcode/json-edit.ts";
+import { zcodeStoreCandidates } from "../src/zcode/json-edit.ts";
 
 // #1145: the per-session bootstrap lifecycle — plan decision table, health
 // probe, routing with #1002 snapshot discipline, stamp, unroute, restore.
@@ -25,7 +25,7 @@ function dataDir(): string {
     const dir = mkdtempSync(path.join(tmpdir(), "zcode-native-"));
     mkdirSync(path.join(dir, "v2"), { recursive: true });
     writeFileSync(
-        zcodeStoreFile(dir, "legacy"),
+        zcodeStoreCandidates(dir, "legacy", {})[0],
         JSON.stringify({ provider: { "builtin:bigmodel-coding-plan": { options: { baseURL: UPSTREAM } } } }) + "\n",
     );
     return dir;
@@ -93,7 +93,7 @@ test("probeProxyHealth accepts any live proxy answer and rejects failures", asyn
 test("routeZcodeConfig wraps the store and snapshots pre-bili state once", async () => {
     const dir = dataDir();
     try {
-        const original = readFileSync(zcodeStoreFile(dir, "legacy"), "utf8");
+        const original = readFileSync(zcodeStoreCandidates(dir, "legacy", {})[0], "utf8");
         const logs: string[] = [];
         const applied = await routeZcodeConfig({ origin: "http://127.0.0.1:18787", dataDir: dir, log: (m) => logs.push(m) });
         assert.ok(applied);
@@ -116,7 +116,7 @@ test("routeZcodeConfig wraps the store and snapshots pre-bili state once", async
 test("routeZcodeConfig re-snapshots user edits made while native mode is active", async () => {
     const dir = dataDir();
     try {
-        const file = zcodeStoreFile(dir, "legacy");
+        const file = zcodeStoreCandidates(dir, "legacy", {})[0];
         await routeZcodeConfig({ origin: "http://127.0.0.1:18787", dataDir: dir, log: () => {} });
         const userEdited = JSON.stringify({ provider: { "builtin:bigmodel-coding-plan": { options: {} }, note: "user edit" } }) + "\n";
         writeFileSync(file, userEdited);
@@ -162,7 +162,7 @@ test("activateZcodePluginMode stamps the header into the routed entries", async 
 test("unrouteZcode strips wrappers in place and drops snapshots", async () => {
     const dir = dataDir();
     try {
-        const file = zcodeStoreFile(dir, "legacy");
+        const file = zcodeStoreCandidates(dir, "legacy", {})[0];
         await routeZcodeConfig({ origin: "http://127.0.0.1:18787", dataDir: dir, log: () => {} });
         unrouteZcode({ dataDir: dir, log: () => {} });
         const parsed = JSON.parse(readFileSync(file, "utf8")) as { provider: Record<string, { options: { baseURL: string } }> };
@@ -240,5 +240,45 @@ test("bootstrapZcodeNative spawns through the injected ensureProxy seam", async 
         });
     } finally {
         rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("bootstrap honors upstream env relocation: ZCODE_DATA_BASE_DIR is a base dir (#1151)", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "zcode-native-base-"));
+    try {
+        const v2 = path.join(base, ".zcode", "v2");
+        mkdirSync(v2, { recursive: true });
+        const file = path.join(v2, "config.json");
+        writeFileSync(file, JSON.stringify({ provider: { "builtin:bigmodel-coding-plan": { options: { baseURL: UPSTREAM } } } }) + "\n");
+        const applied = await routeZcodeConfig({ origin: "http://127.0.0.1:18787", env: { ZCODE_DATA_BASE_DIR: base }, log: () => {} });
+        assert.ok(applied);
+        assert.equal(applied.file, file);
+        assert.match(readFileSync(file, "utf8"), /http:\/\/127\.0\.0\.1:18787\/bili\//);
+        assert.ok(restoreZcodeBackup({ env: { ZCODE_DATA_BASE_DIR: base }, log: () => {} }).restored);
+        assert.doesNotMatch(readFileSync(file, "utf8"), /\/bili\//);
+    } finally {
+        rmSync(base, { recursive: true, force: true });
+    }
+});
+
+test("bootstrap honors ZCODE_PERSONAL_PROVIDER_CONFIG_FILE overrides (#1151)", async () => {
+    const dir = dataDir();
+    const alt = mkdtempSync(path.join(tmpdir(), "zcode-native-alt-"));
+    try {
+        const file = path.join(alt, "p.json");
+        writeFileSync(
+            file,
+            JSON.stringify({ schemaVersion: 1, config: { providerConfigRules: { providerRules: [{ providerId: "account:bigmodel-individual-coding-plan", api: { baseUrl: UPSTREAM } }] } } }) + "\n",
+        );
+        const env = { ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: file };
+        const applied = await routeZcodeConfig({ origin: "http://127.0.0.1:18787", dataDir: dir, env, log: () => {} });
+        assert.ok(applied);
+        assert.equal(applied.kind, "new");
+        assert.equal(applied.file, file);
+        assert.match(readFileSync(file, "utf8"), /http:\/\/127\.0\.0\.1:18787\/bili\//);
+        assert.doesNotMatch(readFileSync(zcodeStoreCandidates(dir, "legacy", {})[0], "utf8"), /\/bili\//);
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+        rmSync(alt, { recursive: true, force: true });
     }
 });

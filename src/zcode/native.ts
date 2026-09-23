@@ -17,7 +17,7 @@ import {
     resolveZcodeDataDir,
     stampZcodePluginHeader,
     unrouteZcodeText,
-    zcodeStoreFile,
+    zcodeStoreCandidates,
     type ZcodeStoreKind,
     type ZcodeWrappedEntry,
 } from "./json-edit.js";
@@ -167,11 +167,12 @@ export async function routeZcodeConfig(opts: RouteZcodeOptions): Promise<ZcodeRo
     const log = opts.log ?? defaultLog;
     const dataDir = opts.dataDir ?? resolveZcodeDataDir(env);
     const v2Dir = path.join(dataDir, "v2");
-    if (!fs.existsSync(v2Dir)) {
+    const hasStore = fs.existsSync(v2Dir) || zcodeStoreCandidates(dataDir, "new", env).some((f) => fs.existsSync(f));
+    if (!hasStore) {
         log(`no ${v2Dir} — nothing to route`);
         return undefined;
     }
-    const { kind, file } = detectZcodeStore(dataDir);
+    const { kind, file } = detectZcodeStore(dataDir, env);
     let text: string;
     try {
         text = fs.readFileSync(file, "utf8");
@@ -236,15 +237,16 @@ export function unrouteZcode(opts: { env?: NodeJS.ProcessEnv; dataDir?: string; 
     const dataDir = opts.dataDir ?? resolveZcodeDataDir(env);
     try {
         for (const kind of ["legacy", "new"] as const) {
-            const file = zcodeStoreFile(dataDir, kind);
-            try {
-                const text = fs.readFileSync(file, "utf8");
-                if (text.includes("/bili/")) {
-                    fs.writeFileSync(file, unrouteZcodeText(text, kind).text);
-                    log(`reverted ${path.basename(file)} to pre-native routing`);
-                }
-            } catch {}
-            removeSnapshots(file);
+            for (const file of zcodeStoreCandidates(dataDir, kind, env)) {
+                try {
+                    const text = fs.readFileSync(file, "utf8");
+                    if (text.includes("/bili/")) {
+                        fs.writeFileSync(file, unrouteZcodeText(text, kind).text);
+                        log(`reverted ${path.basename(file)} to pre-native routing`);
+                    }
+                } catch {}
+                removeSnapshots(file);
+            }
         }
     } catch (err) {
         log(`unroute failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -263,14 +265,15 @@ export function restoreZcodeBackup(opts: { env?: NodeJS.ProcessEnv; dataDir?: st
     const dataDir = opts.dataDir ?? resolveZcodeDataDir(env);
     let restoredAny = false;
     for (const kind of ["legacy", "new"] as const) {
-        const file = zcodeStoreFile(dataDir, kind);
-        try {
-            const bak = fs.readFileSync(`${file}.bili-bak`, "utf8");
-            fs.writeFileSync(file, bak);
-            removeSnapshots(file);
-            log(`restored ${path.basename(file)} from the pre-install snapshot`);
-            restoredAny = true;
-        } catch {}
+        for (const file of zcodeStoreCandidates(dataDir, kind, env)) {
+            try {
+                const bak = fs.readFileSync(`${file}.bili-bak`, "utf8");
+                fs.writeFileSync(file, bak);
+                removeSnapshots(file);
+                log(`restored ${path.basename(file)} from the pre-install snapshot`);
+                restoredAny = true;
+            } catch {}
+        }
     }
     if (!restoredAny) unrouteZcode(opts);
     return { restored: restoredAny };
