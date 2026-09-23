@@ -560,6 +560,10 @@
 | `BILI_PERSIST_EPERM_ALERT_REPEAT_MS` | persist EPERM 告警的重复窗口（毫秒）。`0`（默认）= 只告警一次后静默；`>0` = 失败持续期间最多每这么久重复告警一次。 |
 | `BILI_MAX_SESSIONS` | 内存中最多保留的会话数（默认 `256`；LRU 淘汰 —— 磁盘是事实源）。 |
 | `BILI_SESSIONS_DIR` | 会话持久化目录（默认 XDG data 目录）。 |
+| `BILI_SESSION_GC` | 过期会话文件清理（#1082）为**可选开启**：设 `1`/`true`/`on` 启用 —— 默认关闭，因为会话文件是用户数据（可导出、可续聊），不应有静默删除策略。启用后，扫描（启动 + 每小时）只在**两个条件同时满足**时删除一个文件：年龄超过 `BILI_SESSION_GC_MAX_AGE_DAYS`，并且"小"到无损 —— 该会话**从未被压缩过**（零折叠块）且最近一次请求体 ≤ 下述 token 上限，这样继续对话只损失一次冷重建（用客户端自己的历史重建），别无其他。安全边界：被压缩过的会话永不删除（其摘要无法无损重建）；内存中仍持有的会话会被跳过，除非该会话自上次落盘后一直空闲；不可读/损坏的文件原地保留；每次删除逐条写审计日志（路径、大小、年龄），另有一次非空扫描的汇总日志；只触碰会话目录；清空后的协议子目录一并删除。注意 resident 守卫是进程内的：共享 `BILI_SESSIONS_DIR` 但不落盘的另一实例（如 `BILI_PERSIST=0`）不会刷新文件 mtime，其仍活跃的会话文件可能老化被扫 —— 代价同样是有限的一次冷重建，且有年龄门兜底。 |
+| `BILI_SESSION_GC_MAX_AGE_DAYS` | 会话文件成为清理候选的最小年龄（天，默认 `7`）。必须远超任何合理续聊窗口：文件删除后同会话再续聊，消息编号会从 m00001 重新分配，而续聊 agent 的转录里可能还引用着旧编号（内核契约：编号永不复用）。 |
+| `BILI_SESSION_GC_MAX_TOKENS` | 清理资格的大小上限（token 数，默认 `1000000` = 1M，#1082 owner 拍板）。按**解码后**的上下文判断，绝不看文件字节数（加密/zstd 文件在盘上小得多）：记录了最近一次请求体 token 估算值（`rawInputTokens`，每轮记录）时以它为准；未记录的旧文件用 `stats.contextTokens`。仅适用于从未被压缩过的会话 —— 含折叠块的文件无论多大都保留，因为其摘要无法从重新发送中无损重建。 |
+| `BILI_SESSION_GC_INTERVAL_MS` | 后台清理扫描间隔（毫秒，默认 `3600000` = 1 小时）。启动时会先扫一次。 |
 | `BILI_ENCRYPTION_KEY` | 会话文件静态加密（#708），适用于部署在不可信节点的场景。密钥必须恰好 32 字节，hex（64 字符）或 base64；未设置 = 不加密的纯 JSON 文件（设 `BILI_PERSIST_ZSTD=1` 时为 `BILIZSTD1`——参见 `BILI_PERSIST_ZSTD`）。设置后：每个会话文件均以 `BILIENC1` 格式写入，即对 JSON 施加 AES-256-GCM 加密，JSON 仅在 `BILI_PERSIST_ZSTD=1` 时以 zstd 压缩（Node ≥ 22.15 使用 zstd，其余情况写入原始数据）——启用压缩还可将文件体积缩小约 5–10 倍。加密与压缩现为独立的配置项（#1080）。密钥只从该环境变量读取——永不落盘、永不进日志——请确保它不受同一文件系统上的其他进程触及。非法值会导致启动中止（快速失败，绝不静默明文运行）。用错误的密钥启动时，受影响的会话按损坏文件跳过（有日志，不崩溃）。丢失密钥将使已加密的会话永久不可读。对称加密为刻意设计（同一进程既加密又解密）。已有的未编码文件从不在启动时改写——在其下一次保存时自然加密（降级安全；参见 `BILI_PERSIST_ZSTD`）。威胁模型（#708，owner 确认）：防的是**离线/机械性**的文件获取——云厂商换盘、节点镜像漂移后的离线磁盘快照、磁盘镜像失窃、备份泄露、被云同步的状态目录——离线第三方拿不到密钥即无法读取内容。不防御对活节点有访问权的定向攻击者；那一档应把信任根移出 proxy（KMS / TEE / 机密虚拟机 + 强化权限体系），而不是在 proxy 本身想办法——到了那个程度暴露的远不止密钥，proxy 层不是该守的边界（`BILI_PERSIST=0` 可彻底关闭持久化）。用同一进程/环境中的第二把密钥对密钥做二次加密不增加任何安全性：所有离线失窃场景里攻击者缺的始终只有一个工件——你的非落盘秘密——无论它叫数据密钥还是包裹密钥；只有把包裹密钥放进不同信任域（KMS/TPM/TEE）才能提高门槛，而那属于上面的场景 2。 |
 | `BILLION_CONTEXT_PROXY` | launcher 会导出它；客户端侧 bili 插件/扩展检测到后自禁用自身压缩（避免双重压缩）。 |
 | `BILLION_CONTEXT_PLUGIN` | 设 `0` 彻底关闭插件模式（恢复 wire 层工具注入）。 |
@@ -591,14 +595,6 @@
 | `bili trae [opts --] [args]` | 代理 + **Trae CLI**（字节跳动,闭源 Go 二进制)—— 证书 MITM(`HTTPS_PROXY` + `SSL_CERT_FILE`);模型主机取 `TRAE_CLI_API_HOST` 或默认企业网关(#655) |
 | `bili jcode [opts --] [args]` | 代理 + **jcode**（Rust 终端编码 agent)—— 环境变量式证书 MITM 启动(`HTTPS_PROXY` + `SSL_CERT_FILE`);托管模型主机 `api.z.ai` 默认加白,本地回环 provider 走 `NO_PROXY` 直连 |
 | `bili kimi [opts --] [args]` | 代理 + **Kimi Code**(Moonshot CLI)—— 证书 MITM(`HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`/`SSL_CERT_FILE`);provider/model 主机取自 `~/.kimi-code/config.toml`(遵循 `KIMI_CODE_HOME`),未声明时用托管 OAuth 端点;回环端点编目并附手动 `/bili/` 前缀提示(#757) |
-| `bili gemini [opts --] [args]` | 代理 + **Gemini CLI**(Google)—— `GOOGLE_GEMINI_BASE_URL` `/bili/` 改写到 `generativelanguage.googleapis.com`(Google 原生 wire;你自己导出的值会被中继);无 MITM/CA;headless `-p` 需要已保存的认证选择(#1047) |
-| `bili iflow [opts --] [args]` | 代理 + **iFlow CLI** —— `IFLOW_BASE_URL` `/bili/` 改写到 `apis.iflow.cn/v1`(OpenAI chat-completions wire;你自己导出的值会被中继)(#1047) |
-| `bili qwen [opts --] [args]` | 代理 + **Qwen Code**(多协议 gemini-cli fork,无 base-URL 钩子)—— 证书 MITM(`HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`);默认 DashScope/Qwen 模型主机加白,自建中转用 `--mitm-domain`(#1047) |
-| `bili mcode [opts --] [args]` | 代理 + **MiniMax Code** —— 证书 MITM(`HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`/`SSL_CERT_FILE`);provider 主机取自 `~/.minimax*/config.yaml`(遵循 `MINIMAX_DATA_DIR`/`MAVIS_DATA_DIR`),未声明时用官方 `agent.minimax.*` 端点;回环端点编目并附手动 `/bili/` 前缀提示;会话经 `X-Mavis-Session-Id` 头绑定(#1050) |
-| `bili aider [opts --] [args]` | 代理 + **Aider**(Python pair programmer)—— 证书 MITM(`HTTPS_PROXY` + `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`);端点发现自继承 env(`OPENAI_API_BASE`、`OPENAI_BASE_URL`、`ANTHROPIC_API_BASE`、`ANTHROPIC_BASE_URL`、`GEMINI_API_BASE`、`DEEPSEEK_API_BASE`)或 `.aider.conf.yml`(`openai-api-base:`),客户端参数里透传的 `--openai-api-base` / `--set-env` 优先;均未声明 → 默认加白 `api.openai.com` + `api.anthropic.com`;非回环纯 http 端点走 `HTTP_PROXY` 绝对形式转发,回环经 `NO_PROXY` 直连(#1048) |
-| `bili copilot [opts --] [args]` | 代理 + **Copilot CLI**（GitHub,闭源 Go 二进制）—— 证书 MITM(`HTTPS_PROXY` + `SSL_CERT_FILE`);模型主机(`api.githubcopilot.com` + 各套餐子域)加白(#1049) |
-| `bili amp [opts --] [args]` | 代理 + **Amp CLI**（Sourcegraph,闭源 Go 二进制）—— 证书 MITM(`HTTPS_PROXY` + `SSL_CERT_FILE`);`ampcode.com` 加白(#1049) |
-| `bili goose [opts --] [args]` | 代理 + **Goose**(Block,Rust/reqwest)—— rustls 发布构建不信任任何 CA 文件,故不用代理环境变量:内置 openai/anthropic 腿经 `OPENAI_HOST`/`ANTHROPIC_HOST` 重定向,自定义声明式 provider 经重新生成的 `GOOSE_PATH_ROOT` overlay 做 `base_url` `/bili/` 改写(真实配置不动,用户编辑回并);固定第三方 provider 会警告(#1049) |
 | `bili test pi` | 无污染的 pi 链路端到端冒烟测试 |
 | `bili export [session] [--full] [--output FILE]` | 列出持久化会话 / 把一个会话导出为 Markdown 交接文档 —— 见[会话与迁移](#会话与迁移) |
 | `bili update` | 立即检查并安装新版本（绕过 3 分钟节流） |
