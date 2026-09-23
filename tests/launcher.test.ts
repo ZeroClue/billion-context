@@ -1004,6 +1004,7 @@ function recordedInstance(over: Partial<InstanceFile> = {}): InstanceFile {
 
 test("ensureProxyRunning: attaches to a compatible healthy instance instead of doubling (#394)", async () => {
     let spawnCalls = 0;
+    const registrations: Array<[string, number]> = [];
     const spawnImpl: SpawnFn = () => {
         spawnCalls++;
         return makeFakeChild(42431);
@@ -1015,14 +1016,51 @@ test("ensureProxyRunning: attaches to a compatible healthy instance instead of d
             fetchImpl: async () => ({ ok: true }),
             fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
             readInstanceFile: () => recordedInstance(),
+            registerWatcher: async (origin, pid) => { registrations.push([origin, pid]); },
         },
     );
     assert.equal(spawnCalls, 0);
     assert.equal(handle.attached, true);
     assert.equal(handle.origin, "http://127.0.0.1:8787");
+    // #1190: the attaching caller registers ITS owner pid with the shared
+    // proxy so the first owner's exit cannot kill this session too.
+    assert.deepEqual(registrations, [["http://127.0.0.1:8787", process.pid]]);
     let killed = false;
     stopProxy({ ...handle, child: { pid: 77777, kill: () => { killed = true; return true; } } });
     assert.equal(killed, false);
+});
+
+test("ensureProxyRunning: attach registers opts.parentPid when given, never on spawn (#1190)", async () => {
+    const registrations: Array<[string, number]> = [];
+    const registerWatcher = async (origin: string, pid: number) => { registrations.push([origin, pid]); };
+
+    const attached = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, parentPid: 42424 },
+        {
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+            readInstanceFile: () => recordedInstance(),
+            registerWatcher,
+        },
+    );
+    assert.equal(attached.attached, true);
+    assert.deepEqual(registrations, [["http://127.0.0.1:8787", 42424]], "attach registers the explicit owner pid");
+
+    registrations.length = 0;
+    let spawned = false;
+    const spawnedHandle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+        {
+            fetchImpl: async () => ({ ok: true }),
+            readInstanceFile: () => undefined,
+            registerWatcher,
+            spawnImpl: () => { spawned = true; return makeFakeChild(42432); },
+            sleep: () => Promise.resolve(),
+        },
+    );
+    assert.equal(spawned, true);
+    assert.equal(spawnedHandle.attached, undefined);
+    assert.deepEqual(registrations, [], "spawn must not register (BILI_PARENT_PID already arms the watchdog)");
 });
 
 test("ensureProxyRunning: incompatible recorded instance (modelWindows) is not attached", async () => {
@@ -1079,6 +1117,7 @@ test("ensureProxyRunning: active starting marker → waits, then attaches instea
                 fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-9" }),
                 readInstanceFile: () => (reads++ < 2 ? undefined : recordedInstance({ instanceId: "inst-9", origin: "http://127.0.0.1:8788", port: 8788 })),
                 sleep: () => Promise.resolve(),
+                registerWatcher: async () => {},
             },
         );
         assert.equal(handle.attached, true);

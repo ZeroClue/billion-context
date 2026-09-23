@@ -215,6 +215,12 @@ export interface LauncherDeps {
      *  process (opencode/pi native binary) process.execPath is NOT Node;
      *  defaults to resolveNodeRuntime(). */
     nodeRuntime?: string;
+    /** #1190: watcher registration for ATTACHED shared proxies — tells the
+     *  proxy's parent-gone watchdog which owner pid to track, so the proxy
+     *  dies only after the LAST owner exits (#7/#1183). Default POSTs to
+     *  <origin>/__bili/watcher; 409 (daemon proxy) is silent, any failure
+     *  warns and degrades to the single-owner watchdog behavior. */
+    registerWatcher?: (origin: string, pid: number) => Promise<void>;
 }
 
 export function isLaunchClient(value: string): value is ClientName {
@@ -2361,6 +2367,26 @@ async function fetchHealthInfoDefault(origin: string): Promise<HealthInfo | unde
     }
 }
 
+/** #1190: an ATTACHED shared proxy belongs to whoever SPAWNED it — its
+ *  parent-gone watchdog tracks THAT owner's pid, so without registration the
+ *  first owner's exit kills every attached session (#7/#1183). Registering our
+ *  own owner makes the proxy die only after the LAST owner exits. Never throws:
+ *  a failed registration degrades to the pre-fix single-owner behavior. */
+async function registerWatcherDefault(origin: string, pid: number): Promise<void> {
+    try {
+        const res = await fetch(`${origin}/__bili/watcher`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ pid }),
+            signal: AbortSignal.timeout(2_000),
+        });
+        // 409 = daemon proxy (watchdog unarmed) — nothing to register there.
+        if (!res.ok && res.status !== 409) console.error(`bili: watcher registration returned HTTP ${res.status} — the shared proxy may exit when its first owner does`);
+    } catch (err) {
+        console.error(`bili: watcher registration failed — the shared proxy may exit when its first owner does (${err instanceof Error ? err.message : String(err)})`);
+    }
+}
+
 /** #707: the marker's owner must still be plausibly mid-bring-up — alive AND
  *  young. A crashed starter leaves a dead-owner marker; a hung one ages out. */
 function isStartingMarkerActive(marker: ProxyStartingMarker, nowMs: number): boolean {
@@ -2546,6 +2572,20 @@ export async function ensureProxyRunning(
     const spawnImpl = deps.spawnImpl ?? (spawn as SpawnFn);
     const now = deps.now ?? Date.now;
     const sleepImpl = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+    const registerWatcher = deps.registerWatcher ?? registerWatcherDefault;
+    // Same expression as the spawn path's BILI_PARENT_PID: one owner-pid
+    // semantic for spawned AND attached proxies (#1190).
+    const watchPid = opts.parentPid ?? process.pid;
+    // #1190: every ATTACH registers our owner pid with the shared proxy's
+    // watchdog so its exit cannot kill the sessions still riding on it
+    // (#7/#1183). Awaited before returning: a spawner that dies right after a
+    // second session attaches must not beat the registration to the grace
+    // window.
+    const attachTo = async (inst: ProxyInstanceFile): Promise<ProxyHandle> => {
+        console.error(`bili: attaching to running proxy at ${inst.origin} (pid ${inst.pid})`);
+        await registerWatcher(inst.origin, watchPid);
+        return { origin: inst.origin, port: inst.port, attached: true };
+    };
 
     // #394/#417: a healthy proxy with a compatible config is SHARED, not
     // doubled — two concurrent launches of the same client would otherwise
@@ -2555,8 +2595,7 @@ export async function ensureProxyRunning(
         // strictPort (#964): the client dials a STATIC url — attaching to a
         // healthy proxy on a DIFFERENT port would strand every request. Only
         // an instance already bound to the exact port may be shared.
-        console.error(`bili: attaching to running proxy at ${existing.origin} (pid ${existing.pid})`);
-        return { origin: existing.origin, port: existing.port, attached: true };
+        return attachTo(existing);
     }
 
     // #707: cross-process startup window — another launcher may be mid-bring-up
@@ -2568,8 +2607,7 @@ export async function ensureProxyRunning(
         console.error("bili: another bili launch is bringing up a proxy — waiting for it instead of spawning a second");
         const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl);
         if (waited && instanceCompatible(waited, opts)) {
-            console.error(`bili: attaching to running proxy at ${waited.origin} (pid ${waited.pid})`);
-            return { origin: waited.origin, port: waited.port, attached: true };
+            return attachTo(waited);
         }
         // starter failed/timed out (or incompatible config) — caller falls
         // through and spawns itself, as before

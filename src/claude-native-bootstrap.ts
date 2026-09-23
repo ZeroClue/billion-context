@@ -259,28 +259,9 @@ async function run(): Promise<void> {
             },
             { scriptPath: proxyScriptPath() },
         );
-        // A stable-port proxy is SHARED across claude sessions: the spawner's
-        // watchdog would kill it when THAT session exits while this one still
-        // runs. ATTACHED sessions must therefore register their own host pid
-        // (POST /__bili/watcher) so the proxy dies only after the last owner
-        // is gone (#7). Fire-and-forget: a failed registration only degrades
-        // to the single-owner watchdog, never blocks session start.
-        if (handle.attached) {
-            try {
-                const res = await fetch(`${handle.origin}/__bili/watcher`, {
-                    method: "POST",
-                    headers: { "content-type": "application/json" },
-                    body: JSON.stringify({ pid: watchPid }),
-                    signal: AbortSignal.timeout(2_000),
-                });
-                // 409 = the proxy runs as a daemon (no parent watchdog) — it
-                // already outlives every session, so there is nothing to
-                // register and nothing to warn about.
-                if (!res.ok && res.status !== 409) log(`watcher registration returned HTTP ${res.status} — the shared proxy may exit when its first owner does`);
-            } catch (err) {
-                log(`watcher registration failed — the shared proxy may exit when its first owner does (${err instanceof Error ? err.message : String(err)})`);
-            }
-        }
+        // #1190: watcher registration on attach lives in ensureProxyRunning
+        // (every native client registers there; claude's earlier copy was
+        // redundant once the chokepoint covered all callers).
         log(`proxy ${handle.attached ? "attached" : "started"} at ${handle.origin}${plan.action === "passthrough" ? " (passthrough — compression off)" : ""}`);
     } catch (err) {
         log(
