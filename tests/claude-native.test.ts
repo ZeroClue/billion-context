@@ -737,8 +737,9 @@ test("hook e2e: dist script spawns a proxy on the stable port, second run attach
 // bring-up, the transient sh dies with it — and the proxy's watchdog, pointed
 // at that sh, killed a healthy proxy ~2s into EVERY session while claude kept
 // running. The fake claude below reproduces the exact tree; the assertions
-// pin both sides of the intended lifetime.
-test("hook e2e: watchdog tracks the claude host, not the transient sh wrapper", { timeout: 120_000 }, async () => {
+// pin both sides of the intended lifetime. Linux-only: the resolver walks
+// /proc and the fake claude needs /bin/sh + shebang exec (CI runs windows too).
+test("hook e2e: watchdog tracks the claude host, not the transient sh wrapper", { timeout: 120_000, skip: process.platform !== "linux" }, async () => {
     const distScript = path.resolve(import.meta.dirname, "..", "dist", "claude-native-bootstrap.js");
     ensureDistBuilt(distScript);
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-hook-"));
