@@ -105,6 +105,20 @@ export function isModelApiUrl(url: string): boolean {
     }
 }
 
+/** True when the URL addresses bili's own control plane (`/__bili/*`,
+ *  `/__acp/*`, or a `/bili/<protocol>/<url>` tunnel) — expected direct
+ *  traffic, not an unrecognized endpoint (#1290): reporting it as "not a
+ *  recognized model endpoint" would flag bili's own requests. */
+function isBiliControlUrl(url: string): boolean {
+    if (url.includes("/__bili/") || url.includes("/__acp/")) return true;
+    try {
+        const segments = new URL(url).pathname.split("/").filter((s) => s.length > 0);
+        return segments[0] === "bili";
+    } catch {
+        return false;
+    }
+}
+
 /** A URL already routed by a bili proxy in `/bili/` rewrite form
  *  (`${proxy}/bili/${upstream}`): returns the embedded upstream URL when it
  *  is model-API shaped, else undefined. The launcher's settings overlay
@@ -408,7 +422,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             }
         }
         if (!isModelApiUrl(url)) {
-            state.onUnroutedModelUrl?.(url);
+            if (!isBiliControlUrl(url)) state.onUnroutedModelUrl?.(url);
             return orig(input, init);
         }
         // #1117: URL shape alone cannot claim a request — every model call in

@@ -103,6 +103,9 @@ test("install: non-model-API URLs fire onUnroutedModelUrl so direct sends are vi
         await fetch("https://api.commandcode.example/alpha/generate");
         // A real model endpoint — routed, never reported as unrouted.
         await fetch("http://127.0.0.1:8199/v1/messages");
+        // Bili's own control plane — direct by design, never reported either.
+        await fetch("http://127.0.0.1:40001/__bili/plugin/manifest");
+        await fetch("http://127.0.0.1:40001/bili/openai/http://127.0.0.1:9/alpha/generate");
     });
     assert.ok(sink.includes("https://api.commandcode.example/alpha/generate"), "custom wire sent direct");
     assert.ok(sink.includes("http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"), "model endpoint routed");
