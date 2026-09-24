@@ -303,6 +303,64 @@ test("#1086 T3: foreign artifacts without local state pass through byte-identica
     }
 });
 
+test("#1218: /acp explains chain passthrough instead of the armed-idle notice", async () => {
+    // Same shape as T3: a session whose requests are judged an external chain
+    // is passed through with NO local state. /acp (plugin status) must surface
+    // WHY there is no session — the user sees "PASSED THROUGH" with the escape
+    // valve, not "no model request yet" (#1218 repro).
+    const dir = mkdtempSync(join(tmpdir(), "bili-chain-1218-"));
+    const store = new SessionStore({ dir, debounceMs: 5, enabled: true });
+    _setStoreForTest(store);
+    _resetSessionsForTest();
+    _resetChainWarningsForTest();
+    setRegistryForTest({});
+    const captured: Captured[] = [];
+    const upstream = makeUpstream(captured);
+    upstream.listen(0, "127.0.0.1");
+    await listen(upstream);
+    const proxy = await startServer(makeOpts(`http://127.0.0.1:${(upstream.address() as { port: number }).port}`));
+    await listen(proxy);
+    try {
+        const resp = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "chain-exp-1" },
+            body: incidentBody(),
+        });
+        assert.equal(resp.status, 200);
+        await resp.text();
+        assert.equal(peekSession("chain-exp-1"), undefined, "passthrough leaves no session");
+        const probe = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/__bili/plugin/status?conversationId=chain-exp-1`);
+        const probeBody = await probe.text();
+        assert.equal(probe.status, 200, `status probe failed: ${probeBody.slice(0, 200)}`);
+        const status = JSON.parse(probeBody) as { ok: boolean; conversationId: string; phase: string; chain: { at: number; kind: string; protocol: string }; panel: string };
+        assert.equal(status.ok, true);
+        assert.equal(status.conversationId, "chain-exp-1");
+        assert.equal(status.phase, "chain-passthrough");
+        assert.equal(typeof status.chain.kind, "string");
+        assert.ok(status.chain.kind.length > 0, "verdict carries the evidence kind");
+        assert.equal(status.chain.protocol, "openai");
+        assert.ok(status.panel.includes("PASSED THROUGH UNPROCESSED"), `panel explains the passthrough (got: ${status.panel.slice(0, 120)}…)`);
+        assert.ok(status.panel.includes("chainContentDetection=false"), "panel points at the escape valve");
+        // A conversation with NO verdict keeps the pre-#1218 answer shape —
+        // the new branch must not hijack unrelated probes.
+        const clean = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/__bili/plugin/status?conversationId=never-seen`);
+        // Pre-existing shape: an unknown conversation keeps the 404
+        // "unknown plugin conversation" answer (clients render it as the
+        // armed-idle notice) — the new branch must not hijack unrelated probes.
+        assert.equal(clean.status, 404);
+        const cleanStatus = JSON.parse(await clean.text()) as { ok: boolean; phase?: string };
+        assert.equal(cleanStatus.ok, false);
+        assert.notEqual(cleanStatus.phase, "chain-passthrough");
+    } finally {
+        proxy.closeAllConnections?.();
+        await close(proxy);
+        upstream.closeAllConnections?.();
+        await close(upstream);
+        store.cancelAll();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 test("#1086 T4: chainContentDetection=false disables the content fallback entirely", async () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     _resetSessionsForTest();
@@ -612,7 +670,7 @@ test("#1101 T8: warn-set FIFO evicts the oldest session once past the cap", asyn
     await listen(proxy);
     try {
         const warnSet = _chainWarnSetForTest();
-        for (let i = 0; i < WARNED_CHAIN_SESSION_CAP; i++) warnSet.add(`pad-${i}`);
+        for (let i = 0; i < WARNED_CHAIN_SESSION_CAP; i++) warnSet.set(`pad-${i}`, { at: 0, kind: "tags", protocol: "openai" });
         const raw = incidentBody();
         const resp = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/v1/chat/completions`, {
             method: "POST",
