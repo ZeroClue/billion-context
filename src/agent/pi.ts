@@ -466,19 +466,27 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 },
             });
         }
-        pi.on("before_provider_headers", (event, ctx) => {
+        pi.on("before_provider_headers", async (event, ctx) => {
             try {
                 if (proxyBaseForCtx(ctx) === undefined) return;
                 const headers = (event as unknown as { headers?: Record<string, string> }).headers;
                 if (headers === undefined || typeof headers !== "object" || Array.isArray(headers)) return;
+                // #1214: pi's runner AWAITS async handlers (emitBeforeProviderHeaders),
+                // so the ownership claim serializes behind tool registration instead
+                // of racing it. A one-shot (`pi -p`) dispatches exactly ONE request —
+                // with fire-and-forget registration it rode wire mode forever and
+                // bound as an anonymous pfa session. registerTools is idempotent
+                // (sid-cached, pending-deduped, retryAt-throttled), so the await is
+                // bounded; a permanently failing manifest fetch still degrades to
+                // wire mode — a graceful fallback rather than a tool-less session.
+                try {
+                    await registerTools(pi, ctx, state, agent);
+                } catch (err) {
+                    console.error(`bili-plugin(${agent}): tool registration failed (${err instanceof Error ? err.message : String(err)}) — riding wire mode for this request`);
+                }
                 // The x-bili-plugin marker tells the proxy "the client owns the
-                // ACP tools natively — skip wire-level injection". Stamping it
-                // before registerTools() finishes would send round 1 out with
-                // NO ACP tools (the first provider request races the manifest
-                // fetch). Claim ownership only once tools are registered;
-                // until then the request rides the proxy's wire mode. A
-                // permanently failing manifest fetch keeps us in wire mode —
-                // a graceful fallback rather than a tool-less session.
+                // ACP tools natively — skip wire-level injection". Ownership is
+                // claimed only once tools are registered (#162).
                 if (state.toolsReady === true) {
                     const sid = sessionIdOf(ctx);
                     if (sid !== undefined) headers["x-bili-plugin-conversation"] = sid;
@@ -501,7 +509,6 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             } catch (err) {
                 console.error(`bili-plugin(${agent}): header stamp skipped (${err instanceof Error ? err.message : String(err)})`);
             }
-            void registerTools(pi, ctx, state, agent).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
         });
         // omp never emits before_provider_headers — where pi stamps the
         // x-bili-plugin-* headers and reports runtime info (#955) — so omp's
