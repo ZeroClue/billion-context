@@ -14,7 +14,7 @@
     "bili-proxy": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && node scripts/check-dist-import-annotations.mjs",
     "registry:snapshot": "node scripts/update-registry-snapshot.mjs",
     "codex-models:snapshot": "node scripts/update-codex-models-snapshot.mjs",
     "typecheck": "tsc --noEmit --project tsconfig.build.json",
