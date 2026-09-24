@@ -320,7 +320,7 @@ export type CompressSettings = {
      *  rounds), and folds to ONE response with true summed usage. Merged sub-field-wise
      *  across the three levels like `absorb`/`reasoning`; off unless enabled at some
      *  level. See src/reasoning-guard.ts. */
-     reasoningGuard?: ReasoningGuardConfig;
+    reasoningGuard?: ReasoningGuardConfig;
      /** [#1093] Output-side compression levers — verbosity steering (a conciseness
       *  directive appended to the system-prompt tail) and effort routing (clamp an
       *  already-sent effort field down on mechanical continuation turns). Resolved
@@ -328,7 +328,7 @@ export type CompressSettings = {
       *  kernel's resolveOutputSteeringConfig at resolution time (an out-of-range value
       *  falls back to its default with a warning rather than rejecting the whole block).
       *  Off unless enabled at some level. See src/output-steering.ts. */
-     outputSteering?: Partial<OutputSteeringConfig>;
+    outputSteering?: Partial<OutputSteeringConfig>;
 };
 export type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";

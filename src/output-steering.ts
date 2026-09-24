@@ -432,11 +432,14 @@ export function applyOutputSteering(body: string, protocol: WireProtocol | null,
 /** Object-level variant shared by the forward boundary and the compress-retry
  *  re-send paths. Mutates `parsed` in place; returns the applied labels. */
 export interface ApplySteeringOptions {
-    /** Skip the verbosity directive while keeping effort routing. Used by the
-     *  kernel's compress rounds: the L2/L3 directive ("never restate code, file
-     *  contents, diffs, or tool output …") directly contradicts the compress
-     *  prompt's own contract — summaries must preserve exact paths, values and
-     *  commands verbatim because they are the primary carrier on decompress. */
+    /** Skip the verbosity directive while keeping effort routing. Reserved for
+     *  summarize-shaped requests should they ever route through here: the L2/L3
+     *  directive ("never restate code, file contents, diffs, or tool output …")
+     *  directly contradicts a compress prompt's own contract — summaries must
+     *  preserve exact paths, values and commands verbatim because they are the
+     *  primary carrier on decompress. Today's preflight summarize path
+     *  (src/preflight.ts summaryPayload) bypasses steering entirely, so no
+     *  current call site passes this. */
     verbosity?: boolean;
 }
 
