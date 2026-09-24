@@ -24,4 +24,11 @@ export default defineConfig({
         // built-ins ever reach this path — node-forge is otherwise bundled.
         js: "import { createRequire as __biliCreateRequire } from 'node:module';\nconst require = __biliCreateRequire(import.meta.url);",
     },
+    esbuildOptions(options) {
+        // #1255: non-minified ESM keeps class-body JSDoc, so undici's
+        // {import('./client.js')} annotations leak into dist and bun-based
+        // plugin loaders (opencode) resolve them as files → ENOENT dead lane.
+        // Whitespace minify drops non-legal comments; names stay readable.
+        options.minifyWhitespace = true;
+    },
 });
