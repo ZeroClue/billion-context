@@ -138,3 +138,45 @@ ask): bootstrap failures must also land in the shared bili.log file.
   vanishing silently — visible, but intended uncompressed.
 - `handlePluginCompact`'s analogous 404 wording left untouched (not part of
   the symptom; dsh-native has no compaction hook calling it).
+
+## Follow-up: L2 gate three-state (branch 2026-09-23_dsh-gate-three-state-log)
+
+Root cause was pinned by the reporter's runtime evidence (dsh-http-proxy
+settings-refresh re-arm overwrites `globalThis.fetch` with its frozen
+pre-bili capture, evicting bili from the chain); the owner shipped the L1
+self-heal separately (#1187, guarded accessor + `BILI_RECLAIM_FETCH_PATCH`).
+This follow-up delivers the agreed L2 instrument in `src/agent/dsh-native.ts`:
+
+- `attributionOf(ctx)`: three states — `ok` (usable session id), `none`
+  (initiator present-or-absent, no id), `threw` (+ exception message). The old
+  bare catch folded `threw` into `none`. `sessionIdOf` is now a thin wrapper;
+  statusOutcome/headersFor behavior is byte-identical.
+- Gate refusal log: first refusal per endpoint prints exactly as before plus
+  `— refusals so far: N`; same-state refusals accumulate silently; a state
+  transition (none↔threw) re-prints with `(state none→threw)`. Bounded noise
+  — #1117's per-request silence preserved; the 256-endpoint cap now clears
+  only when a NEW endpoint would overflow (existing counts survive).
+- Every printed line is additionally appended to bili.log via
+  `persistClientEvent` (`[warn] [dsh-client] …`) so GUI hosts that swallow
+  stderr leave a durable trace.
+
+Behavior change disclosure (old → new):
+- A gate refusal on a previously-unseen endpoint now ends with
+  `— refusals so far: 1` (previously no count suffix).
+- NEW log lines appear on attribution-state transitions
+  (`(state none→threw)` / `(state threw→none)`) carrying the accumulated
+  count — previously only one flat line per endpoint ever existed.
+- NEW durable lines in `~/.local/state/billion-context/bili.log`
+  (`[dsh-client]`-marked) mirroring every printed refusal line — previously
+  refusals were stderr-only and invisible in GUI hosts.
+- No change to gate decision logic, wire shapes, config schema, or persistence
+  format.
+
+Verification (head 2a6778df, based on master incl. merged #1187):
+- `npm run typecheck`: clean (after `npm ci` — a stale local acp-kernel 0.0.82
+  vs pinned 0.0.84 had produced spurious src/store.ts errors on the old tree).
+- `npm test`: 2359 total, 2357 pass, 0 fail, 2 skipped (gated E2E);
+  dsh-native 31/31 (+1 new three-state test covering silent counting,
+  both transition directions, attributed-silent claim, and the durable
+  bili.log copy).
+- `npm run build`: success.

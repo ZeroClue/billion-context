@@ -833,9 +833,10 @@ test("#983 maybeRetry self-heals a base-less register after a failed respawn", a
 
 test("#1117 apply() installs takeoverGate keyed on currentInitiator attribution", async () => {
     const proxy = await startMockProxy([]);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1117-state-"));
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1117-"));
     try {
-        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
             _resetRegisterForTest(proxy.origin);
             const ctx = mockCtx();
             apply(ctx);
@@ -855,6 +856,7 @@ test("#1117 apply() installs takeoverGate keyed on currentInitiator attribution"
         });
     } finally {
         proxy.close();
+        fs.rmSync(stateHome, { recursive: true, force: true });
         fs.rmSync(home, { recursive: true, force: true });
         _resetRegisterForTest(undefined);
     }
@@ -862,9 +864,10 @@ test("#1117 apply() installs takeoverGate keyed on currentInitiator attribution"
 
 test("#1158 apply() gate refusal logs each endpoint once per process with attribution state", async () => {
     const proxy = await startMockProxy([]);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1158-state-"));
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1158-"));
     try {
-        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
             _resetRegisterForTest(proxy.origin);
             const ctx = mockCtx();
             apply(ctx);
@@ -901,6 +904,76 @@ test("#1158 apply() gate refusal logs each endpoint once per process with attrib
         });
     } finally {
         proxy.close();
+        fs.rmSync(stateHome, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts accumulate; transitions re-print (+bili.log)", async () => {
+    const proxy = await startMockProxy([]);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1158e-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1158e-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const gate = _stateTakeoverGateForTest();
+            assert.ok(gate !== undefined, "takeoverGate installed");
+            const origCI = ctx.agents.currentInitiator;
+            const origErr = console.error;
+            const errs: string[] = [];
+            console.error = (...args: unknown[]) => {
+                errs.push(args.map(String).join(" "));
+            };
+            try {
+                const url = "https://api.gate-l2.test/v1/chat/completions";
+                // four same-state (none) refusals → exactly one line; counting continues silently
+                assert.equal(gate(url), false);
+                assert.equal(gate(url), false);
+                assert.equal(gate(url), false);
+                assert.equal(gate(url), false);
+                let lines = errs.filter((e) => e.includes("takeover gate refused"));
+                assert.equal(lines.length, 1, `expected one line for repeated same-state refusals, got: ${errs.join(" | ")}`);
+                assert.match(lines[0]!, /no active initiator attribution/);
+                assert.match(lines[0]!, /refusals so far: 1$/);
+                // the ALS boundary starts throwing (disposed/closing agent scope) →
+                // new category → re-print carrying the accumulated count
+                ctx.agents.currentInitiator = () => {
+                    throw new Error("agent initiator scope is disposed");
+                };
+                assert.equal(gate(url), false);
+                lines = errs.filter((e) => e.includes("takeover gate refused"));
+                assert.equal(lines.length, 2, `expected a state-transition re-print, got: ${errs.join(" | ")}`);
+                assert.match(lines[1]!, /currentInitiator\(\) threw \(agent initiator scope is disposed\)/);
+                assert.match(lines[1]!, /refusals so far: 5 \(state none→threw\)$/);
+                // further thrown refusals stay silent again
+                assert.equal(gate(url), false);
+                assert.equal(errs.filter((e) => e.includes("takeover gate refused")).length, 2);
+                // back to plain none → transition the other way, count keeps running
+                ctx.agents.currentInitiator = () => undefined;
+                assert.equal(gate(url), false);
+                lines = errs.filter((e) => e.includes("takeover gate refused"));
+                assert.equal(lines.length, 3);
+                assert.match(lines[2]!, /refusals so far: 7 \(state threw→none\)$/);
+                // attributed traffic claims silently — no line
+                ctx.agents.currentInitiator = origCI;
+                ctx.setInitiator({ session: { id: "s1158l2" } });
+                assert.equal(gate(url), true);
+                assert.equal(errs.filter((e) => e.includes("takeover gate refused")).length, 3);
+                // the durable copy carries the same lines into bili.log, [dsh-client]-marked
+                const logFile = path.join(stateHome, "billion-context", "bili.log");
+                const content = fs.readFileSync(logFile, "utf8");
+                assert.match(content, /\[warn\] \[dsh-client\] bili-native-dsh: model request sent DIRECT \(uncompressed\) — takeover gate refused https:\/\/api\.gate-l2\.test\/v1\/chat\/completions: currentInitiator\(\) threw \(agent initiator scope is disposed\) — agent scope disposed\/closing mid-request\? — refusals so far: 5 \(state none→threw\)$/m);
+            } finally {
+                console.error = origErr;
+            }
+        });
+    } finally {
+        proxy.close();
+        fs.rmSync(stateHome, { recursive: true, force: true });
         fs.rmSync(home, { recursive: true, force: true });
         _resetRegisterForTest(undefined);
     }
