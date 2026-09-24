@@ -4,7 +4,8 @@ import assert from "node:assert/strict";
 process.env.NODE_ENV = "test";
 
 import { setLogCapture } from "../src/logger.ts";
-import { logDumpFailure, logUnrecognizedPath } from "../src/server.ts";
+import { getUnrecognizedPathStats, logDumpFailure, logUnrecognizedPath } from "../src/server.ts";
+import { maskUrlsInText } from "../src/log-mask.ts";
 
 interface Line { level: string; msg: string; }
 
@@ -67,4 +68,17 @@ test("logDumpFailure: first failure logs, repeat suppressed, re-logs after windo
     logDumpFailure("SSE stream dump", new Error("ENOSPC: no space left on device"));
     assert.equal(lines.length, 2);
     assert.ok(lines[1].msg.includes("total 3x"));
+});
+
+// #1290: unrecognized paths were only visible as 3 transient stderr warns —
+// expose the per-path counts so /__bili/stats and the /acp report can surface them.
+test("getUnrecognizedPathStats: exposes per-path counts for /__bili/stats (#1290)", () => {
+    const url = "https://cc-stats-1290.example/alpha/generate?x=1";
+    const key = maskUrlsInText(url.split("?")[0]);
+    const before = getUnrecognizedPathStats();
+    const base = before.paths[key] ?? 0;
+    for (let i = 0; i < 5; i++) logUnrecognizedPath(() => {}, url);
+    const after = getUnrecognizedPathStats();
+    assert.equal(after.paths[key], base + 5, "counted under the masked path key");
+    assert.ok(after.total >= 5);
 });

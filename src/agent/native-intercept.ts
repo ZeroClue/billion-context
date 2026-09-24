@@ -53,6 +53,14 @@ export interface NativeInterceptState {
     readyTimeoutMs?: number;
     /** Test/observability hook: every dispatched decision. */
     onDispatch?: (url: string, action: "rewrite" | "direct" | "self" | "retry") => void;
+    /** #1290: observability hook — fired for every request the fetch patch lets
+     *  through WITHOUT routing because its URL is not a recognized model endpoint
+     *  (isModelApiUrl miss). Such requests never reach a bili proxy, so without
+     *  this their "went direct (uncompressed)" outcome was completely silent —
+     *  #1158's logging promise only covered the attribution gate below. Called
+     *  per request; hosts dedup once-per-process-per-endpoint like takeoverGate.
+     *  Undefined hosts stay silent. */
+    onUnroutedModelUrl?: (url: string) => void;
 }
 
 const INTERCEPT_FLAG = "__biliNativeFetchIntercept";
@@ -399,7 +407,10 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 return orig(makeTarget(routedTarget), init);
             }
         }
-        if (!isModelApiUrl(url)) return orig(input, init);
+        if (!isModelApiUrl(url)) {
+            state.onUnroutedModelUrl?.(url);
+            return orig(input, init);
+        }
         // #1117: URL shape alone cannot claim a request — every model call in
         // the process hits the same endpoints. When the host supplies an
         // attribution gate, an unattributed caller keeps its original URL and

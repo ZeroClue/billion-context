@@ -8,6 +8,7 @@ import {
     type CoreMessage,
 } from "acp-kernel";
 import { getBlindTunnelStats } from "./mitm.js";
+import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
 import { preCompactionArchiveOf, type Session } from "./session.js";
@@ -128,6 +129,19 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             .join(", ");
         extra.push("");
         extra.push(`UNDECRYPTED TRAFFIC (instance-level): ${blind.total} CONNECT tunnel(s) to host(s) outside the MITM whitelist were blind-relayed since instance start — that traffic was never decrypted, so it never entered any session and CANNOT be compressed (${hosts}). To compress such a client: add its model domain to "mitm".domains in billion-context.json, restart bili, and make the client trust bili's root CA. Exact counts: GET /__bili/stats → blindTunnels.`);
+    }
+    const unrec = getUnrecognizedPathStats();
+    if (unrec.total > 0) {
+        // #1290: requests whose path matched no known protocol were relayed
+        // byte-for-byte and never entered a session — a second reason "no
+        // compressed blocks" can mean misrouting rather than a short chat.
+        const top = Object.entries(unrec.paths)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 10)
+            .map(([p, n]) => `${p}×${n}`)
+            .join(", ");
+        extra.push("");
+        extra.push(`UNRECOGNIZED PATHS (instance-level): ${unrec.total} request(s) to ${Object.keys(unrec.paths).length} path(s) matched no known protocol (/chat/completions, /llm_raw_chat, /v1/messages, /responses, …) since instance start — they were relayed byte-for-byte and CANNOT be compressed (${top}). If you expected compression here, that endpoint's path is not in bili's protocol table. Exact counts: GET /__bili/stats → unrecognizedPaths.`);
     }
     return extra.length > 0 ? `${base}\n${extra.join("\n")}` : base;
 }
