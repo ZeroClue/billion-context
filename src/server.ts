@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
-import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
+import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges, resolveOutputSteeringConfig } from "acp-kernel";
 import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
 import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
 import type { ProxyOptions } from "./config.js";
@@ -109,6 +109,7 @@ import { dumpRejectedBody } from "./error-dump.js";
 
 import { decodeRequestBody, DecompressedTooLargeError } from "./content-encoding.js";
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, resolveCompatRoles, type CompatRoles } from "./compat-roles.js";
+import { applyOutputSteering, applyOutputSteeringJson } from "./output-steering.js";
 import { bodyDumpEnabled, isModelDiscoveryPath, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
 import { BILI_HOP_HEADER, anthropicBetaContextWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
 import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
@@ -4164,6 +4165,16 @@ async function forward(
     let compatRoles: CompatRoles | null = null;
     let compatProtocol: "openai" | "responses" | null = null;
     const { upstreamUrl, headers, proxyUrl } = buildForwardTarget(req, opts, route, affinity, prepared !== null ? instanceId : undefined);
+    // #1093 output-side compression: resolve through the standard three-level
+    // compress cascade (global → provider); default off = byte-for-byte passthrough.
+    // The kernel decides (turn kind / verbosity / lower-effort); bili only lands it.
+    // Resolved at provider granularity — verbosity/effort routing isn't model-specific
+    // and extracting a model across all four wires here is disproportionate.
+    const steerRaw = resolveCompress(opts.routes, upstreamUrl, undefined, opts.compress).outputSteering;
+    const steerResolved = steerRaw !== undefined ? resolveOutputSteeringConfig(steerRaw) : null;
+    const steerCfg = steerResolved?.config ?? null;
+    for (const w of steerResolved?.warnings ?? []) log("warn", `[${prepared?.session.id ?? "passthrough"}] [output-steering] ${w}`);
+    let steerProtocol: WireProtocol | null = null;
     if (typeof body === "string") {
         // upstreamUrl (the real destination) — not route?.rewrittenUrl, which
         // is undefined for zero-config requests and would skip provider compat.
@@ -4188,15 +4199,27 @@ async function forward(
                 }
             }
         }
+        // #1093 land output-side compression AFTER every other body mutation (compat
+        // above) so the turn classifier sees the final message list. All wires, not
+        // just the compat pair; idempotent, byte-identical when nothing changes.
+        steerProtocol = protocol;
+        if (steerCfg && steerCfg.enabled && typeof wireBody === "string") {
+            const applied = applyOutputSteering(wireBody, protocol, steerCfg);
+            if (applied.changed) {
+                wireBody = applied.body;
+                log("info", `[${prepared?.session.id ?? "passthrough"}] [output-steering] applied (${applied.labels.join(", ")})`);
+            }
+        }
     }
     // #552: wire transform shared by ALL re-send paths (compress-retry loops
     // below) so re-sent bodies carry the same rewrite as the initial forward —
     // otherwise a developer-role 400 would hit mid-stream on the first retry.
     // Reads compatRoles at CALL time: a role learned mid-request (retry below)
     // applies to later re-sends within the same request.
-    const wireTransform = compatProtocol
+    const wireTransform = compatProtocol || (steerCfg !== null && steerCfg.enabled)
         ? (b: Record<string, unknown>): Record<string, unknown> => {
-            if (compatRoles) applyCompatRolesJson(b, compatProtocol, compatRoles);
+            if (compatProtocol && compatRoles) applyCompatRolesJson(b, compatProtocol, compatRoles);
+            if (steerCfg && steerCfg.enabled && steerProtocol) applyOutputSteeringJson(b, steerProtocol, steerCfg);
             return b;
         }
         : undefined;

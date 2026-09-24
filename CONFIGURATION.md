@@ -424,6 +424,24 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
    { "providers": { "https://your-relay.example": { "compress": { "reasoningGuard": { "enabled": true, "maxContinue": 2 } } } } }
   ```
 
+#### `outputSteering`
+
+- **Type:** `object` (`{ enabled?, verbosityLevel?, effortRouting? }`)
+- **Default:** *(disabled — off unless you set `enabled: true` at some level)*
+- **Status:** ACTIVE
+- **Description:** Opt-in **output-side compression** (issue #1093): two request-time levers that cut *output* tokens, which cost more than input and are billed the instant they stream. The decision logic (turn classification, L0–L4 directive wording, effort clamp) lives in acp-kernel and is shared with the agent side; bili only lands it on the wire, after every other body mutation:
+  - **Verbosity steering** — a deterministic conciseness directive appended to the **tail** of the system prompt (never prepended — that would shift the client's prompt bytes and bust the prefix cache). Sentinel-wrapped and idempotent: retries never accumulate it and a level change replaces it in place. Note the wording is byte-stable across releases (a kernel wording edit is a prefix-cache bust for every session at that level).
+  - **Effort routing** — classify the last user turn structurally (block composition only, no content pattern-matching); on a *mechanical continuation* (clean tool result, no error, no fresh user signal) an already-present effort field is clamped toward its minimum. Clamp-only: never injects a field the client did not send (models without effort support 400 on it), never toggles `thinking.type`, never raises `minimal`. Wires: OpenAI `reasoning_effort`, Responses `reasoning.effort`, Anthropic `thinking.budget_tokens` (floor 1024), Gemini `generationConfig.thinkingConfig.thinkingBudget` (floor 128; `-1` dynamic untouched).
+  - Sub-fields (merged deepest-wins like every other CompressSettings field): `enabled: boolean` master switch; `verbosityLevel: number` 0–4 (0 = no directive, default 2); `effortRouting: boolean` (default on whenever `enabled` is). Out-of-range values fall back to defaults **with a warning** instead of rejecting the block. Applies to all four wires (openai chat / responses / anthropic / google); requests with no system carrier are left untouched (skip-if-absent).
+  ```jsonc
+  // enable globally
+  { "compress": { "outputSteering": { "enabled": true } } }
+  // only lower effort, no wording directive
+  { "compress": { "outputSteering": { "enabled": true, "verbosityLevel": 0 } } }
+  // per provider (placement scopes it to that provider's traffic)
+  { "providers": { "https://your-relay.example": { "compress": { "outputSteering": { "enabled": true, "verbosityLevel": 3 } } } } }
+  ```
+
 #### `stripImages`
 
 - **Type:** `boolean`

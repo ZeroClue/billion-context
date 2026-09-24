@@ -424,6 +424,24 @@
    { "providers": { "https://your-relay.example": { "compress": { "reasoningGuard": { "enabled": true, "maxContinue": 2 } } } } }
   ```
 
+#### `outputSteering`
+
+- **类型:** `object`(`{ enabled?, verbosityLevel?, effortRouting? }`)
+- **默认:** *(禁用——不在任何层级设 `enabled: true` 就完全关闭)*
+- **状态:** ACTIVE
+- **描述:** 可选的**输出侧压缩**(issue #1093):两个请求期杠杆,削减的是*输出* token——它比输入贵、且一流出就计费。决策逻辑(轮次分类、L0–L4 指令措辞、effort 钳制)在 acp-kernel 内与 agent 侧共享;bili 只负责落在 wire 上,且在所有其他 body 改写之后:
+  - **Verbosity steering** — 确定性的简洁指令追加到 system prompt **尾部**(绝不前置——前移会改变客户端自己的提示词字节、击穿前缀缓存)。哨兵包裹且幂等:重试不会累积,等级切换原地替换。措辞跨版本字节稳定(内核改措辞=所有该等级会话的前缀缓存一次性失效)。
+  - **Effort routing** — 按结构分类最后一个 user 轮(只看块组成,不做内容模式匹配);在*机械续答*(干净的工具结果、无错误、无新用户信号)时把**客户端已发送的** effort 字段向最低档钳制。只钳不注:绝不注入客户端没发的字段(不支持 effort 的模型会 400)、绝不切换 `thinking.type`、绝不把 `minimal` 上调。覆盖:OpenAI `reasoning_effort`、Responses `reasoning.effort`、Anthropic `thinking.budget_tokens`(下限 1024)、Gemini `generationConfig.thinkingConfig.thinkingBudget`(下限 128;`-1` 动态档不动)。
+  - 子字段(与其他 CompressSettings 字段一样最深层级优先):`enabled: boolean` 总开关;`verbosityLevel: number` 0–4(0=不发指令,默认 2);`effortRouting: boolean`(默认随 `enabled` 开启)。越界值**带警告**回退默认,不会整块拒绝。四条 wire 全覆盖(openai chat / responses / anthropic / google);无 system 载体的请求不动(skip-if-absent)。
+  ```jsonc
+  // 全局启用
+  { "compress": { "outputSteering": { "enabled": true } } }
+  // 只降 effort,不发措辞指令
+  { "compress": { "outputSteering": { "enabled": true, "verbosityLevel": 0 } } }
+  // 按 provider(位置决定只作用于该 provider 的流量)
+  { "providers": { "https://your-relay.example": { "compress": { "outputSteering": { "enabled": true, "verbosityLevel": 3 } } } } }
+  ```
+
 #### `stripImages`
 
 - **类型：** `boolean`

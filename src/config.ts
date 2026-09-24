@@ -9,6 +9,7 @@ import { resolveOutputHeadroomCap } from "./util.js";
 import { parseCompatRoles } from "./compat-roles.js";
 import type { ImageBillingMode } from "./image-tokens.js";
 import type { ReasoningGuardConfig } from "./reasoning-guard.js";
+import type { OutputSteeringConfig } from "./output-steering.js";
 
 export function safeReadJson(path: string): unknown {
     try {
@@ -320,6 +321,14 @@ export type CompressSettings = {
      *  across the three levels like `absorb`/`reasoning`; off unless enabled at some
      *  level. See src/reasoning-guard.ts. */
     reasoningGuard?: ReasoningGuardConfig;
+     /** [#1093] Output-side compression levers — verbosity steering (a conciseness
+      *  directive appended to the system-prompt tail) and effort routing (clamp an
+      *  already-sent effort field down on mechanical continuation turns). Resolved
+      *  through this same three-level cascade; sub-fields are validated by the
+      *  kernel's resolveOutputSteeringConfig at resolution time (an out-of-range value
+      *  falls back to its default with a warning rather than rejecting the whole block).
+      *  Off unless enabled at some level. See src/output-steering.ts. */
+    outputSteering?: Partial<OutputSteeringConfig>;
 };
 export type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
@@ -1159,6 +1168,16 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
                 }
             }
             if (ok) out.reasoningGuard = cleaned;
+        }
+    }
+    if ("outputSteering" in obj && obj.outputSteering !== undefined) {
+        const os = obj.outputSteering;
+        if (!os || typeof os !== "object" || Array.isArray(os)) {
+            ok = false;
+        } else {
+            // Shape-guard only: sub-field validation is the kernel resolver's job at
+            // resolution time, so one out-of-range value can't nuke the whole block.
+            out.outputSteering = os as Partial<OutputSteeringConfig>;
         }
     }
     if (!ok) return undefined;
