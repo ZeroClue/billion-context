@@ -200,30 +200,36 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
     const pickedSet = new Set(cov.raws.filter(({ num }) => num >= sb.numericId && num <= eb.numericId).map(({ raw }) => raw));
     if (pickedSet.size === 0) return `[decompress FAILED: ${block.blockId} covers no messages in ${startRaw}–${endRaw} (its coverage is ${cov.text})]`;
     const parts: string[] = [];
-    for (const m of ctx.compressMessages ?? ctx.messages) {
-        if (!pickedSet.has(m.id)) continue;
-        const text = m.text ?? "";
-        parts.push(m.toolName && m.contentType !== "text" ? `[${m.role} • ${m.toolName}]\n${text}` : `[${m.role}]\n${text}`);
-    }
     let restoredFromStore = 0;
-    // [#1207 review F1] Covered originals may have left the client's re-sent
-    // view (native-compaction archive adoption, client-side trimming, restart
-    // with a compacted client) — exactly the scenario storeCoveredOriginals
-    // exists for. Fall back to the fold-time content store, keyed by the
-    // coverage's own ref numbers (byRef is mNNNNN-indexed; ids are never
-    // reused, so num → ref is stable). Same arming gate as the entry path.
-    if (parts.length === 0) {
-        const store = contentStoreOf(ctx.session);
-        for (const { raw, num } of cov.raws) {
-            if (!pickedSet.has(raw)) continue;
-            const r = retrieveByRef(store, `m${String(num).padStart(5, "0")}`);
-            if (!r.ok) continue;
+    // [#1283] Per-ref source selection supersedes the all-or-nothing fallback
+    // ([#1207 review F1]): store entries are immutable originals (append-only,
+    // first write wins, refs never reissued), so the store wins whenever it has
+    // the ref and the exec-time view is only the fallback (pre-CCR folds have
+    // no entries). The old zero-items gate assumed view/store mutual exclusion
+    // per ref that nothing enforces — a covered ref left visible in the view
+    // contributed its view text, which for arrival-stored refs is the 📦
+    // placeholder, not the original, and a partially visible span silently
+    // dropped the missing refs. Iterating coverage in num order keeps the span
+    // deterministic across both sources.
+    const store = contentStoreOf(ctx.session);
+    const viewById = new Map<string, CoreMessage>();
+    for (const m of ctx.compressMessages ?? ctx.messages) {
+        if (pickedSet.has(m.id)) viewById.set(m.id, m);
+    }
+    for (const { raw, num } of cov.raws) {
+        if (!pickedSet.has(raw)) continue;
+        const r = retrieveByRef(store, `m${String(num).padStart(5, "0")}`);
+        if (r.ok) {
             parts.push(r.entry.toolName ? `[${r.entry.toolName} • stored]\n${r.text}` : `[${r.entry.kind} • stored]\n${r.text}`);
             restoredFromStore++;
+            continue;
         }
-        if (parts.length === 0) {
-            return `[decompress FAILED: originals for ${startRaw}–${endRaw} are neither in this request's view nor in the content store (pre-CCR fold) — whole-block decompress may still work from cache]`;
-        }
+        const m = viewById.get(raw);
+        if (!m) continue;
+        parts.push(m.toolName && m.contentType !== "text" ? `[${m.role} • ${m.toolName}]\n${m.text ?? ""}` : `[${m.role}]\n${m.text ?? ""}`);
+    }
+    if (parts.length === 0) {
+        return `[decompress FAILED: originals for ${startRaw}–${endRaw} are neither in this request's view nor in the content store (pre-CCR fold) — whole-block decompress may still work from cache]`;
     }
     const header = `[Block ${block.blockId} content — ${startRaw}–${endRaw} — ${parts.length} item(s)]`;
     let injText: string;

@@ -10,6 +10,7 @@ import http from "node:http";
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
 import {
+    buildStoredPlaceholder,
     createContentStore,
     createCore,
     defaultConfig,
@@ -147,6 +148,24 @@ test("CCR v2 range decompress: falls back to the content store when the client v
     assert.match(injs[0]!.text!, /Historical detail 1\./);
     assert.match(injs[0]!.text!, /Historical detail 3\./);
     assert.doesNotMatch(injs[0]!.text!, /Historical detail 0\./);
+});
+
+test("CCR v2 range decompress: store-first per-ref beats an arrival placeholder left in the exec-time view (#1283)", () => {
+    // Oversized tool result stored at arrival: the store holds the original,
+    // but a covered ref that stays visible in the exec-time view carries only
+    // its 📦 placeholder (rebuild hides covered refs in real server flows;
+    // direct core consumers and protect-zone edges do not). The old
+    // all-or-nothing fallback let the placeholder win because parts was
+    // non-empty; per-ref store-first must restore the stored original.
+    const pre = storeOriginal(createContentStore(), { ref: "m00003", rawId: "h_2", text: "ARRIVAL-WINS FULL ORIGINAL", kind: "shell output", toolName: "bash", tokens: 40, head: "ARRIVAL-WINS HEAD" });
+    const f = fold({ ccr: true, preStore: pre });
+    const msgs = f.msgs.map((m) => (m.id === "h_2" ? { ...m, contentType: "text", toolName: undefined, text: buildStoredPlaceholder({ ref: "m00003", kind: "shell output", tokens: 40, head: "ARRIVAL-WINS HEAD", retrieveToolName: "acp_retrieve" }) } : m));
+    const ack = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004" }, { core: f.core, config: f.config, messages: msgs, session: f.session, log: () => {} });
+    assert.match(ack, /restored 3 item\(s\)/);
+    const injs = drainPendingRetrievals(f.session);
+    assert.equal(injs.length, 1);
+    assert.match(injs[0]!.text!, /ARRIVAL-WINS FULL ORIGINAL/, "stored original wins over the view placeholder");
+    assert.doesNotMatch(injs[0]!.text!, /acp-stored/, "no placeholder leaks into the restored span");
 });
 
 test("CCR v2 range decompress: client retry dedupes the injection and the stat (#1207 F5)", () => {
