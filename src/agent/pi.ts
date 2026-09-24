@@ -6,6 +6,7 @@
 // from the host at runtime (the host duck-types us in).
 
 import { wrapCacheReport } from "../acp-panel.js";
+import { awaitNativeProxyOrigin } from "./native-bootstrap.js";
 import { detectProxyBase, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, type ManifestTool } from "./shared.js";
 
 type Ctx = {
@@ -489,7 +490,15 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         }
         pi.on("before_provider_headers", async (event, ctx) => {
             try {
-                if (proxyBaseForCtx(ctx) === undefined) return;
+                // #1243: on the native lane the proxy origin lands via an async
+                // bootstrap that writes BILLION_CONTEXT_PROXY only after the spawn;
+                // a one-shot (-p) fires this event exactly once, inside that
+                // window. Await the writer's ready promise instead of racing it —
+                // hosts without a native entry register no waiter and fall
+                // straight through to wire mode.
+                let proxyBase = proxyBaseForCtx(ctx);
+                if (proxyBase === undefined) proxyBase = await awaitNativeProxyOrigin();
+                if (proxyBase === undefined) return;
                 const headers = (event as unknown as { headers?: Record<string, string> }).headers;
                 if (headers === undefined || typeof headers !== "object" || Array.isArray(headers)) return;
                 // #1214: pi's runner AWAITS async handlers (emitBeforeProviderHeaders),
@@ -526,7 +535,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                         headers["x-bili-plugin-model"] = modelId;
                         const maxOut = (ctx.model as { maxTokens?: unknown } | undefined)?.maxTokens;
                         if (typeof maxOut === "number" && Number.isFinite(maxOut) && maxOut > 0) headers["x-bili-plugin-max-output"] = String(Math.floor(maxOut));
-                        reportRuntimeInfoOnChange(proxyBaseForCtx(ctx), { agent, model: modelId, contextWindow: typeof window === "number" && window > 0 ? Math.floor(window) : undefined, maxOutput: typeof maxOut === "number" && maxOut > 0 ? Math.floor(maxOut) : undefined, baseURL: ctx.model?.baseUrl, source: "client-config" });
+                        reportRuntimeInfoOnChange(proxyBase, { agent, model: modelId, contextWindow: typeof window === "number" && window > 0 ? Math.floor(window) : undefined, maxOutput: typeof maxOut === "number" && maxOut > 0 ? Math.floor(maxOut) : undefined, baseURL: ctx.model?.baseUrl, source: "client-config" });
                     }
                 }
             } catch (err) {
