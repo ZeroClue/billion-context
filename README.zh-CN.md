@@ -305,6 +305,18 @@ fork 继承同一面)。按设计保持 launcher-only。
 
 要真正压缩这类客户端:把它的模型域名加进 `billion-context.json` 的 `"mitm".domains`(如 `"mitm": { "domains": ["copilot.tencent.com"] }`)或环境变量 `BILI_MITM_DOMAINS`,重启 bili,并让客户端信任 bili 的根 CA(Node 系客户端用 `NODE_EXTRA_CA_CERTS=~/.local/share/billion-context/ca/root-ca.pem`,有 CA 路径设置的用其设置)。`/bili/` 前缀方案在这里不适用——没有 URL 可改。详见 [CONFIGURATION.zh-CN.md → MITM](CONFIGURATION.zh-CN.md#mitm-透明代理登录客户端)。
 
+### 未识别的端点直连、什么都不压缩(#1290)
+
+bili 只压缩路径匹配已知 wire 协议(`/chat/completions`、`/llm_raw_chat`、`/v1/messages`、`/responses`……)的请求。发往其它路径的请求——例如第三方插件的**自定义 wire**(Command Code 的 Go 套餐发 `POST /alpha/generate`)——会逐字节中继,**永不压缩**。目前没有任何配置口可以声明一种任意新 wire;那是一项独立功能,不是一个能打开的开关。
+
+这个结果现在不再静默(#1290):
+
+- 客户端侧 fetch 钩子对每个不同的未路由端点每进程记一次日志(`…is not a recognized model endpoint, so bili did not route it through the proxy…`);
+- `curl -s http://localhost:8787/__bili/stats` 输出 `unrecognizedPaths`(按路径计数,仅 loopback);
+- 存在此类请求时,`acp_status` 输出会多一节 `UNRECOGNIZED PATHS (instance-level)`。
+
+如果你期望这类端点被压缩,改用 provider 的标准协议端点(Command Code 的 Provider 套餐发 `/provider/v1/chat/completions`,bili 能正常压缩);真正的自定义 wire 需要单独的支持。
+
 ## OpenCode
 
 同一个内置插件同时服务两代 OpenCode:agent 文件同时保留 V1 `server()` 与 V2 `setup()` 导出 —— ≥ 1.18.29 的 1.x 宿主加载 V1 形状,2.x 宿主加载 V2 `setup()`。独立扩展 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) 仅支持 V1,在 2.x 下**不加载** —— 对 OpenCode 2.x,**billion-context 是推荐的上下文管理方案**。以下均在 `@opencode/cli` 2.0.3 上端到端验证过(V1 泳道:1.14.46 与 1.18.31)。
