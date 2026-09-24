@@ -342,7 +342,7 @@ test("pi extension registers manifest tools and stamps headers when proxied", as
         await pi.events.get("session_start")!({}, fakeCtx(proxy));
         await waitForTools(pi, 2);
         const headers: Record<string, string> = {};
-        pi.events.get("before_provider_headers")!({ headers }, fakeCtx(proxy));
+        await pi.events.get("before_provider_headers")!({ headers }, fakeCtx(proxy));
         assert.equal(headers["x-bili-plugin"], "pi");
         assert.equal(headers["x-bili-plugin-conversation"], "sess-42");
         assert.equal(headers["x-bili-plugin-context-window"], "1000000");
@@ -361,18 +361,39 @@ test("pi extension registers manifest tools and stamps headers when proxied", as
     }
 });
 
-test("before_provider_headers does not claim plugin mode until tools are registered", async () => {
+test("#1214: before_provider_headers awaits tool registration — one-shot (-p) first request claims plugin mode", async () => {
     const proxy = await startFakeProxy();
     try {
         const pi = makeFakePi();
         biliPlugin(pi as never);
-        const early: Record<string, string> = {};
-        pi.events.get("before_provider_headers")!({ headers: early }, fakeCtx(proxy));
-        assert.deepEqual(early, {});
+        // The -p shape: NO session_start prewarm — the one and only request
+        // dispatches at boot. pi's runner awaits async handlers, so awaiting
+        // the handler mirrors the real host; the stamp must already carry
+        // the full plugin-ownership header set on the FIRST fire.
+        const headers: Record<string, string> = {};
+        await pi.events.get("before_provider_headers")!({ headers }, fakeCtx(proxy));
+        assert.equal(headers["x-bili-plugin"], "pi");
+        assert.equal(headers["x-bili-plugin-conversation"], "sess-42");
+        assert.equal(headers["x-bili-plugin-context-window"], "1000000");
+        assert.equal(pi.tools.length, 2, "tools registered before the request could leave");
+        // Subsequent fires stay stamped (cached registration, no re-fetch).
+        const again: Record<string, string> = {};
+        await pi.events.get("before_provider_headers")!({ headers: again }, fakeCtx(proxy));
+        assert.equal(again["x-bili-plugin"], "pi");
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("before_provider_headers stamps after a session_start prewarm too", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
         await pi.events.get("session_start")!({}, fakeCtx(proxy));
         await waitForTools(pi, 2);
         const late: Record<string, string> = {};
-        pi.events.get("before_provider_headers")!({ headers: late }, fakeCtx(proxy));
+        await pi.events.get("before_provider_headers")!({ headers: late }, fakeCtx(proxy));
         assert.equal(late["x-bili-plugin"], "pi");
         assert.equal(late["x-bili-plugin-conversation"], "sess-42");
     } finally {
@@ -383,6 +404,7 @@ test("before_provider_headers does not claim plugin mode until tools are registe
 test("before_provider_headers stays silent when the manifest fetch keeps failing", async () => {
     // Graceful degradation: a dead manifest endpoint means the plugin never
     // claims ownership, so the session rides the proxy's wire mode forever.
+    // #1214: the handler must RESOLVE (bounded await), never throw.
     const server = http.createServer((req, res) => {
         res.writeHead(404);
         res.end("{}");
@@ -398,7 +420,7 @@ test("before_provider_headers stays silent when the manifest fetch keeps failing
         await flush();
         assert.equal(pi.tools.length, 0);
         const headers: Record<string, string> = {};
-        pi.events.get("before_provider_headers")!({ headers }, fakeCtx(origin));
+        await pi.events.get("before_provider_headers")!({ headers }, fakeCtx(origin));
         assert.deepEqual(headers, {});
     } finally {
         server.close();
@@ -838,7 +860,7 @@ test("omp entry reports x-bili-plugin: omp without env vars", async () => {
             await pi.events.get("session_start")!({}, fakeCtx(undefined));
             await waitForTools(pi, 2);
             const headers: Record<string, string> = {};
-            pi.events.get("before_provider_headers")!({ headers }, fakeCtx(undefined));
+            await pi.events.get("before_provider_headers")!({ headers }, fakeCtx(undefined));
             assert.equal(headers["x-bili-plugin"], "omp");
         });
         await withEnv({ BILLION_CONTEXT_PLUGIN_AGENT: "omp", BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
@@ -847,7 +869,7 @@ test("omp entry reports x-bili-plugin: omp without env vars", async () => {
             await pi.events.get("session_start")!({}, fakeCtx(undefined));
             await waitForTools(pi, 2);
             const headers: Record<string, string> = {};
-            pi.events.get("before_provider_headers")!({ headers }, fakeCtx(undefined));
+            await pi.events.get("before_provider_headers")!({ headers }, fakeCtx(undefined));
             assert.equal(headers["x-bili-plugin"], "omp");
         });
         await withEnv({ BILLION_CONTEXT_PLUGIN_AGENT: undefined }, async () => {
@@ -857,7 +879,7 @@ test("omp entry reports x-bili-plugin: omp without env vars", async () => {
             await pi.events.get("session_start")!({}, ctx);
             await waitForTools(pi, 2);
             const headers: Record<string, string> = {};
-            pi.events.get("before_provider_headers")!({ headers }, ctx);
+            await pi.events.get("before_provider_headers")!({ headers }, ctx);
             assert.equal(headers["x-bili-plugin"], "dsh");
         });
     } finally {
