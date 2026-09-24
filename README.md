@@ -251,7 +251,7 @@ overwrites that copy in place:
 | global `bili` | npm global (`npm i -g billion-context`) | `bili update` / background auto-update |
 | **pi** | pi's package manager (npm form) | **`pi update`** — bili never overwrites it |
 | **opencode** | opencode's plugin dir | **opencode's plugin manager** — bili never overwrites it |
-| **dsh** | each profile's pnpm store | global bili self-update re-runs dsh's plugin channel per profile (or `dsh plugin add billion-context@latest`); pnpm's hardlinked store must never be copied over in place |
+| **dsh** | each profile's pnpm store | a periodic check re-runs dsh's plugin channel per profile — driven by the global bili self-update **or by the profile copy's own proxy** when the global isn't running (dsh-market installs, #1196); manual: `dsh plugin add billion-context@latest`. pnpm's hardlinked store must never be copied over in place |
 | omp / claude / codex / kimi / zcode | no copy — entries point at the global bili install | they update together with the global copy |
 | **hermes** | `~/.hermes/plugins/billion-context/` (copied files + `bili.json` sidecar pointing at the global dist) | **`bili plugin update hermes`** re-copies the files; the sidecar tracks the global install |
 
@@ -440,12 +440,17 @@ Two lanes, same plugin (#941):
   `billion-context/dsh`, the profile resolved a pre-bundle copy from a stale
   package-metadata cache (#953) — re-add pinned: `dsh plugin --profile
   <name> add billion-context@latest`.
-- **Auto-update keeps profiles in lockstep:** after a global self-update,
-  bili scans `~/.dsh/profiles/*/package.json` and brings any registry-pinned
-  `billion-context` dependency back to the new global version, so the loaded
-  plugin and the proxy never drift apart again (#953); profiles pinned to a
-  local source are left alone. The refresh is best-effort and never fails the
-  update itself.
+- **Auto-update keeps profiles in lockstep:** the refresh has two triggers —
+  after a global self-update, AND from the **profile copy's own proxy** when
+  its periodic check sees a newer registry version (so dsh plugin-market
+  users with no global bili running still refresh, #1196). Both scan
+  `~/.dsh/profiles/*/package.json` and bring any registry-pinned
+  `billion-context` dependency to the target version (the new global version
+  for the global trigger, registry-latest for the self trigger), always
+  through dsh's own `plugin add` channel — never an in-place copy — so the
+  loaded plugin and the proxy never drift apart again (#953); profiles
+  pinned to a local source are left alone. The refresh is best-effort,
+  retries next cycle on failure, and never fails the update or the proxy.
  - **Reported: zero proxy traffic for some transports under profile install
    (#1158, under investigation):** sessions served by some of dsh's
    `llm-pi-ai`-layer transports show NO model request ever reaching the proxy
