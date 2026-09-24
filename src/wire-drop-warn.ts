@@ -1,13 +1,15 @@
-// #1205: the acp-kernel openai wire codec keeps only text parts — plus
-// image_url parts on user messages (sidecar'd as rawOpenaiContent/Parts) — and
-// silently drops every other content-part type on the parse→rebuild round trip,
-// before any compression happens. DeepSeek's default attachment flow sends
-// {"type":"file","file_id":"file-api-…"} parts, so the model never sees the
-// pixels. This detector scans the RAW body against that preserved set so the
-// proxy can log a one-time warn instead of staying silent. When the kernel
-// learns opaque part carry-through the call site should be re-pointed at what
-// actually survived the round trip (today nothing does, so raw-body scanning
-// is both sufficient and accurate for this drop class).
+// #1205: the acp-kernel openai wire codec used to keep only text parts —
+// plus image_url parts on user messages — silently dropping every other
+// content-part type on the parse→rebuild round trip (DeepSeek's default
+// attachment flow sends {"type":"file","file_id":…} parts, so the model
+// never saw the pixels). acp-kernel 0.0.85 (PR #365) fixed the dominant
+// class: user-message content parts are ALL carried through verbatim via the
+// rawOpenaiContentParts sidecar, so user messages no longer drop anything.
+// The remaining drop class is NON-user roles: the codec still reduces e.g.
+// assistant content to text-only (stringContent), so parts riding those
+// messages (assistant-carried images/attachments some clients emit) still
+// vanish. This detector scans the RAW body for that surviving drop class so
+// the proxy can log a one-time warn instead of staying silent.
 
 function isObj(v: unknown): v is Record<string, unknown> {
     return typeof v === "object" && v !== null;
@@ -19,7 +21,8 @@ export interface DroppedOpenaiPartsReport {
     firstIndex: number;
 }
 
-const USER_PRESERVED = new Set(["text", "image_url"]);
+// Kernel 0.0.85+: non-user roles still go through text-only reduction
+// (stringContent), so only text survives there.
 const DEFAULT_PRESERVED = new Set(["text"]);
 
 export function droppedOpenaiParts(body: unknown): DroppedOpenaiPartsReport | null {
@@ -32,9 +35,9 @@ export function droppedOpenaiParts(body: unknown): DroppedOpenaiPartsReport | nu
     for (let i = 0; i < messages.length; i++) {
         const m = messages[i];
         if (!isObj(m) || !Array.isArray(m.content)) continue;
-        const preserved = m.role === "user" ? USER_PRESERVED : DEFAULT_PRESERVED;
+        if (m.role === "user") continue;
         for (const p of m.content) {
-            if (!isObj(p) || preserved.has(typeof p.type === "string" ? p.type : "<no-type>")) continue;
+            if (!isObj(p) || DEFAULT_PRESERVED.has(typeof p.type === "string" ? p.type : "<no-type>")) continue;
             count++;
             types.add(typeof p.type === "string" ? p.type : "<no-type>");
             if (firstIndex < 0) firstIndex = i;
