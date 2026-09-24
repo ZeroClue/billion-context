@@ -115,6 +115,7 @@ import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead } from "./server/budget.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
+import { droppedOpenaiParts } from "./wire-drop-warn.js";
 
 // #1086/#1218: the per-session chain-verdict memory moved to plugin.ts
 // (`chainVerdicts`) so the /acp status path can read it — a session judged an
@@ -123,6 +124,30 @@ import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js
 // semantics preserved: recordChainVerdict returns true on the first verdict
 // for a session. Re-exported under the old names for tests.
 export { WARNED_CHAIN_SESSION_CAP, _resetChainVerdictsForTest as _resetChainWarningsForTest, _chainVerdictMapForTest as _chainWarnSetForTest } from "./plugin.js";
+
+// #1205: sessions already warned about codec-dropped content parts (e.g.
+// DeepSeek Files API file refs) — one warn per session per distinct type-set;
+// attachment flows resend the same history every turn. Same bounded-FIFO shape
+// as warnedChainSessions above.
+const warnedWireDropKeys = new Set<string>();
+export const WARNED_WIREDROP_KEY_CAP = 4096;
+export function _resetWireDropWarningsForTest(): void {
+    warnedWireDropKeys.clear();
+}
+export function _wireDropWarnSetForTest(): Set<string> {
+    return warnedWireDropKeys;
+}
+export function warnDroppedOpenaiParts(parsed: unknown, sessionId: string, log: (level: string, msg: string) => void): void {
+    const report = droppedOpenaiParts(parsed);
+    if (!report) return;
+    const key = `${sessionId}:${report.types.join(",")}`;
+    if (warnedWireDropKeys.has(key)) return;
+    warnedWireDropKeys.add(key);
+    if (warnedWireDropKeys.size > WARNED_WIREDROP_KEY_CAP) {
+        warnedWireDropKeys.delete(warnedWireDropKeys.values().next().value as string);
+    }
+    log("warn", `[${sessionId}] wire codec will drop ${report.count} content part(s) with unrecognized type(s) [${report.types.join(", ")}] (first at message #${report.firstIndex}) — e.g. DeepSeek Files API file refs vanish on the wire before any compression (#1205); inline base64 images work around it`);
+}
 
 // #1073: a forward-proxy-style (absolute-form) request whose authority IS this
 // instance's own listening endpoint — e.g. a health prober configured with our
@@ -2598,6 +2623,7 @@ function prepareOpenai(
         // otherwise the proxy would forward payloads without any system.
         const { msgs, systemText } = openaiToCore(parsed);
         openaiSystemText = systemText;
+        warnDroppedOpenaiParts(parsed, sessionId, log);
         // Title-gen side-requests carry their own tiny system — reconciling
         // them would pollute the conversation's anchor state.
         if (opts.stableSystemAnchor && !pluginMode && !isTitleGen) {

@@ -251,9 +251,23 @@ export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "resp
         for (const part of m.content) {
             if (!isObj(part)) continue;
             if (protocol === "openai") {
-                if (part.type !== "image_url") continue;
-                const url = urlOf(part.image_url);
-                if (url) total += costForUrl(url, billing);
+                if (part.type === "image_url") {
+                    const url = urlOf(part.image_url);
+                    if (url) total += costForUrl(url, billing);
+                    continue;
+                }
+                // #1205: OpenAI-family file references — DeepSeek Files API
+                // {"type":"file","file_id":"file-api-…"} and OpenAI's
+                // {"type":"file","file":{…}}. Inline file_data is sized from
+                // its base64 payload like any data URL; opaque id/url refs
+                // cost the flat remote price (google fileData precedent).
+                if (part.type === "file") {
+                    const f = isObj(part.file) ? part.file : {};
+                    const ref = typeof f.file_data === "string" ? f.file_data : typeof f.url === "string" ? f.url : undefined;
+                    total += ref ? costForUrl(ref, billing) : applyCap(REMOTE_IMAGE_TOKENS);
+                    continue;
+                }
+                continue;
             } else {
                 if (part.type !== "image") continue;
                 const src = part.source;
@@ -273,7 +287,7 @@ export function imageTokensInRawBody(protocol: "anthropic" | "openai" | "respons
     const probe =
         protocol === "google" ? s.includes("inlineData") || s.includes("fileData")
         : protocol === "responses" ? s.includes("input_image")
-        : protocol === "openai" ? s.includes("image_url")
+        : protocol === "openai" ? s.includes("image_url") || s.includes('"type":"file"') || s.includes('"type": "file"')
         : s.includes('"type":"image"') || s.includes('"type": "image"');
     if (!probe) return 0;
     try {
