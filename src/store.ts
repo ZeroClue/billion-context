@@ -42,6 +42,19 @@ export function retrieveToolName(session: Session | undefined): string {
     return effectiveCcr(session)?.toolName ?? RETRIEVE_TOOL_NAME;
 }
 
+// [#1271] Wire protocols that support plugin-mode CCR. The agent advertises
+// acp_retrieve from the manifest and rides the full original back via the
+// request-only injection in prepare* — which exists only for these two wires.
+// google (strict role-alternation) and responses (fragile developer-message
+// mechanics, no real plugin lane) are excluded so a placeholder is never emitted
+// on a wire that cannot round-trip it (silent loss, #1097). The arming gate and
+// the drain sites must stay in lockstep with this set.
+export const PLUGIN_CCR_WIRES: ReadonlySet<string> = new Set(["anthropic", "openai"]);
+
+export function ccrPluginWireOk(protocol: string): boolean {
+    return PLUGIN_CCR_WIRES.has(protocol);
+}
+
 /** Lazily materialize the session's kernel content-store envelope: loaded
  *  from the session's content-store.json on first touch, fresh when the file
  *  is absent (or corrupt — degraded to retrieve misses, never a crash). */
