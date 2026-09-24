@@ -523,11 +523,26 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             const maxOut = (ctx.model as { maxTokens?: unknown } | undefined)?.maxTokens;
             reportRuntimeInfoOnChange(proxyBaseForCtx(ctx), { agent, model: modelId, contextWindow: typeof window === "number" && window > 0 ? Math.floor(window) : undefined, maxOutput: typeof maxOut === "number" && maxOut > 0 ? Math.floor(maxOut) : undefined, baseURL: ctx.model?.baseUrl, source: "client-config" });
         }
-        pi.on("before_provider_request", (event, ctx) => {
+        pi.on("before_provider_request", async (event, ctx) => {
             // omp emits this per model request (but never before_provider_headers);
             // it doubles as the retry driver when the session_start manifest
             // fetch raced the proxy startup. Cached by sid, throttled by retryAt.
-            void registerTools(pi, ctx, state, agent).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
+            // #1230: omp's runner also AWAITS async handlers (emitBeforeProviderRequest)
+            // and uses the resolved value as the outgoing payload — so the plugin-mode
+            // claim serializes behind tool registration instead of racing it. For omp
+            // the claim is the identity registration that runs INSIDE registerTools
+            // (after the manifest fetch): a one-shot (`omp -p`) dispatches exactly ONE
+            // request, and with fire-and-forget registration it left before the proxy
+            // saw the conversation id — bound as an anonymous pfa session, rode proxy
+            // mode forever, no round 2 to self-heal. registerTools is idempotent
+            // (sid-cached, pending-deduped, retryAt-throttled), so the await is bounded
+            // (worst case = manifest fetch + identity POST timeouts); a permanently
+            // failing manifest fetch still degrades to wire mode.
+            try {
+                await registerTools(pi, ctx, state, agent);
+            } catch (err) {
+                console.error(`bili-plugin(${agent}): tool registration failed (${err instanceof Error ? err.message : String(err)}) — riding wire mode for this request`);
+            }
             if (agent === "omp") reportOmpRuntimeInfo(ctx);
             return stampPromptCacheKey(event, ctx, agent);
         });
