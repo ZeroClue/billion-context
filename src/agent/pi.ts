@@ -5,7 +5,7 @@
 // minimal structural declarations — the bundled artifact imports NOTHING
 // from the host at runtime (the host duck-types us in).
 
-import { wrapCacheReport } from "../acp-panel.js";
+import { wrapCacheReport, wrapRuleReport } from "../acp-panel.js";
 import { awaitNativeProxyOrigin } from "./native-bootstrap.js";
 import { detectProxyBase, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, type ManifestTool } from "./shared.js";
 
@@ -479,6 +479,58 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     if (typeof pi.sendMessage === "function") {
                         try {
                             pi.sendMessage({ customType: "bili-acp-cache", content: wrapCacheReport(text), display: true });
+                            return;
+                        } catch (err) {
+                            console.error(`bili-plugin(${agent}): sendMessage failed (${err instanceof Error ? err.message : String(err)}) — falling back to notify`);
+                        }
+                    }
+                    notify(text, "info");
+                },
+            });
+            // #1251: human entry point for the persistent-rules feature — the model side
+            // already has the acp_rule tool; this command shows humans the identical list
+            // (both paths hit executeRule on the proxy) and lets a human record a rule
+            // directly by passing text. Launcher mode and native mode both load this
+            // factory (see pi-native.ts), so one registration covers both.
+            pi.registerCommand("acp-rule", {
+                description: "Persistent rules for this session (same list as the acp_rule tool). Usage: /acp-rule [text to record]",
+                handler: async (args, ctx) => {
+                    const notify = (message: string, type?: string): void => {
+                        try {
+                            ctx.ui?.notify?.(message, type);
+                        } catch {
+                            // host UI unavailable — the command is best-effort
+                        }
+                    };
+                    const proxyBase = detectProxyBase(ctx.model?.baseUrl);
+                    if (proxyBase === undefined) {
+                        notify(noProxyWarning(agent), "warning");
+                        return;
+                    }
+                    const conversationId = sessionIdOf(ctx) ?? "unknown";
+                    const ruleText = (args ?? "").trim();
+                    const toolArgs = ruleText.length > 0 ? { rule: ruleText } : {};
+                    let text: string;
+                    try {
+                        text = await forwardTool(proxyBase, conversationId, "acp_rule", toolArgs);
+                    } catch (err) {
+                        notify(`bili: acp_rule failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+                        return;
+                    }
+                    // #1192 note channel (disabledOptionalToolNote): the feature is off in
+                    // this session's effective config — surface the enablement hint instead
+                    // of echoing the model-facing note into the transcript.
+                    if (text.startsWith("acp_rule is not enabled")) {
+                        notify("bili: acp_rule is not enabled on this bili proxy — set compress.rules.enabled: true in your bili config", "warning");
+                        return;
+                    }
+                    // Persistent transcript output (TUI + web hosts like pi-web). The proxy strips
+                    // the wrapped message from the model context by content signature
+                    // (src/acp-panel.ts), so it never reaches the LLM; notify() is the fallback
+                    // for hosts without sendMessage (older pi).
+                    if (typeof pi.sendMessage === "function") {
+                        try {
+                            pi.sendMessage({ customType: "bili-acp-rule", content: wrapRuleReport(text), display: true });
                             return;
                         } catch (err) {
                             console.error(`bili-plugin(${agent}): sendMessage failed (${err instanceof Error ? err.message : String(err)}) — falling back to notify`);

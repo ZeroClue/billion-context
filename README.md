@@ -816,6 +816,15 @@ API: `bili plugin install claude` writes a model-mediated
 MCP tool and pastes the report back verbatim. codex/kimi/hermes expose no
 user-typable command seam — ask the model to call its `acp_cache` tool directly.
 
+The same seam carries `/acp-rule` (#1251) — the human entry point to the
+persistent-rules feature (identical output to the `acp_rule` tool): pi/omp
+register it natively — bare `/acp-rule` lists every recorded rule, and
+`/acp-rule <text>` records one directly (as if the model had called it). The
+wrapped transcript message is stripped from model context by content signature
+like the cache report — recorded rules reach the model every turn via the
+system-prompt injection anyway. delete/clear subcommands land with #1178;
+other lanes get it in follow-up work.
+
 ### Legacy opencode-acp sessions (#920)
 
 On 1.x hosts, pre-migration [`opencode-acp`](https://github.com/ranxianglei/opencode-acp)

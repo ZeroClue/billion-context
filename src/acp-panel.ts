@@ -19,6 +19,8 @@
 //    the kernel's cache report — its shape is kernel-owned and variable-length
 //    (LINE ITEMS table up to the sample cap), so we cannot anchor on the
 //    renderer output the way we can for the two panels above.
+//  - wrapRuleReport (#1251, /acp-rule): same marker scheme around the
+//    executeRule output (a numbered list or a one-line add/list result).
 import { MARKER_LINE, stripMarkerLines } from "./loop/tag-echo-filter.js";
 
 const PANEL_BOX_TOP = "\u256d";
@@ -28,20 +30,31 @@ const PANEL_FALLBACK_HEADER = "\u{1f4ca} ACP status";
 
 export const CACHE_REPORT_OPEN = "[acp-cache]";
 export const CACHE_REPORT_CLOSE = "[/acp-cache]";
+export const RULE_REPORT_OPEN = "[acp-rule]";
+export const RULE_REPORT_CLOSE = "[/acp-rule]";
 
 /** Wrap a cache report for persistent transcript display (see above). */
 export function wrapCacheReport(report: string): string {
     return `${CACHE_REPORT_OPEN}\n${report}\n${CACHE_REPORT_CLOSE}`;
 }
 
+/** Wrap an acp_rule report for persistent transcript display (see above). */
+export function wrapRuleReport(report: string): string {
+    return `${RULE_REPORT_OPEN}\n${report}\n${RULE_REPORT_CLOSE}`;
+}
+
 export function isAcpPanelText(text: string): boolean {
     const t = text.trim();
     if (t.length === 0) return false;
-    return isBoxPanel(t) || isFallbackPanel(t) || isCacheReport(t);
+    return isBoxPanel(t) || isFallbackPanel(t) || isCacheReport(t) || isRuleReport(t);
 }
 
 function isCacheReport(t: string): boolean {
     return t.startsWith(CACHE_REPORT_OPEN) && t.endsWith(CACHE_REPORT_CLOSE);
+}
+
+function isRuleReport(t: string): boolean {
+    return t.startsWith(RULE_REPORT_OPEN) && t.endsWith(RULE_REPORT_CLOSE);
 }
 
 function isBoxPanel(t: string): boolean {

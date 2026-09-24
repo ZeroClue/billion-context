@@ -9,7 +9,7 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { proxyBaseFromUrl, proxyBaseFromEnv, detectProxyBase, fetchManifest, forwardTool, fetchStatus } from "../src/agent/shared.ts";
-import { wrapCacheReport } from "../src/acp-panel.ts";
+import { wrapCacheReport, wrapRuleReport } from "../src/acp-panel.ts";
 import biliPlugin, { createBiliPlugin } from "../src/agent/pi.ts";
 import ompPlugin from "../src/agent/omp.ts";
 import { pluginInstall, pluginRemove, pluginStatusAll, PLUGIN_AGENTS, selfPackageRoot, pickPluginKey, detectOpencodeMajor, piEntryFor, PI_NPM_ENTRY, isPiEntry, claudeNativeInstalled } from "../src/plugin-install.ts";
@@ -992,6 +992,125 @@ test("/acp-cache reports a proxy-side failure via notify error (#800)", async ()
         assert.equal(notes[0]!.type, "error");
         assert.match(notes[0]!.msg, /cache report failed/);
         assert.match(notes[0]!.msg, /boom/);
+    } finally {
+        await proxy.close();
+    }
+});
+
+function startRuleProxy(result: string | undefined, error?: string): Promise<{ origin: string; calls: Array<{ conversationId: string; tool: string; args: Record<string, unknown> }>; close(): Promise<void> }> {
+    const calls: Array<{ conversationId: string; tool: string; args: Record<string, unknown> }> = [];
+    const server = http.createServer((req, res) => {
+        if (req.url === "/__bili/plugin/tool" && req.method === "POST") {
+            let body = "";
+            req.on("data", (c) => (body += c));
+            req.on("end", () => {
+                const data = JSON.parse(body) as { conversationId: string; tool: string; args?: Record<string, unknown> };
+                calls.push({ conversationId: data.conversationId, tool: data.tool, args: data.args ?? {} });
+                res.writeHead(200, { "content-type": "application/json" });
+                if (error !== undefined) res.end(JSON.stringify({ ok: false, error }));
+                else res.end(JSON.stringify({ ok: true, result }));
+            });
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    return new Promise((resolve) => {
+        server.listen(0, "127.0.0.1", () => {
+            resolve({
+                origin: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+                calls,
+                close: () => new Promise<void>((r) => server.close(() => r())),
+            });
+        });
+    });
+}
+
+test("/acp-rule forwards acp_rule with empty args and persists the wrapped list via sendMessage (#1251)", async () => {
+    const proxy = await startRuleProxy("rule1: always run typecheck");
+    try {
+        const sent: Array<{ customType: string; content: string; display: boolean }> = [];
+        const notes: string[] = [];
+        const pi = { ...makeFakePi(), sendMessage: (m: { customType: string; content: string; display: boolean }) => sent.push(m) };
+        createBiliPlugin()(pi as never);
+        const cmd = pi.commands.get("acp-rule");
+        assert.ok(cmd, "acp-rule command should be registered");
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-rules" },
+            model: { baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (msg: string) => notes.push(msg) },
+        };
+        await cmd!.handler("", ctx);
+        assert.deepEqual(proxy.calls, [{ conversationId: "sess-rules", tool: "acp_rule", args: {} }], "no-arg list forwards empty args");
+        assert.equal(sent.length, 1, "one custom message sent");
+        assert.equal(notes.length, 0, "notify must not fire when sendMessage is available");
+        assert.equal(sent[0]!.customType, "bili-acp-rule");
+        assert.equal(sent[0]!.display, true);
+        assert.equal(sent[0]!.content, wrapRuleReport("rule1: always run typecheck"));
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("/acp-rule forwards the text as { rule } to record a rule (#1251)", async () => {
+    const proxy = await startRuleProxy("Recorded rule2: prefer pnpm");
+    try {
+        const sent: Array<{ customType: string; content: string }> = [];
+        const pi = { ...makeFakePi(), sendMessage: (m: { customType: string; content: string }) => sent.push(m) };
+        createBiliPlugin()(pi as never);
+        const cmd = pi.commands.get("acp-rule")!;
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-rules-add" },
+            model: { baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (_msg: string) => {} },
+        };
+        await cmd.handler("  prefer pnpm  ", ctx);
+        assert.deepEqual(proxy.calls, [{ conversationId: "sess-rules-add", tool: "acp_rule", args: { rule: "prefer pnpm" } }], "trimmed text forwarded as { rule }");
+        assert.equal(sent[0]!.customType, "bili-acp-rule");
+        assert.equal(sent[0]!.content, wrapRuleReport("Recorded rule2: prefer pnpm"));
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("/acp-rule falls back to raw-text notify when the host has no sendMessage (#1251)", async () => {
+    const proxy = await startRuleProxy("No rules recorded.");
+    try {
+        const notes: string[] = [];
+        const pi = makeFakePi();
+        createBiliPlugin()(pi as never);
+        const cmd = pi.commands.get("acp-rule")!;
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-rules-notify" },
+            model: { baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (msg: string) => notes.push(msg) },
+        };
+        await cmd.handler("", ctx);
+        assert.equal(notes.length, 1, "notify fallback fires");
+        assert.equal(notes[0], "No rules recorded.");
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("/acp-rule warns with an enablement hint when the proxy reports the feature disabled (#1251)", async () => {
+    const proxy = await startRuleProxy("acp_rule is not enabled on this bili proxy (compress.rules.enabled is not true) — nothing was recorded.");
+    try {
+        const sent: Array<{ customType: string }> = [];
+        const notes: Array<{ msg: string; type?: string }> = [];
+        const pi = { ...makeFakePi(), sendMessage: (m: { customType: string }) => sent.push(m) };
+        createBiliPlugin()(pi as never);
+        const cmd = pi.commands.get("acp-rule")!;
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-rules-off" },
+            model: { baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (msg: string, type?: string) => notes.push({ msg, type }) },
+        };
+        await cmd.handler("", ctx);
+        assert.equal(sent.length, 0, "no transcript message when disabled");
+        assert.equal(notes.length, 1);
+        assert.equal(notes[0]!.type, "warning");
+        assert.match(notes[0]!.msg, /compress\.rules\.enabled/);
     } finally {
         await proxy.close();
     }

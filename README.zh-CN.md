@@ -353,6 +353,8 @@ HTTPS 走证书 MITM,HTTP 走临时 `opencode.json` 副本(`/bili/` 改写;JSONC
 
 `/acp` 面板在所有模式下都绑定当前会话,`acp_status` 工具是其宿主内等价手段。在命令编辑器支持新增条目的宿主(2.0.x 稳定版,`editor.add`)上,V2 插件额外注册 `/acp` 斜杠命令 —— 以合成非模型消息渲染,面板优先(与 `acp_status` 工具一致);旧形状上该注册保持惰性。注意 `opencode run` 模式完全不派发斜杠命令(它们会透传给模型)—— 请用 TUI。
 
+同一接缝还承载 `/acp-rule`(#1251)—— 持久指令功能的人侧入口(输出与 `acp_rule` 工具一致):pi/omp 原生注册 —— 裸 `/acp-rule` 逐字列出全部已记录指令,`/acp-rule <文本>` 直接记录一条(等价于模型调用)。包裹后的 transcript 消息按内容签名从模型上下文剥离(与缓存报告同机制)—— 已记录的指令本来就每轮经 system prompt 注入。delete/clear 子命令随 #1178 落地;其他 lane 见后续工作。
+
 ### 旧 opencode-acp 会话(#920)
 
 在 1.x 宿主上,迁移前的 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) 旧会话在两条泳道下都继续可用:启动器从临时配置副本中移除 `opencode-acp` 条目(宿主永远不会以激活状态加载它),各泳道把已安装的包作为库吸收(直接从 `node_modules` 导入 —— `.opencode/node_modules`、项目 `node_modules`、全局 npm root、opencode 配置级 modules,先到先得)。会话属于 legacy ⟺ opencode-acp 的持久化状态文件存在(`<XDG_DATA_HOME>/opencode/storage/plugin/acp/<sessionID>.json`,或 `acp.jsonc` 中 `storagePath` 指定的目录):
