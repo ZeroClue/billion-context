@@ -288,6 +288,16 @@ never attached: a rebuilt or updated install always starts a fresh proxy on
 the next launch, so fixes take effect immediately instead of silently
 serving stale code.
 
+Attach discovery is lane-aware across **all** live instances (#1232): the
+launcher probes every live entry in the instance registry, not just the
+single instance file (last-writer-wins — under concurrent multi-client use
+it can point at another client's proxy). Among compatible candidates the
+newest instance with the launcher's own declared lane wins; an instance
+without a lane (manual `bili start`) remains shareable by every client.
+The `another bili instance is running` warning (#394) is lane-aware too: it
+fires for same-lane or lane-less coexistence, but stays silent between two
+*different* declared lanes, whose session files are disjoint.
+
 **Runtime-info protocol (#955).** A native plugin reads the model config
 the client itself will use and pushes it to the proxy (per-request headers
 + bootstrap report); the proxy prefers that truth over the models.dev

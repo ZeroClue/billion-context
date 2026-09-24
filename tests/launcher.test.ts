@@ -10,8 +10,10 @@ import path from "node:path";
 import {
     claimStartingMarker,
     readStartingMarker,
+    registerInstanceAndWarn,
     removeStartingMarker,
     startingMarkerPath,
+    unregisterInstance,
     type ProxyInstanceFile as InstanceFile,
 } from "../src/instance.ts";
 import {
@@ -1166,6 +1168,115 @@ test("ensureProxyRunning: pre-#1225 instance without codeFingerprint is never at
     );
     assert.equal(spawnCalls, 1);
     assert.equal(handle.attached, undefined);
+});
+
+// #1232: with per-lane proxies the single proxy-origin file is last-writer-
+// wins and can point at ANOTHER client's proxy. Attach discovery must scan
+// every live registry entry. These tests seed real markers under an isolated
+// state dir (the module-level XDG_STATE_HOME is shared across this file).
+function isoStateDir(): { restore: () => void } {
+    const prev = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "bili-iso-state-"));
+    return {
+        restore: () => {
+            if (prev === undefined) delete process.env.XDG_STATE_HOME;
+            else process.env.XDG_STATE_HOME = prev;
+        },
+    };
+}
+
+function liveRegistryInstance(over: Partial<InstanceFile>): InstanceFile {
+    return recordedInstance({ pid: process.pid, ...over });
+}
+
+test("ensureProxyRunning: reattaches to own-lane instance when the instance file points at another client's proxy (#1232)", async () => {
+    const st = isoStateDir();
+    try {
+        const A = liveRegistryInstance({ instanceId: "inst-A", origin: "http://127.0.0.1:8801", port: 8801, lane: "pi", startedAt: Date.now() - 60_000 });
+        const B = liveRegistryInstance({ instanceId: "inst-B", origin: "http://127.0.0.1:8802", port: 8802, lane: "codex", startedAt: Date.now() });
+        registerInstanceAndWarn(A, () => {});
+        registerInstanceAndWarn(B, () => {});
+        let spawnCalls = 0;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi" },
+            {
+                spawnImpl: () => {
+                    spawnCalls++;
+                    return makeFakeChild(42470);
+                },
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async (origin) => ({ ok: true, instanceId: origin.endsWith("8801") ? "inst-A" : "inst-B" }),
+                readInstanceFile: () => B,
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(spawnCalls, 0, "must attach, not spawn a third proxy");
+        assert.equal(handle.attached, true);
+        assert.equal(handle.origin, A.origin, "attach to the pi-lane instance, not the codex one the file pointed at");
+    } finally {
+        unregisterInstance("inst-A");
+        unregisterInstance("inst-B");
+        st.restore();
+    }
+});
+
+test("ensureProxyRunning: same-lane instance wins over a newer wildcard daemon found via the registry (#1232)", async () => {
+    const st = isoStateDir();
+    try {
+        const W = liveRegistryInstance({ instanceId: "inst-W", origin: "http://127.0.0.1:8803", port: 8803, startedAt: Date.now() });
+        const A = liveRegistryInstance({ instanceId: "inst-A2", origin: "http://127.0.0.1:8804", port: 8804, lane: "pi", startedAt: Date.now() - 60_000 });
+        registerInstanceAndWarn(W, () => {});
+        registerInstanceAndWarn(A, () => {});
+        let spawnCalls = 0;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi" },
+            {
+                spawnImpl: () => {
+                    spawnCalls++;
+                    return makeFakeChild(42471);
+                },
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async (origin) => ({ ok: true, instanceId: origin.endsWith("8803") ? "inst-W" : "inst-A2" }),
+                readInstanceFile: () => W,
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(spawnCalls, 0);
+        assert.equal(handle.attached, true);
+        assert.equal(handle.origin, A.origin, "same declared lane beats a wildcard even when the wildcard is newer");
+    } finally {
+        unregisterInstance("inst-W");
+        unregisterInstance("inst-A2");
+        st.restore();
+    }
+});
+
+test("ensureProxyRunning: stale instance file still finds a live wildcard daemon via the registry (#1232)", async () => {
+    const st = isoStateDir();
+    try {
+        const W = liveRegistryInstance({ instanceId: "inst-W3", origin: "http://127.0.0.1:8805", port: 8805 });
+        registerInstanceAndWarn(W, () => {});
+        let spawnCalls = 0;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi" },
+            {
+                spawnImpl: () => {
+                    spawnCalls++;
+                    return makeFakeChild(42472);
+                },
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async (origin) => (origin.endsWith("8805") ? { ok: true, instanceId: "inst-W3" } : undefined),
+                readInstanceFile: () => recordedInstance({ instanceId: "inst-dead", origin: "http://127.0.0.1:8806", port: 8806, pid: 4_000_000 }),
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(spawnCalls, 0, "registry discovery must recover the live daemon instead of doubling it");
+        assert.equal(handle.attached, true);
+        assert.equal(handle.origin, W.origin);
+    } finally {
+        unregisterInstance("inst-W3");
+        st.restore();
+    }
 });
 
 test("ensureProxyRunning: active starting marker of a different lane → spawns immediately, does not wait (#1225)", async () => {

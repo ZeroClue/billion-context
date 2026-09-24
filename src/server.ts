@@ -76,7 +76,7 @@ import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError } from "./logger.js";
 import { configFile, defaultLogFile, dumpsDir, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, entryScriptFingerprint, isPidAlive, registerInstanceAndWarn, unregisterInstance } from "./instance.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, entryScriptFingerprint, isPidAlive, registerInstanceAndWarn, unregisterInstance, type ProxyInstanceFile } from "./instance.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
@@ -482,31 +482,35 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // so the file always holds a valid URL.
         const originHost = opts.host === "0.0.0.0" || opts.host === "::" || opts.host === "localhost" ? "127.0.0.1" : opts.host.includes(":") && !opts.host.startsWith("[") ? `[${opts.host}]` : opts.host;
         const origin = `http://${originHost}:${actualPort}`;
+        const instanceRecord: ProxyInstanceFile = {
+            origin,
+            instanceId,
+            pid: process.pid,
+            startedAt: instanceStartedAt,
+            host: opts.host,
+            port: actualPort,
+            passthrough: opts.passthrough,
+            mitmDomains: opts.mitm.enabled ? opts.mitm.domains : [],
+            modelWindows: { ...LAUNCHER_MODEL_WINDOWS },
+            modelMaxOutputs: Object.keys(LAUNCHER_MODEL_MAX_OUTPUTS).length > 0 ? { ...LAUNCHER_MODEL_MAX_OUTPUTS } : undefined,
+            launchToken: launchToken || undefined,
+            lane: launcherLane,
+            codeFingerprint: ownFingerprint,
+        };
         try {
             fs.mkdirSync(stateDir(), { recursive: true });
             hydratePrefixAffinity();
-            atomicWriteInstanceFile({
-                origin,
-                instanceId,
-                pid: process.pid,
-                startedAt: instanceStartedAt,
-                host: opts.host,
-                port: actualPort,
-                passthrough: opts.passthrough,
-                mitmDomains: opts.mitm.enabled ? opts.mitm.domains : [],
-                modelWindows: { ...LAUNCHER_MODEL_WINDOWS },
-                modelMaxOutputs: Object.keys(LAUNCHER_MODEL_MAX_OUTPUTS).length > 0 ? { ...LAUNCHER_MODEL_MAX_OUTPUTS } : undefined,
-                launchToken: launchToken || undefined,
-                lane: launcherLane,
-                codeFingerprint: ownFingerprint,
-            });
+            atomicWriteInstanceFile(instanceRecord);
         } catch {
             // best-effort discovery hint for host-spawned MCP shells
         }
-        registerInstanceAndWarn(
-            { instanceId, pid: process.pid, port: actualPort, origin, startedAt: instanceStartedAt },
-            (msg) => log("warn", `[instances] ${msg}`),
-        );
+        // #1232: the registry marker carries the same identity (minus the
+        // launcher-private launchToken) so lane-aware attach discovery and
+        // the #394 warning can reason about EVERY live instance — the single
+        // proxy-origin file only reflects the last writer.
+        const registryRecord = { ...instanceRecord };
+        delete registryRecord.launchToken;
+        registerInstanceAndWarn(registryRecord, (msg) => log("warn", `[instances] ${msg}`));
         const nOverrides = Object.keys(opts.routes).length;
         log(
             "info",

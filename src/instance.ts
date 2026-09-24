@@ -261,6 +261,18 @@ interface RegistryEntry {
     port: number;
     origin: string;
     startedAt: number;
+    /** #1232: identity fields mirroring the proxy-origin record (minus the
+     *  launcher-private launchToken) — lane-aware attach discovery and the
+     *  lane-aware #394 warning need them for EVERY live instance, not just
+     *  the last writer of the single proxy-origin file. Absent in markers
+     *  written by pre-#1232 builds → wildcard lane / never-attachable. */
+    host?: string;
+    passthrough?: boolean;
+    mitmDomains?: string[];
+    modelWindows?: Record<string, number>;
+    modelMaxOutputs?: Record<string, number>;
+    lane?: string;
+    codeFingerprint?: string;
 }
 
 /** Cross-instance liveness registry (#394/#527): one marker file per instance
@@ -301,12 +313,33 @@ function coerceEntry(value: unknown): RegistryEntry | undefined {
     if (!value || typeof value !== "object") return undefined;
     const o = value as Record<string, unknown>;
     if (typeof o.instanceId !== "string" || o.instanceId === "") return undefined;
+    const windows: Record<string, number> = {};
+    if (o.modelWindows && typeof o.modelWindows === "object") {
+        for (const [k, v] of Object.entries(o.modelWindows as Record<string, unknown>)) {
+            const n = Number(v);
+            if (Number.isFinite(n) && n > 0) windows[k] = n;
+        }
+    }
+    const maxOutputs: Record<string, number> = {};
+    if (o.modelMaxOutputs && typeof o.modelMaxOutputs === "object") {
+        for (const [k, v] of Object.entries(o.modelMaxOutputs as Record<string, unknown>)) {
+            const n = Number(v);
+            if (Number.isFinite(n) && n > 0) maxOutputs[k] = n;
+        }
+    }
     return {
         instanceId: o.instanceId,
         pid: typeof o.pid === "number" ? o.pid : 0,
         port: typeof o.port === "number" ? o.port : 0,
         origin: typeof o.origin === "string" ? o.origin : "",
         startedAt: typeof o.startedAt === "number" ? o.startedAt : 0,
+        ...(typeof o.host === "string" && o.host !== "" ? { host: o.host } : {}),
+        ...(typeof o.passthrough === "boolean" ? { passthrough: o.passthrough } : {}),
+        ...(Array.isArray(o.mitmDomains) ? { mitmDomains: o.mitmDomains.map(String) } : {}),
+        ...(Object.keys(windows).length > 0 ? { modelWindows: windows } : {}),
+        ...(Object.keys(maxOutputs).length > 0 ? { modelMaxOutputs: maxOutputs } : {}),
+        ...(typeof o.lane === "string" && o.lane !== "" ? { lane: o.lane } : {}),
+        ...(typeof o.codeFingerprint === "string" && o.codeFingerprint !== "" ? { codeFingerprint: o.codeFingerprint } : {}),
     };
 }
 
@@ -354,17 +387,56 @@ function reapDeadMarkers(ours: string): void {
     }
 }
 
+/** #1232: two instances' lanes overlap iff either is undeclared (a manual
+ *  `bili start` daemon can serve ANY client, so it shares every lane's
+ *  hazard) or both declare the same lane. Different declared lanes serve
+ *  disjoint clients/conversations — concurrent use there is legitimate and
+ *  must not trigger the "stop one" advice. */
+function lanesOverlap(a: string | undefined, b: string | undefined): boolean {
+    return a === undefined || b === undefined || a === b;
+}
+
 export function registerInstanceAndWarn(entry: RegistryEntry, warn: (msg: string) => void): void {
     const others = readAllRegistryEntries().filter((e) => e.instanceId !== entry.instanceId && isPidAlive(e.pid));
     for (const other of others) {
+        if (!lanesOverlap(entry.lane, other.lane)) continue;
+        const laneNote = entry.lane !== undefined && other.lane !== undefined ? ` on lane "${entry.lane}"` : "";
         warn(
-            `another bili instance is running (pid ${other.pid}, ${other.origin}) — both processes will write the same sessions directory; stop one to avoid state pollution (#394)`,
+            `another bili instance is running (pid ${other.pid}, ${other.origin})${laneNote} — both processes will write the same sessions directory; stop one to avoid state pollution (#394)`,
         );
     }
     reapDeadMarkers(entry.instanceId);
     try {
         atomicWriteJson(entry, registryEntryFile(entry.instanceId));
     } catch {}
+}
+
+/** #1232: every LIVE registered instance as a full identity record. The
+ *  single proxy-origin file is last-writer-wins and cannot represent
+ *  per-lane proxies (#1225/#1231); the registry IS the directory listing,
+ *  so it is the authoritative multi-instance view behind attach decisions.
+ *  Dead owners are skipped here (reaped lazily on the next registration).
+ *  Markers from pre-#1232 builds carry no fingerprint → never attachable. */
+export function discoverLiveInstances(): ProxyInstanceFile[] {
+    const out: ProxyInstanceFile[] = [];
+    for (const e of readAllRegistryEntries()) {
+        if (!isPidAlive(e.pid)) continue;
+        out.push({
+            origin: e.origin,
+            instanceId: e.instanceId,
+            pid: e.pid,
+            startedAt: e.startedAt,
+            host: e.host ?? "",
+            port: e.port,
+            passthrough: Boolean(e.passthrough),
+            mitmDomains: e.mitmDomains ?? [],
+            modelWindows: e.modelWindows ?? {},
+            modelMaxOutputs: e.modelMaxOutputs,
+            lane: e.lane,
+            codeFingerprint: e.codeFingerprint,
+        });
+    }
+    return out;
 }
 
 /** Unlinks only our own marker; cannot clobber another instance's entry (#527). */

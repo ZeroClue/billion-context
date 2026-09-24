@@ -38,6 +38,7 @@ import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
 import {
     claimStartingMarker,
     clearStartingMarker,
+    discoverLiveInstances,
     entryScriptFingerprint,
     isPidAlive,
     isProxyInstanceFile,
@@ -2422,17 +2423,56 @@ function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions, codeFi
     return maxKeys.every((k) => (inst.modelMaxOutputs ?? {})[k] === wantMax[k]);
 }
 
-async function probeExistingInstance(
+/** #1232: every healthy live instance — not just the last writer of the
+ *  single proxy-origin file. With per-lane proxies (#1225/#1231) that file
+ *  points at whichever instance registered LAST, which may be another
+ *  client's, so the attach decision unions the file view with the
+ *  multi-instance registry (every instance self-registers on startup) and
+ *  health-probes each candidate in parallel. */
+async function probeLiveInstances(
     readInstance: () => ProxyInstanceFile | { origin: string } | undefined,
     fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
-): Promise<ProxyInstanceFile | undefined> {
+): Promise<ProxyInstanceFile[]> {
+    const seen = new Map<string, ProxyInstanceFile>();
     const inst = readInstance();
-    if (!isProxyInstanceFile(inst)) return undefined;
-    if (!isPidAlive(inst.pid)) return undefined;
-    const health = await fetchHealthInfo(inst.origin);
-    if (!health || !health.ok) return undefined;
-    if (health.instanceId !== undefined && health.instanceId !== inst.instanceId) return undefined;
-    return inst;
+    if (isProxyInstanceFile(inst)) seen.set(inst.instanceId || inst.origin, inst);
+    for (const live of discoverLiveInstances()) seen.set(live.instanceId || live.origin, live);
+    const checked = await Promise.all(
+        [...seen.values()].map(async (c): Promise<ProxyInstanceFile | undefined> => {
+            if (!isPidAlive(c.pid)) return undefined;
+            const health = await fetchHealthInfo(c.origin);
+            if (!health || !health.ok) return undefined;
+            if (health.instanceId !== undefined && health.instanceId !== c.instanceId) return undefined;
+            return c;
+        }),
+    );
+    return checked.filter((c): c is ProxyInstanceFile => c !== undefined);
+}
+
+/** #1232: choose the attach target among healthy candidates. Must be
+ *  compatible (code fingerprint + config shape + lane rules) and, under
+ *  strictPort, bound to our exact port. Same declared lane beats wildcard —
+ *  concurrent same-lane launches must converge on the lane's own instance,
+ *  not a general-purpose daemon either could use — newest within class. */
+function pickAttachable(
+    candidates: ProxyInstanceFile[],
+    opts: LaunchOptions,
+    codeFingerprint?: string,
+): ProxyInstanceFile | undefined {
+    let best: ProxyInstanceFile | undefined;
+    let bestClass = 2;
+    let bestStartedAt = Number.NEGATIVE_INFINITY;
+    for (const c of candidates) {
+        if (!instanceCompatible(c, opts, codeFingerprint)) continue;
+        if (opts.strictPort && c.port !== opts.port) continue;
+        const cls = opts.lane !== undefined && c.lane === opts.lane ? 0 : 1;
+        if (cls < bestClass || (cls === bestClass && c.startedAt > bestStartedAt)) {
+            best = c;
+            bestClass = cls;
+            bestStartedAt = c.startedAt;
+        }
+    }
+    return best;
 }
 
 /** #707: wait for another launcher's in-flight bring-up to produce a live
@@ -2446,17 +2486,21 @@ async function waitForStarterInstance(
     fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
     now: () => number,
     sleepImpl: (ms: number) => Promise<void>,
+    opts: LaunchOptions,
+    codeFingerprint?: string,
 ): Promise<ProxyInstanceFile | undefined> {
     const deadline = now() + SPAWN_WAIT_MS;
+    const probe = async (): Promise<ProxyInstanceFile | undefined> =>
+        pickAttachable(await probeLiveInstances(readInstance, fetchHealthInfo), opts, codeFingerprint);
     let inst: ProxyInstanceFile | undefined;
     while (now() < deadline) {
         await sleepImpl(HEALTH_POLL_INTERVAL_MS);
-        inst = await probeExistingInstance(readInstance, fetchHealthInfo);
+        inst = await probe();
         if (inst) break;
         const still = readStartingMarker();
         if (!still || !isStartingMarkerActive(still, now())) break;
     }
-    return inst ?? (await probeExistingInstance(readInstance, fetchHealthInfo));
+    return inst ?? (await probe());
 }
 
 export function findFreePort(preferred: number, host = LAUNCHER_DEFAULT_HOST): Promise<number> {
@@ -2607,12 +2651,15 @@ export async function ensureProxyRunning(
     // #394/#417: a healthy proxy with a compatible config is SHARED, not
     // doubled — two concurrent launches of the same client would otherwise
     // spawn two writers over one sessions dir. #1225 tightens "compatible":
-    // same code AND same declared lane, not just same config shape.
-    const existing = await probeExistingInstance(readInstance, fetchHealthInfo);
-    if (existing && instanceCompatible(existing, opts, codeFingerprint) && (!opts.strictPort || existing.port === opts.port)) {
-        // strictPort (#964): the client dials a STATIC url — attaching to a
-        // healthy proxy on a DIFFERENT port would strand every request. Only
-        // an instance already bound to the exact port may be shared.
+    // same code AND same declared lane, not just same config shape. #1232:
+    // candidates come from every live registry entry, not only the last
+    // writer of the single proxy-origin file (that pointer can belong to
+    // another client's per-lane proxy).
+    const existing = pickAttachable(await probeLiveInstances(readInstance, fetchHealthInfo), opts, codeFingerprint);
+    if (existing) {
+        // strictPort (#964) is enforced inside pickAttachable: the client
+        // dials a STATIC url — attaching to a healthy proxy on a DIFFERENT
+        // port would strand every request.
         return attachTo(existing);
     }
 
@@ -2623,8 +2670,8 @@ export async function ensureProxyRunning(
     // (singleFlight, #706); this is the cross-process half.
     const waitForOtherStarter = async (): Promise<ProxyHandle | undefined> => {
         console.error("bili: another bili launch is bringing up a proxy — waiting for it instead of spawning a second");
-        const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl);
-        if (waited && instanceCompatible(waited, opts, codeFingerprint)) {
+        const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl, opts, codeFingerprint);
+        if (waited) {
             return attachTo(waited);
         }
         // starter failed/timed out (or incompatible config) — caller falls
