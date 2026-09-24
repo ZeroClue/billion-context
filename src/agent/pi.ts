@@ -186,7 +186,7 @@ function noProxyWarning(agent: string): string {
 
 const RETRY_INTERVAL_MS = 10000;
 
-type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; retryIntervalMs: number };
+type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; retryIntervalMs: number; manifestPrime?: { base: string; tools: Promise<ManifestTool[] | undefined> } };
 
 // omp never emits before_provider_headers, so the x-bili-plugin marker cannot
 // be stamped per request. Register the conversation id once (after tools are
@@ -214,13 +214,22 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
     if (state.retryAt !== undefined && Date.now() < state.retryAt) return;
     const wait = state.retryIntervalMs;
     state.pending = (async () => {
-        let tools: ManifestTool[];
-        try {
-            tools = await fetchManifest(proxyBase);
-        } catch (err) {
-            state.retryAt = Date.now() + wait;
-            console.error(`bili-plugin(${agent}): manifest fetch failed: ${err instanceof Error ? err.message : String(err)} — retrying in ${wait / 1000}s`);
-            return;
+        // #1217: consume the load-time manifest prime (see factory). It is
+        // taken exactly once and only for the same proxy origin; a failed
+        // prime resolves to undefined and falls through to the normal fetch
+        // below (same failure path, same log, then retry-throttled).
+        let tools: ManifestTool[] | undefined;
+        const prime = state.manifestPrime;
+        state.manifestPrime = undefined;
+        if (prime !== undefined && prime.base === proxyBase) tools = await prime.tools;
+        if (tools === undefined) {
+            try {
+                tools = await fetchManifest(proxyBase);
+            } catch (err) {
+                state.retryAt = Date.now() + wait;
+                console.error(`bili-plugin(${agent}): manifest fetch failed: ${err instanceof Error ? err.message : String(err)} — retrying in ${wait / 1000}s`);
+                return;
+            }
         }
         try {
             // toolsFor (not sid) guards the register loop: a retry after a
@@ -266,6 +275,18 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
     return function biliPlugin(pi: ExtensionAPI): void {
         const agent = agentName(agentOverride);
         const state: RegisterState = { retryIntervalMs: opts?.retryIntervalMs ?? RETRY_INTERVAL_MS };
+        // #1217: -p single-shot fires round 1 before session_start's manifest
+        // fetch can resolve, leaving the request unmarked → anonymous
+        // proxy-mode session. Prime the fetch at load time: the launcher
+        // health-checks the proxy before spawning pi, so by session_start the
+        // prime has almost always settled and toolsReady flips in microtasks
+        // — ahead of round 1. Native mode (#519) sets BILLION_CONTEXT_PROXY
+        // only after async bootstrap, so no prime exists there and round 1
+        // stays on wire mode (residual; the host would have to await us).
+        const primeBase = detectProxyBase(undefined);
+        if (primeBase !== undefined) {
+            state.manifestPrime = { base: primeBase, tools: fetchManifest(primeBase).then((t) => t, () => undefined) };
+        }
         // #535: file-free routing — override provider baseUrls at load from
         // the launcher-passed manifest (see buildPiEnv). registerProvider is
         // queued during initial extension load and applied before any model
@@ -466,19 +487,29 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 },
             });
         }
-        pi.on("before_provider_headers", (event, ctx) => {
+        pi.on("before_provider_headers", async (event, ctx) => {
             try {
                 if (proxyBaseForCtx(ctx) === undefined) return;
                 const headers = (event as unknown as { headers?: Record<string, string> }).headers;
                 if (headers === undefined || typeof headers !== "object" || Array.isArray(headers)) return;
+                // #1214: pi's runner AWAITS async handlers (emitBeforeProviderHeaders),
+                // so the ownership claim serializes behind tool registration instead
+                // of racing it. A one-shot (`pi -p`) dispatches exactly ONE request —
+                // with fire-and-forget registration it rode wire mode forever and
+                // bound as an anonymous pfa session. registerTools is idempotent
+                // (sid-cached, pending-deduped, retryAt-throttled), so the await is
+                // bounded; a permanently failing manifest fetch still degrades to
+                // wire mode — a graceful fallback rather than a tool-less session.
+                try {
+                    await registerTools(pi, ctx, state, agent);
+                } catch (err) {
+                    console.error(`bili-plugin(${agent}): tool registration failed (${err instanceof Error ? err.message : String(err)}) — riding wire mode for this request`);
+                }
                 // The x-bili-plugin marker tells the proxy "the client owns the
-                // ACP tools natively — skip wire-level injection". Stamping it
-                // before registerTools() finishes would send round 1 out with
-                // NO ACP tools (the first provider request races the manifest
-                // fetch). Claim ownership only once tools are registered;
-                // until then the request rides the proxy's wire mode. A
-                // permanently failing manifest fetch keeps us in wire mode —
-                // a graceful fallback rather than a tool-less session.
+                // ACP tools natively — skip wire-level injection". Ownership is
+                // claimed only once tools are registered (#162). In launcher mode
+                // the manifest fetch is primed at extension load time (#1217), so
+                // by round 1 registration has almost always completed.
                 if (state.toolsReady === true) {
                     const sid = sessionIdOf(ctx);
                     if (sid !== undefined) headers["x-bili-plugin-conversation"] = sid;
@@ -501,7 +532,6 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             } catch (err) {
                 console.error(`bili-plugin(${agent}): header stamp skipped (${err instanceof Error ? err.message : String(err)})`);
             }
-            void registerTools(pi, ctx, state, agent).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
         });
         // omp never emits before_provider_headers — where pi stamps the
         // x-bili-plugin-* headers and reports runtime info (#955) — so omp's
@@ -516,11 +546,26 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             const maxOut = (ctx.model as { maxTokens?: unknown } | undefined)?.maxTokens;
             reportRuntimeInfoOnChange(proxyBaseForCtx(ctx), { agent, model: modelId, contextWindow: typeof window === "number" && window > 0 ? Math.floor(window) : undefined, maxOutput: typeof maxOut === "number" && maxOut > 0 ? Math.floor(maxOut) : undefined, baseURL: ctx.model?.baseUrl, source: "client-config" });
         }
-        pi.on("before_provider_request", (event, ctx) => {
+        pi.on("before_provider_request", async (event, ctx) => {
             // omp emits this per model request (but never before_provider_headers);
             // it doubles as the retry driver when the session_start manifest
             // fetch raced the proxy startup. Cached by sid, throttled by retryAt.
-            void registerTools(pi, ctx, state, agent).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
+            // #1230: omp's runner also AWAITS async handlers (emitBeforeProviderRequest)
+            // and uses the resolved value as the outgoing payload — so the plugin-mode
+            // claim serializes behind tool registration instead of racing it. For omp
+            // the claim is the identity registration that runs INSIDE registerTools
+            // (after the manifest fetch): a one-shot (`omp -p`) dispatches exactly ONE
+            // request, and with fire-and-forget registration it left before the proxy
+            // saw the conversation id — bound as an anonymous pfa session, rode proxy
+            // mode forever, no round 2 to self-heal. registerTools is idempotent
+            // (sid-cached, pending-deduped, retryAt-throttled), so the await is bounded
+            // (worst case = manifest fetch + identity POST timeouts); a permanently
+            // failing manifest fetch still degrades to wire mode.
+            try {
+                await registerTools(pi, ctx, state, agent);
+            } catch (err) {
+                console.error(`bili-plugin(${agent}): tool registration failed (${err instanceof Error ? err.message : String(err)}) — riding wire mode for this request`);
+            }
             if (agent === "omp") reportOmpRuntimeInfo(ctx);
             return stampPromptCacheKey(event, ctx, agent);
         });

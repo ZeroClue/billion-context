@@ -615,6 +615,48 @@ function disabledOptionalToolNote(tool: string, session: Session, config: Config
 
 /** Context-level visibility for plugin UIs (status bars / slash commands):
  *  the same usage the nudge decision sees, keyed by conversation id. */
+// #1218: last chain/content-fallback verdict per conversation. A session
+// judged an external chain is passed through WITHOUT creating local state,
+// so /acp's no-session answer must be able to say WHY there is no session
+// instead of the misleading armed-idle notice. Keyed by the conversation id
+// the request carried (client header value or anonymous pfa id); `at` is
+// refreshed on every passthrough; bounded FIFO like the warn-once set it
+// replaces (server.ts).
+export interface ChainVerdict {
+    at: number;
+    kind: string;
+    protocol: string;
+}
+const chainVerdicts = new Map<string, ChainVerdict>();
+export const WARNED_CHAIN_SESSION_CAP = 4096;
+/** Records a passthrough verdict; returns true when this is the FIRST verdict
+ *  for the session (drives the once-per-session [chain] warn in server.ts). */
+export function recordChainVerdict(sessionId: string, kind: string, protocol: string): boolean {
+    const first = !chainVerdicts.has(sessionId);
+    chainVerdicts.set(sessionId, { at: Date.now(), kind, protocol });
+    if (chainVerdicts.size > WARNED_CHAIN_SESSION_CAP) {
+        chainVerdicts.delete(chainVerdicts.keys().next().value as string);
+    }
+    return first;
+}
+export function chainVerdictFor(conversationId: string): ChainVerdict | undefined {
+    return chainVerdicts.get(conversationId);
+}
+export function _resetChainVerdictsForTest(): void {
+    chainVerdicts.clear();
+}
+export function _chainVerdictMapForTest(): Map<string, ChainVerdict> {
+    return chainVerdicts;
+}
+
+/** #1218: the /acp panel rendered when a conversation is being passed through
+ *  unprocessed. Every /acp surface (pi / dsh / opencode) displays `panel`
+ *  verbatim, so the server renders the verdict once and all clients show it
+ *  without agent-side changes. */
+function chainPassthroughPanel(v: ChainVerdict): string {
+    return `⚠️ billion-context: this conversation is being PASSED THROUGH UNPROCESSED — judged an external bili chain by the content fallback (evidence: ${v.kind}, protocol ${v.protocol}). No local compression session exists, so compression is silently disabled for this conversation. Last passthrough: ${new Date(v.at).toISOString()}. If this is your own client, disable the content fallback (chainContentDetection=false, env BILI_CHAIN_CONTENT=0); see the [chain] warn in the bili log.`;
+}
+
 export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false): void {
     const { session: resolvedSession, entry } = resolveConversation(conversationId);
     let session = resolvedSession;
@@ -637,6 +679,17 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         }
     }
     if (!session) {
+        // #1218: a chain/content-fallback verdict for THIS conversation means
+        // requests ARE arriving — passed through unprocessed — so the
+        // armed-idle notice would mislead ("no model request yet" is false).
+        // Answer 200 with a renderable panel; `phase` exposes the state for
+        // programmatic consumers.
+        const verdict = chainVerdictFor(conversationId);
+        if (verdict !== undefined) {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, conversationId, phase: "chain-passthrough", chain: verdict, panel: chainPassthroughPanel(verdict) }));
+            return;
+        }
         // Runtime-info protocol (#955): no session exists yet, but the client
         // may have reported its model config at bootstrap — answer from the
         // agent-keyed runtime table so /acp works pre-first-request. Clients

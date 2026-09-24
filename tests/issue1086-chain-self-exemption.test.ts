@@ -303,6 +303,64 @@ test("#1086 T3: foreign artifacts without local state pass through byte-identica
     }
 });
 
+test("#1218: /acp explains chain passthrough instead of the armed-idle notice", async () => {
+    // Same shape as T3: a session whose requests are judged an external chain
+    // is passed through with NO local state. /acp (plugin status) must surface
+    // WHY there is no session — the user sees "PASSED THROUGH" with the escape
+    // valve, not "no model request yet" (#1218 repro).
+    const dir = mkdtempSync(join(tmpdir(), "bili-chain-1218-"));
+    const store = new SessionStore({ dir, debounceMs: 5, enabled: true });
+    _setStoreForTest(store);
+    _resetSessionsForTest();
+    _resetChainWarningsForTest();
+    setRegistryForTest({});
+    const captured: Captured[] = [];
+    const upstream = makeUpstream(captured);
+    upstream.listen(0, "127.0.0.1");
+    await listen(upstream);
+    const proxy = await startServer(makeOpts(`http://127.0.0.1:${(upstream.address() as { port: number }).port}`));
+    await listen(proxy);
+    try {
+        const resp = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "chain-exp-1" },
+            body: incidentBody(),
+        });
+        assert.equal(resp.status, 200);
+        await resp.text();
+        assert.equal(peekSession("chain-exp-1"), undefined, "passthrough leaves no session");
+        const probe = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/__bili/plugin/status?conversationId=chain-exp-1`);
+        const probeBody = await probe.text();
+        assert.equal(probe.status, 200, `status probe failed: ${probeBody.slice(0, 200)}`);
+        const status = JSON.parse(probeBody) as { ok: boolean; conversationId: string; phase: string; chain: { at: number; kind: string; protocol: string }; panel: string };
+        assert.equal(status.ok, true);
+        assert.equal(status.conversationId, "chain-exp-1");
+        assert.equal(status.phase, "chain-passthrough");
+        assert.equal(typeof status.chain.kind, "string");
+        assert.ok(status.chain.kind.length > 0, "verdict carries the evidence kind");
+        assert.equal(status.chain.protocol, "openai");
+        assert.ok(status.panel.includes("PASSED THROUGH UNPROCESSED"), `panel explains the passthrough (got: ${status.panel.slice(0, 120)}…)`);
+        assert.ok(status.panel.includes("chainContentDetection=false"), "panel points at the escape valve");
+        // A conversation with NO verdict keeps the pre-#1218 answer shape —
+        // the new branch must not hijack unrelated probes.
+        const clean = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/__bili/plugin/status?conversationId=never-seen`);
+        // Pre-existing shape: an unknown conversation keeps the 404
+        // "unknown plugin conversation" answer (clients render it as the
+        // armed-idle notice) — the new branch must not hijack unrelated probes.
+        assert.equal(clean.status, 404);
+        const cleanStatus = JSON.parse(await clean.text()) as { ok: boolean; phase?: string };
+        assert.equal(cleanStatus.ok, false);
+        assert.notEqual(cleanStatus.phase, "chain-passthrough");
+    } finally {
+        proxy.closeAllConnections?.();
+        await close(proxy);
+        upstream.closeAllConnections?.();
+        await close(upstream);
+        store.cancelAll();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 test("#1086 T4: chainContentDetection=false disables the content fallback entirely", async () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     _resetSessionsForTest();
@@ -612,7 +670,7 @@ test("#1101 T8: warn-set FIFO evicts the oldest session once past the cap", asyn
     await listen(proxy);
     try {
         const warnSet = _chainWarnSetForTest();
-        for (let i = 0; i < WARNED_CHAIN_SESSION_CAP; i++) warnSet.add(`pad-${i}`);
+        for (let i = 0; i < WARNED_CHAIN_SESSION_CAP; i++) warnSet.set(`pad-${i}`, { at: 0, kind: "tags", protocol: "openai" });
         const raw = incidentBody();
         const resp = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/v1/chat/completions`, {
             method: "POST",
@@ -654,5 +712,203 @@ test("#1101 T9: BILI_CHAIN_CONTENT env parse — default ON, 0 disables, env win
     } finally {
         if (prevFile === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevFile;
         rmSync(root, { recursive: true, force: true });
+    }
+});
+
+// #1197: tag-shaped text in the SYSTEM section is client-authored context
+// (AGENTS.md/CLAUDE.md/README quoting the wire format — the billion-context
+// repo itself carries literal examples), never bili compression output:
+// render tags and the re-voiced acp_summary always live in HISTORY items.
+test("#1197 detector: tags in system/developer/instructions are NOT artifacts", () => {
+    const realTag = "\x3cacp tokens=\"59\" type=\"text\"\x3em00001\x3c/acp\x3e";
+
+    const openaiSystem = { model: MODEL, messages: [
+        { role: "system", content: `Project rules — refs look like ${realTag}` },
+        { role: "user", content: "reply 1234" },
+    ] };
+    assert.ok(artifactSeedHit(Buffer.from(JSON.stringify(openaiSystem))), "byte pre-filter still hits");
+    assert.equal(detectAcpArtifacts(Buffer.from(JSON.stringify(openaiSystem)), openaiSystem), null, "openai system-role tags must not read as chain evidence");
+
+    const developer = { model: MODEL, messages: [
+        { role: "developer", content: `wire examples: ${realTag}` },
+        { role: "user", content: "hi" },
+    ] };
+    assert.equal(detectAcpArtifacts(Buffer.from(JSON.stringify(developer)), developer), null, "developer-role tags are context, not artifacts");
+
+    const anthropicSystem = { model: MODEL, system: [{ type: "text", text: `docs quote ${realTag}` }], messages: [{ role: "user", content: "hi" }] };
+    assert.equal(detectAcpArtifacts(Buffer.from(JSON.stringify(anthropicSystem)), anthropicSystem), null, "anthropic top-level system is never scanned");
+
+    const responsesInstructions = { model: MODEL, instructions: `format: ${realTag}`, input: [{ type: "message", role: "user", content: "hi" }] };
+    assert.equal(detectAcpArtifacts(Buffer.from(JSON.stringify(responsesInstructions)), responsesInstructions), null, "responses instructions is never scanned");
+});
+
+test("#1197 detector: tags in HISTORY still are artifacts (tool results, user messages)", () => {
+    const realTag = "\x3cacp tokens=\"1.2K\" type=\"text\"\x3em00042\x3c/acp\x3e";
+    const toolResult = { model: MODEL, messages: [
+        { role: "user", content: "compress please" },
+        { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "compress", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "c1", content: `blocks folded ${realTag}` },
+    ] };
+    assert.equal(detectAcpArtifacts(Buffer.from(JSON.stringify(toolResult)), toolResult), "tags", "tool-result tags (plugin compress replay) remain detectable");
+
+    const userMsg = { model: MODEL, messages: [{ role: "user", content: `folded ${realTag}` }] };
+    assert.equal(detectAcpArtifacts(Buffer.from(JSON.stringify(userMsg)), userMsg), "tags", "history-message tags remain detectable");
+});
+
+// The exact #1197 incident: a fresh session whose system prompt carries literal
+// tag examples from the project's AGENTS.md (cwd = a billion-context checkout)
+// used to be verdict-ed into permanent passthrough — /acp stuck on armed-idle
+// and the whole session ran uncompressed.
+test("#1197 T10: system-prompt tags on a fresh plain-client session are processed, not judged a chain", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-chain-t10-"));
+    const store = new SessionStore({ dir, debounceMs: 5, enabled: true });
+    _setStoreForTest(store);
+    _resetSessionsForTest();
+    _resetChainWarningsForTest();
+    setRegistryForTest({});
+    const logs: LogRec[] = [];
+    setLogCapture((level, msg) => logs.push({ level, msg }));
+    const captured: Captured[] = [];
+    const upstream = makeUpstream(captured);
+    upstream.listen(0, "127.0.0.1");
+    await listen(upstream);
+    const proxy = await startServer(makeOpts(`http://127.0.0.1:${(upstream.address() as { port: number }).port}`));
+    await listen(proxy);
+    try {
+        const realTag = "\x3cacp tokens=\"59\" type=\"text\"\x3em00001\x3c/acp\x3e";
+        const raw = JSON.stringify({
+            model: MODEL,
+            stream: false,
+            messages: [
+                { role: "system", content: `# Project docs\nRef anchors ${realTag} in summaries.` },
+                { role: "user", content: "reply with exactly: 1234" },
+            ],
+        });
+        const resp = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "ctx-1" },
+            body: raw,
+        });
+        assert.equal(resp.status, 200);
+        await resp.text();
+        assert.equal(captured.length, 1);
+        assert.notEqual(sha(captured[0]!.body), sha(raw), "#1197: context-file tags must go through the kernel, not raw passthrough");
+        assert.equal(chainWarns(logs, "ctx-1").length, 0, "no chain warning for client-authored system content");
+        assert.equal(peekSession("ctx-1")?.stats.requests, 1, "session must be created and processed");
+    } finally {
+        setLogCapture(null);
+        proxy.closeAllConnections?.();
+        await close(proxy);
+        upstream.closeAllConnections?.();
+        await close(upstream);
+        store.cancelAll();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// A cooperative plugin's protocol re-sends its compression artifacts (compress
+// tool call + result in history) by design; the announcement header outranks
+// content-shape evidence, so a resumed plugin session is processed even when
+// this instance holds no state for it.
+test("#1197 T11: plugin-announced request with history artifacts is processed, not judged a chain", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-chain-t11-"));
+    const store = new SessionStore({ dir, debounceMs: 5, enabled: true });
+    _setStoreForTest(store);
+    _resetSessionsForTest();
+    _resetChainWarningsForTest();
+    setRegistryForTest({});
+    const logs: LogRec[] = [];
+    setLogCapture((level, msg) => logs.push({ level, msg }));
+    const captured: Captured[] = [];
+    const upstream = makeUpstream(captured);
+    upstream.listen(0, "127.0.0.1");
+    await listen(upstream);
+    const proxy = await startServer(makeOpts(`http://127.0.0.1:${(upstream.address() as { port: number }).port}`));
+    await listen(proxy);
+    try {
+        const raw = incidentBody();
+        const resp = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/v1/chat/completions`, {
+            method: "POST",
+            headers: {
+                "content-type": "application/json",
+                "x-acp-session": "plug-1",
+                "x-bili-plugin": "pi",
+                "x-bili-plugin-conversation": "plug-1",
+            },
+            body: raw,
+        });
+        assert.equal(resp.status, 200);
+        await resp.text();
+        assert.equal(captured.length, 1);
+        assert.notEqual(sha(captured[0]!.body), sha(raw), "#1197: plugin-announced replay must be rebuilt by the kernel, not passed through");
+        assert.equal(chainWarns(logs, "plug-1").length, 0, "no chain warning for a cooperative plugin's own replay");
+        assert.equal(peekSession("plug-1")?.stats.requests, 1, "session must be created (plugin binding) and processed");
+    } finally {
+        setLogCapture(null);
+        proxy.closeAllConnections?.();
+        await close(proxy);
+        upstream.closeAllConnections?.();
+        await close(upstream);
+        store.cancelAll();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// Review of #1213: T3 pins the #1086 fallback for the TOOL-HISTORY family at
+// server level, but nothing pinned it for the TAGS family — the exact family
+// this PR re-scopes. A non-cooperative client whose HISTORY carries real
+// render tags must still be judged a chain when this instance holds no state
+// for it: byte-identical passthrough, one warn, no session record.
+test("#1197 T12: foreign client with tags in HISTORY passes through byte-identical, one warn, no state", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-chain-t12-"));
+    const store = new SessionStore({ dir, debounceMs: 5, enabled: true });
+    _setStoreForTest(store);
+    _resetSessionsForTest();
+    _resetChainWarningsForTest();
+    setRegistryForTest({});
+    const logs: LogRec[] = [];
+    setLogCapture((level, msg) => logs.push({ level, msg }));
+    const captured: Captured[] = [];
+    const upstream = makeUpstream(captured);
+    upstream.listen(0, "127.0.0.1");
+    await listen(upstream);
+    const proxy = await startServer(makeOpts(`http://127.0.0.1:${(upstream.address() as { port: number }).port}`));
+    await listen(proxy);
+    try {
+        // Proxy-mode chain shape: the re-voiced acp_summary lands as a user
+        // message whose content carries the render tags.
+        const realTag = "\x3cacp tokens=\"1.2K\" type=\"text\"\x3em00042\x3c/acp\x3e";
+        const raw = JSON.stringify({
+            model: MODEL,
+            stream: false,
+            messages: [
+                { role: "system", content: "You are a test assistant." },
+                { role: "user", content: `earlier context folded ${realTag} continue` },
+            ],
+        });
+        for (let i = 0; i < 2; i++) {
+            const resp = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/v1/chat/completions`, {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-acp-session": "foreign-tags-1" },
+                body: raw,
+            });
+            assert.equal(resp.status, 200);
+            await resp.text();
+        }
+        assert.equal(captured.length, 2);
+        assert.equal(captured[0]!.body, raw, "foreign payload with history tags must reach the LLM byte-identical (no kernel processing)");
+        assert.equal(captured[1]!.body, raw);
+        const warns = chainWarns(logs, "foreign-tags-1");
+        assert.equal(warns.length, 1, `exactly one warn per session (got ${warns.length}: ${JSON.stringify(warns)})`);
+        assert.ok(warns[0]!.msg.includes("chainContentDetection=false"), "warning must point at the escape valve");
+        assert.equal(peekSession("foreign-tags-1"), undefined, "foreign sessions must leave no trace in this instance");
+    } finally {
+        setLogCapture(null);
+        proxy.closeAllConnections?.();
+        await close(proxy);
+        upstream.closeAllConnections?.();
+        await close(upstream);
+        store.cancelAll();
+        rmSync(dir, { recursive: true, force: true });
     }
 });

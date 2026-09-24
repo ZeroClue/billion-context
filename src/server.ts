@@ -99,7 +99,7 @@ import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConver
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks } from "./fork-adoption.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
-import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRuntimeInfoFor, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
+import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRuntimeInfoFor, recordChainVerdict, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type WireProtocol } from "./util.js";
@@ -117,17 +117,13 @@ import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimat
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
 
-// #1086: sessions already warned about by the ACP-artifact content fallback —
-// one warn per session instead of one per request (a chained session can run
-// thousands of turns). Bounded FIFO: evict the oldest once past the cap.
-const warnedChainSessions = new Set<string>();
-export const WARNED_CHAIN_SESSION_CAP = 4096;
-export function _resetChainWarningsForTest(): void {
-    warnedChainSessions.clear();
-}
-export function _chainWarnSetForTest(): Set<string> {
-    return warnedChainSessions;
-}
+// #1086/#1218: the per-session chain-verdict memory moved to plugin.ts
+// (`chainVerdicts`) so the /acp status path can read it — a session judged an
+// external chain is passed through with NO local state, and /acp must be able
+// to explain that instead of the misleading armed-idle notice. Warn-once
+// semantics preserved: recordChainVerdict returns true on the first verdict
+// for a session. Re-exported under the old names for tests.
+export { WARNED_CHAIN_SESSION_CAP, _resetChainVerdictsForTest as _resetChainWarningsForTest, _chainVerdictMapForTest as _chainWarnSetForTest } from "./plugin.js";
 
 // #1073: a forward-proxy-style (absolute-form) request whose authority IS this
 // instance's own listening endpoint — e.g. a health prober configured with our
@@ -1569,12 +1565,26 @@ async function handle(
         // so a foreign session leaves no trace in this instance.
         if (artifactSeed) {
             const artifactKind = detectAcpArtifacts(bodyBuffer, parsed);
-            if (artifactKind !== null && !hasProcessedState(sessionId, { protocol })) {
-                if (!warnedChainSessions.has(sessionId)) {
-                    warnedChainSessions.add(sessionId);
-                    if (warnedChainSessions.size > WARNED_CHAIN_SESSION_CAP) {
-                        warnedChainSessions.delete(warnedChainSessions.values().next().value as string);
-                    }
+            // #1197: a cooperative plugin announces itself with x-bili-plugin —
+            // its protocol RE-SENDS bili's compression artifacts (the compress
+            // tool call + result live in the agent's own re-sent history by
+            // design), so content-shape evidence can never outrank that
+            // announcement. The #1086 fallback guards NON-cooperative clients
+            // chained behind a header-stripping middlebox; a plugin client that
+            // is ALSO double-chained through another bili AND had the hop header
+            // stripped is contrived, and weighing it against silently losing
+            // compression + /acp for every resumed plugin session (the #1197
+            // incident) says: process.
+            const pluginAnnounced = pluginAgentHeader(req.headers) !== undefined;
+            if (artifactKind !== null && !pluginAnnounced && !hasProcessedState(sessionId, { protocol })) {
+                // #1218: record the verdict under the session id AND the
+                // client's own conversation value when they differ — /acp
+                // status probes arrive keyed by the client's value (the same
+                // key space resolveConversation uses), and the session-bound
+                // id alone would be invisible to the client.
+                const firstVerdict = recordChainVerdict(sessionId, artifactKind, protocol);
+                if (clientConv !== undefined && clientConv !== sessionId) recordChainVerdict(clientConv, artifactKind, protocol);
+                if (firstVerdict) {
                     log("warn", `[chain] inbound ${protocol} request carries ACP compression artifacts (${artifactKind}) but neither ${BILI_HOP_HEADER} nor local compression state for session ${sessionId} — likely a bili→bili chain whose headers were stripped. Passing through without processing; if this is your own client, disable the content fallback with chainContentDetection=false (env BILI_CHAIN_CONTENT=0).`);
                 }
                 await forward(req, res, opts, bodyBuffer, null, core, config, log, route, instanceId, undefined);

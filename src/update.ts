@@ -30,7 +30,7 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { cacheDir } from "./paths.js";
 import { log as loggerLog, type Logger } from "./logger.js";
-import { refreshDshProfileBundles } from "./dsh-channel.js";
+import { refreshDshProfileBundles, isDshProfileCopy } from "./dsh-channel.js";
 import { resolveDshHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "./client-config.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import type { FetchOptions } from "./fetch-util.js";
@@ -232,7 +232,7 @@ export function hostManagedInstall(installDir: string, env: NodeJS.ProcessEnv = 
         if (dir.split(path.sep).some((seg) => seg === ".pnpm")) {
             return {
                 owner: "pnpm",
-                channel: "dsh profiles refresh automatically on the next global bili self-update; a pnpm-global install upgrades via `pnpm add -g billion-context@latest`",
+                channel: "dsh profiles refresh automatically (on the next global bili self-update, or from the profile proxy's own periodic check when no global is running, #1196); a pnpm-global install upgrades via `pnpm add -g billion-context@latest`",
             };
         }
     }
@@ -240,7 +240,7 @@ export function hostManagedInstall(installDir: string, env: NodeJS.ProcessEnv = 
     const homes: Array<[string, string, string]> = [
         ["pi", resolvePiHome(env), "`pi update` (pi installs and upgrades the npm:billion-context entry itself)"],
         ["opencode", path.join(xdgData, "opencode"), "opencode's own plugin manager (reload/reinstall the billion-context plugin)"],
-        ["dsh", resolveDshHome(env), "the dsh plugin channel (global bili self-update refreshes profiles; or `dsh plugin add billion-context@latest`)"],
+        ["dsh", resolveDshHome(env), "the dsh plugin channel (the global bili self-update refreshes profiles, and so does the profile proxy's own periodic check; or `dsh plugin add billion-context@latest`)"],
         ["kimi", resolveKimiHome(env), "`bili plugin install kimi` after updating the global bili install"],
         ["omp", resolveOmpHome(env), "the global bili install (the extensions entry points at it)"],
     ];
@@ -422,6 +422,11 @@ async function tryAcquireLock(): Promise<{ release: () => Promise<void> } | null
     }
 
     // Write our lock. Use flag "wx" to fail if file already exists.
+    // The cache dir may not exist yet on a fresh install (writeLastCheck
+    // normally creates it, but the lock must not depend on that side
+    // effect) — create it first, keeping EACCES/ERO failures surfacing via
+    // the wx write below exactly as before.
+    await mkdir(path.dirname(LOCK_FILE), { recursive: true }).catch(() => {});
     try {
         await writeFile(LOCK_FILE, JSON.stringify({ pid, ts: now }), { flag: "wx" });
     } catch {
@@ -522,6 +527,54 @@ export async function fetchRegistryVersion(opts: Pick<UpdateOptions, "resolvePro
     return data.version;
 }
 
+/** #1196: when the running process itself lives inside a dsh profile bundle
+ *  (dsh plugin-market install), there is no global bili to drive the lockstep
+ *  refresh — the profile copy would stay frozen at its install version
+ *  forever (dsh-market users often have no global install at all). Instead of
+ *  a bare skip, check the registry and drive dsh's OWN plugin channel
+ *  (`dsh plugin --profile <name> add billion-context@<v>`, the single-writer-
+ *  safe owner) under the shared cross-process update lock. Registry-pinned
+ *  profiles only — refreshDshProfileBundles leaves link:/file: pins alone, so
+ *  dev lanes stay manual. Best-effort: never throws, never blocks the proxy;
+ *  a failed refresh retries on the next check cycle (unlike the post-self-
+ *  update trigger, which fires once per install event and never retries). */
+export async function refreshDshProfileCopy(
+    installDir: string,
+    opts: UpdateOptions,
+    env: NodeJS.ProcessEnv = process.env,
+    log: Logger = loggerLog,
+): Promise<void> {
+    if (!isDshProfileCopy(installDir, env)) return;
+    let latest: string | undefined;
+    try {
+        latest = await fetchRegistryVersion(opts, opts.packageName);
+    } catch (e) {
+        log("warn", `[update] dsh profile bundle check failed: ${String(e)} \u2014 leaving profile copies alone`);
+        return;
+    }
+    if (!latest) {
+        log("warn", `[update] could not resolve the latest version for ${opts.packageName} \u2014 leaving dsh profile bundles alone`);
+        return;
+    }
+    const diskVersion = await readDiskVersion(installDir);
+    const currentVersion = diskVersion ?? opts.currentVersion;
+    if (!isVersionNewer(latest, currentVersion)) {
+        log("info", `[update] dsh profile bundle up to date (current=${currentVersion} latest=${latest} tag=${normalizeUpdateTag(opts.updateTag)})`);
+        return;
+    }
+    log("info", `[update] dsh profile bundle is stale (${currentVersion} \u2192 ${latest}) \u2014 refreshing via dsh's plugin channel`);
+    const lock = await tryAcquireLock();
+    if (!lock) {
+        log("info", `[update] another process is updating, will check next cycle`);
+        return;
+    }
+    try {
+        await refreshDshProfileBundles(latest, log, env);
+    } finally {
+        await lock.release();
+    }
+}
+
 /** Run a single check (throttled unless `force`). Safe to call frequently. */
 export async function checkForUpdate(opts: UpdateOptions, force = false): Promise<void> {
     if (!opts.autoUpdate && !force) return;
@@ -555,8 +608,13 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         // updated through its owner — never overwritten in place by the
         // global self-updater.
         const managed = installDir ? hostManagedInstall(installDir) : undefined;
-        if (managed) {
+        if (managed && installDir) {
             loggerLog("info", `[update] install dir is managed by ${managed.owner} (${installDir}) \u2014 skipping in-place self-update; update it via ${managed.channel} (#991)`);
+            // #1196: a copy living inside a dsh profile bundle cannot wait
+            // for a global self-update that may never come (dsh-market users
+            // often have no global install at all) — drive the lockstep
+            // refresh through dsh's own plugin channel from here.
+            await refreshDshProfileCopy(installDir, opts, process.env, loggerLog);
             return;
         }
 
