@@ -315,10 +315,17 @@ test("legacy oversized envelope is trimmed to the cap on first touch (load path)
         // Phase 2: reload the same id with a tight cap → first touch trims it.
         s.contentStore = undefined;
         s.contentStoreDirty = false;
+        s.stats.storedBytes = storeBytes(multiStore([
+            { ref: "m00001", rawId: "r1", text: "a".repeat(1000) + "1" },
+            { ref: "m00002", rawId: "r2", text: "b".repeat(1000) + "2" },
+            { ref: "m00003", rawId: "r3", text: "c".repeat(1000) + "3" },
+            { ref: "m00004", rawId: "r4", text: "d".repeat(1000) + "4" },
+        ]));
         storeEffectiveCcr(s, { enabled: true, minToolTokens: 50, maxStoreBytes: 2560 });
         const loaded = contentStoreOf(s);
         assert.deepEqual(Object.keys(loaded.byRef).sort(), ["m00003", "m00004"], "oldest refs trimmed on load");
         assert.ok(storeBytes(loaded) <= 2560);
+        assert.equal(s.stats.storedBytes, storeBytes(loaded), "storedBytes stat refreshed after load-path trim");
         // the persisted file converges too
         assert.ok(store.flushSync(s));
         s.contentStore = undefined;

@@ -113,7 +113,7 @@ export function enforceStoreCap(session: Session): number {
 export function contentStoreOf(session: Session): MessageContentStore {
     if (!session.contentStore) {
         session.contentStore = getStore().loadContentStore(session) ?? createContentStore();
-        enforceStoreCap(session);
+        if (enforceStoreCap(session) > 0) session.stats.storedBytes = storeSizeBytes(session.contentStore);
     }
     return session.contentStore;
 }
