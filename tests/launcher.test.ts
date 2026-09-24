@@ -1,5 +1,6 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import type { PathLike } from "node:fs";
 type SymlinkKind = "dir" | "file" | "junction";
@@ -987,6 +988,12 @@ test("ensureProxyRunning: registers a child 'error' handler so an async spawn fa
     assert.ok(subscribed.includes("error"), "an 'error' handler was registered on the spawned proxy child");
 });
 
+// #1225: the attaching side hashes the script it WOULD spawn; the fake
+// instance records the hash of this fixture so matching attach tests line up.
+const FP_SCRIPT = path.join(os.tmpdir(), `bili-fp-${process.pid}.js`);
+fs.writeFileSync(FP_SCRIPT, "// fingerprint fixture\n");
+const FP_HASH = createHash("sha256").update(fs.readFileSync(FP_SCRIPT)).digest("hex");
+
 function recordedInstance(over: Partial<InstanceFile> = {}): InstanceFile {
     return {
         origin: "http://127.0.0.1:8787",
@@ -998,6 +1005,7 @@ function recordedInstance(over: Partial<InstanceFile> = {}): InstanceFile {
         passthrough: false,
         mitmDomains: [],
         modelWindows: {},
+        codeFingerprint: FP_HASH,
         ...over,
     };
 }
@@ -1017,6 +1025,7 @@ test("ensureProxyRunning: attaches to a compatible healthy instance instead of d
             fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
             readInstanceFile: () => recordedInstance(),
             registerWatcher: async (origin, pid) => { registrations.push([origin, pid]); },
+            scriptPath: FP_SCRIPT,
         },
     );
     assert.equal(spawnCalls, 0);
@@ -1041,6 +1050,7 @@ test("ensureProxyRunning: attach registers opts.parentPid when given, never on s
             fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
             readInstanceFile: () => recordedInstance(),
             registerWatcher,
+            scriptPath: FP_SCRIPT,
         },
     );
     assert.equal(attached.attached, true);
@@ -1054,6 +1064,7 @@ test("ensureProxyRunning: attach registers opts.parentPid when given, never on s
             fetchImpl: async () => ({ ok: true }),
             readInstanceFile: () => undefined,
             registerWatcher,
+            scriptPath: FP_SCRIPT,
             spawnImpl: () => { spawned = true; return makeFakeChild(42432); },
             sleep: () => Promise.resolve(),
         },
@@ -1061,6 +1072,132 @@ test("ensureProxyRunning: attach registers opts.parentPid when given, never on s
     assert.equal(spawned, true);
     assert.equal(spawnedHandle.attached, undefined);
     assert.deepEqual(registrations, [], "spawn must not register (BILI_PARENT_PID already arms the watchdog)");
+});
+
+test("ensureProxyRunning: same lane attaches, different declared lanes spawn separate proxies (#1225)", async () => {
+    let spawnCalls = 0;
+    let lastSpawnEnv: NodeJS.ProcessEnv | undefined;
+    const spawnImpl: SpawnFn = (_cmd, _args, options) => {
+        spawnCalls++;
+        lastSpawnEnv = options.env ?? {};
+        return makeFakeChild(42460);
+    };
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi" },
+        {
+            spawnImpl,
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+            readInstanceFile: () => recordedInstance({ lane: "pi" }),
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(spawnCalls, 0);
+    assert.equal(handle.attached, true);
+
+    let reads = 0;
+    const other = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "codex" },
+        {
+            spawnImpl,
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+            readInstanceFile: () => (reads++ === 0 ? recordedInstance({ lane: "pi" }) : undefined),
+            sleep: () => Promise.resolve(),
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(spawnCalls, 1);
+    assert.equal(other.attached, undefined);
+    assert.equal(lastSpawnEnv?.BILI_LAUNCHER_LANE, "codex");
+});
+
+test("ensureProxyRunning: manual daemon (no lane) stays shareable with any client lane (#1225)", async () => {
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi" },
+        {
+            spawnImpl: () => makeFakeChild(42463),
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+            readInstanceFile: () => recordedInstance(),
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(handle.attached, true);
+});
+
+test("ensureProxyRunning: stale code (fingerprint mismatch) is not attached — rebuild takes effect (#1225)", async () => {
+    let spawnCalls = 0;
+    let reads = 0;
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+        {
+            spawnImpl: () => {
+                spawnCalls++;
+                return makeFakeChild(42461);
+            },
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+            readInstanceFile: () => (reads++ === 0 ? recordedInstance({ codeFingerprint: "stale-dist-hash" }) : undefined),
+            sleep: () => Promise.resolve(),
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(spawnCalls, 1);
+    assert.equal(handle.attached, undefined);
+});
+
+test("ensureProxyRunning: pre-#1225 instance without codeFingerprint is never attached (#1225)", async () => {
+    let spawnCalls = 0;
+    let reads = 0;
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+        {
+            spawnImpl: () => {
+                spawnCalls++;
+                return makeFakeChild(42464);
+            },
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+            readInstanceFile: () => (reads++ === 0 ? recordedInstance({ codeFingerprint: undefined }) : undefined),
+            sleep: () => Promise.resolve(),
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(spawnCalls, 1);
+    assert.equal(handle.attached, undefined);
+});
+
+test("ensureProxyRunning: active starting marker of a different lane → spawns immediately, does not wait (#1225)", async () => {
+    try {
+        claimStartingMarker({ token: "starter-lane", pid: process.pid, host: "127.0.0.1", port: 8794, startedAt: Date.now(), lane: "codex" });
+        let spawnCalls = 0;
+        let spawnedLane: string | undefined;
+        let sleeps = 0;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi" },
+            {
+                spawnImpl: (_cmd, _args, options) => {
+                    spawnCalls++;
+                    spawnedLane = options.env?.BILI_LAUNCHER_LANE;
+                    return makeFakeChild(42462);
+                },
+                fetchImpl: async () => ({ ok: true }),
+                readInstanceFile: () => undefined,
+                sleep: () => {
+                    sleeps++;
+                    return Promise.resolve();
+                },
+            },
+        );
+        assert.equal(spawnCalls, 1);
+        assert.ok(handle.child);
+        assert.equal(spawnedLane, "pi");
+        assert.ok(sleeps <= 1, `must not wait behind a cross-lane starter (slept ${sleeps} times)`);
+        assert.equal(readStartingMarker()?.token, "starter-lane");
+    } finally {
+        removeStartingMarker();
+    }
 });
 
 test("ensureProxyRunning: incompatible recorded instance (modelWindows) is not attached", async () => {
@@ -1118,6 +1255,7 @@ test("ensureProxyRunning: active starting marker → waits, then attaches instea
                 readInstanceFile: () => (reads++ < 2 ? undefined : recordedInstance({ instanceId: "inst-9", origin: "http://127.0.0.1:8788", port: 8788 })),
                 sleep: () => Promise.resolve(),
                 registerWatcher: async () => {},
+                scriptPath: FP_SCRIPT,
             },
         );
         assert.equal(handle.attached, true);
@@ -1344,6 +1482,7 @@ test("ensureProxyRunning: instance appearing at the wait deadline is attached, n
                     ticks += 10;
                     return Promise.resolve();
                 },
+                scriptPath: FP_SCRIPT,
             },
         );
         assert.equal(handle.attached, true);

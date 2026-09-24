@@ -76,7 +76,7 @@ import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError } from "./logger.js";
 import { configFile, defaultLogFile, dumpsDir, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, isPidAlive, registerInstanceAndWarn, unregisterInstance } from "./instance.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, entryScriptFingerprint, isPidAlive, registerInstanceAndWarn, unregisterInstance } from "./instance.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
@@ -460,6 +460,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // "success" would strand every model request on the dead original port.
     const launchToken = process.env.BILI_LAUNCH_TOKEN?.trim();
     const strictPort = process.env.BILI_STRICT_PORT === "1";
+    // #1225: lane identity + code fingerprint recorded into the instance file
+    // so later launches can decide reuse by WHO started us and WHICH code we
+    // run — not just config shape (same-version stale dist kept serving after
+    // a rebuild; different clients cross-wrote one shared proxy).
+    const launcherLane = process.env.BILI_LAUNCHER_LANE?.trim() || undefined;
+    const ownFingerprint = entryScriptFingerprint(process.argv[1]);
     const MAX_LISTEN_ATTEMPTS = 17;
     let listenAttempts = 0;
     let lastTriedPort = opts.port;
@@ -491,6 +497,8 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 modelWindows: { ...LAUNCHER_MODEL_WINDOWS },
                 modelMaxOutputs: Object.keys(LAUNCHER_MODEL_MAX_OUTPUTS).length > 0 ? { ...LAUNCHER_MODEL_MAX_OUTPUTS } : undefined,
                 launchToken: launchToken || undefined,
+                lane: launcherLane,
+                codeFingerprint: ownFingerprint,
             });
         } catch {
             // best-effort discovery hint for host-spawned MCP shells

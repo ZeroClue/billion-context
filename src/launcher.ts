@@ -38,6 +38,7 @@ import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
 import {
     claimStartingMarker,
     clearStartingMarker,
+    entryScriptFingerprint,
     isPidAlive,
     isProxyInstanceFile,
     readProxyInstanceFile,
@@ -190,6 +191,13 @@ export interface LaunchOptions {
      * native posture dials a STATIC url baked into settings.json; a proxy
      * that silently landed on port+1 would strand every model request). */
     strictPort?: boolean;
+    /** #1225: which client/lane this launch belongs to. Recorded by the
+     *  spawned child (BILI_LAUNCHER_LANE) and compared on attach: two
+     *  DIFFERENT declared lanes never share an instance, while an undeclared
+     *  side (manual `bili start` daemon, pre-#1225 instance) stays a
+     *  wildcard. Without this, pi and codex with identical config shape
+     *  silently shared one proxy and cross-wrote each other's state. */
+    lane?: string;
 }
 
 export interface ProxyHandle {
@@ -2393,7 +2401,14 @@ function isStartingMarkerActive(marker: ProxyStartingMarker, nowMs: number): boo
     return isPidAlive(marker.pid) && nowMs - marker.startedAt < STARTING_MARKER_TTL_MS;
 }
 
-function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions): boolean {
+/** #1225: reuse requires identical CODE, not just identical config shape —
+ *  same version number with different dist contents (local rebuild, npm link,
+ *  unpublished branch) must not be served by the stale instance. codeFingerprint
+ *  is the attaching side's hash of the script it WOULD spawn; undefined means
+ *  it cannot be verified, which is treated as incompatible (never attach). */
+function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions, codeFingerprint?: string): boolean {
+    if (inst.codeFingerprint === undefined || inst.codeFingerprint !== codeFingerprint) return false;
+    if (opts.lane !== undefined && inst.lane !== undefined && inst.lane !== opts.lane) return false;
     if (inst.host !== opts.host || inst.passthrough !== opts.passthrough) return false;
     const wantDomains = opts.mitmDomains ?? [];
     if (inst.mitmDomains.length !== wantDomains.length || inst.mitmDomains.some((d, i) => d !== wantDomains[i])) return false;
@@ -2586,12 +2601,15 @@ export async function ensureProxyRunning(
         await registerWatcher(inst.origin, watchPid);
         return { origin: inst.origin, port: inst.port, attached: true };
     };
+    const script = deps.scriptPath ?? process.argv[1];
+    const codeFingerprint = entryScriptFingerprint(script);
 
     // #394/#417: a healthy proxy with a compatible config is SHARED, not
     // doubled — two concurrent launches of the same client would otherwise
-    // spawn two writers over one sessions dir.
+    // spawn two writers over one sessions dir. #1225 tightens "compatible":
+    // same code AND same declared lane, not just same config shape.
     const existing = await probeExistingInstance(readInstance, fetchHealthInfo);
-    if (existing && instanceCompatible(existing, opts) && (!opts.strictPort || existing.port === opts.port)) {
+    if (existing && instanceCompatible(existing, opts, codeFingerprint) && (!opts.strictPort || existing.port === opts.port)) {
         // strictPort (#964): the client dials a STATIC url — attaching to a
         // healthy proxy on a DIFFERENT port would strand every request. Only
         // an instance already bound to the exact port may be shared.
@@ -2606,18 +2624,23 @@ export async function ensureProxyRunning(
     const waitForOtherStarter = async (): Promise<ProxyHandle | undefined> => {
         console.error("bili: another bili launch is bringing up a proxy — waiting for it instead of spawning a second");
         const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl);
-        if (waited && instanceCompatible(waited, opts)) {
+        if (waited && instanceCompatible(waited, opts, codeFingerprint)) {
             return attachTo(waited);
         }
         // starter failed/timed out (or incompatible config) — caller falls
         // through and spawns itself, as before
         return undefined;
     };
+    // #1225: an in-flight starter of a DIFFERENT declared lane can never
+    // produce an instance we may attach to — waiting would only stall this
+    // launch behind its SPAWN_WAIT_MS window. Undeclared lanes wildcard.
+    const starterLaneMatches = (m: ProxyStartingMarker): boolean =>
+        opts.lane === undefined || m.lane === undefined || m.lane === opts.lane;
     const marker = readStartingMarker();
     if (marker) {
         if (!isStartingMarkerActive(marker, now())) {
             removeStartingMarker();
-        } else {
+        } else if (starterLaneMatches(marker)) {
             const attached = await waitForOtherStarter();
             if (attached) return attached;
         }
@@ -2632,7 +2655,6 @@ export async function ensureProxyRunning(
     // pointed there only ever reach an explicitly-started `bili start`.
     // The child's EADDRINUSE retry covers the pick/spawn race.
     const port = opts.port > 0 ? opts.port : await pickEphemeralPort(opts.host);
-    const script = deps.scriptPath ?? process.argv[1];
     if (!script) throw new Error("bili: cannot resolve launcher script path");
     const logPath = path.join(os.tmpdir(), `bili-proxy-${port}.log`);
     const logFd = fs.openSync(logPath, "a");
@@ -2643,15 +2665,20 @@ export async function ensureProxyRunning(
     // Cleared on every terminal path below; a hard crash leaves a stale marker
     // that the dead-owner/TTL check treats as inert.
     const claimMarker = (): boolean =>
-        claimStartingMarker({ token: launchToken, pid: process.pid, host: opts.host, port, startedAt: now() });
+        claimStartingMarker({ token: launchToken, pid: process.pid, host: opts.host, port, startedAt: now(), lane: opts.lane });
     let claimed = claimMarker();
     if (!claimed) {
         const holder = readStartingMarker();
         if (holder && isStartingMarkerActive(holder, now())) {
-            // Lost the read→claim race to a live starter — honor its bring-up.
-            const attached = await waitForOtherStarter();
-            if (attached) return attached;
-            claimed = claimMarker();
+            if (starterLaneMatches(holder)) {
+                // Lost the read→claim race to a live starter — honor its bring-up.
+                const attached = await waitForOtherStarter();
+                if (attached) return attached;
+                claimed = claimMarker();
+            }
+            // #1225: live but a DIFFERENT lane — spawn without coordinating,
+            // and leave its marker ALONE: removing it would break THAT
+            // starter's coordination with its own same-lane launches.
         } else {
             // Stale or unreadable (crash mid-write): safe to remove — while any
             // marker file exists, O_EXCL bars a newer claimant, so we cannot
@@ -2677,6 +2704,7 @@ export async function ensureProxyRunning(
                         ...captureInheritedProxyEnv(process.env),
                         BILI_LAUNCH_TOKEN: launchToken,
                         BILI_PARENT_PID: String(opts.parentPid ?? process.pid),
+                        ...(opts.lane ? { BILI_LAUNCHER_LANE: opts.lane } : {}),
                         ...(opts.mitmDomains && opts.mitmDomains.length
                             ? { BILI_MITM_DOMAINS: opts.mitmDomains.join(",") }
                             : {}),
@@ -3006,7 +3034,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     // used to resolve the budget-alignment window, #321).
     const biliRoutes = loadRoutes(process.env);
     const domains = dedupeInOrder([...routes.httpsDomains, ...(params.mitmDomains ?? [])]);
-    const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config, base), modelMaxOutputs: collectModelMaxOutputs(config, base) }, deps);
+    const handle = await ensureProxyRunning({ host, port, passthrough, debug, lane: base, mitmDomains: domains, modelWindows: collectModelWindows(config, base), modelMaxOutputs: collectModelMaxOutputs(config, base) }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
             ((base !== "kimi" && base !== "mcode" && base !== "aider" && routes.httpRewrites.length > 0) ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
@@ -3504,7 +3532,7 @@ export async function runTestPi(params: RunTestPiParams, deps: LauncherDeps = {}
         ...discoverDomains("pi", config),
         ...(params.mitmDomains ?? []),
     ]);
-    const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config, "pi"), modelMaxOutputs: collectModelMaxOutputs(config, "pi") }, deps);
+    const handle = await ensureProxyRunning({ host, port, passthrough, debug, lane: "pi", mitmDomains: domains, modelWindows: collectModelWindows(config, "pi"), modelMaxOutputs: collectModelMaxOutputs(config, "pi") }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})`,
     );

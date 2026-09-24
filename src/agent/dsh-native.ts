@@ -196,7 +196,7 @@ export function persistClientEvent(msg: string): void {
 async function bootstrap(): Promise<string | undefined> {
     try {
         const handle = await ensureProxyRunning(
-            { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false },
+            { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "dsh" },
             { scriptPath: nativeProxyScriptPath() },
         );
         state.origin = handle.origin;

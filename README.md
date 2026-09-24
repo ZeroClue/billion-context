@@ -278,6 +278,16 @@ Opt-out envs: `BILI_NATIVE_PI=0`, `BILI_NATIVE_OMP=0`,
 `BILI_NATIVE_HERMES=0`, `BILI_NATIVE_ZCODE=0`. Full
 mechanics: [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md).
 
+Reuse is identity-based (#1225): an existing proxy is attached only when it
+runs the **same code** (sha256 of the entry script, recorded in the
+instance file) and its **lane is compatible** — each launcher declares its
+client's lane, two *different declared* lanes never share, and an instance
+without a lane (manual `bili start`) stays shareable by every client.
+Instances written before #1225 carry no code fingerprint and are therefore
+never attached: a rebuilt or updated install always starts a fresh proxy on
+the next launch, so fixes take effect immediately instead of silently
+serving stale code.
+
 **Runtime-info protocol (#955).** A native plugin reads the model config
 the client itself will use and pushes it to the proxy (per-request headers
 + bootstrap report); the proxy prefers that truth over the models.dev

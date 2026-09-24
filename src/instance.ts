@@ -22,6 +22,14 @@ export interface ProxyInstanceFile {
     modelWindows: Record<string, number>;
     modelMaxOutputs?: Record<string, number>;
     launchToken?: string;
+    /** #1225: which client/lane the launcher that spawned this instance
+     *  belongs to (BILI_LAUNCHER_LANE). Absent for manual `bili start`
+     *  daemons and pre-#1225 instances — both stay shareable (wildcard). */
+    lane?: string;
+    /** #1225: sha256 of the entry script this instance is RUNNING. A missing
+     *  fingerprint means pre-#1225 code — attaching new code to it would
+     *  serve stale behavior, so readers must treat absence as incompatible. */
+    codeFingerprint?: string;
 }
 
 export function isProxyInstanceFile(v: ProxyInstanceFile | { origin: string } | undefined): v is ProxyInstanceFile {
@@ -65,6 +73,8 @@ export function readProxyInstanceFile(file?: string): ProxyInstanceFile | { orig
                     modelWindows: windows,
                     modelMaxOutputs: Object.keys(maxOutputs).length > 0 ? maxOutputs : undefined,
                     launchToken: typeof parsed.launchToken === "string" ? parsed.launchToken : undefined,
+                    lane: typeof parsed.lane === "string" && parsed.lane !== "" ? parsed.lane : undefined,
+                    codeFingerprint: typeof parsed.codeFingerprint === "string" && parsed.codeFingerprint !== "" ? parsed.codeFingerprint : undefined,
                 };
             }
         } catch {
@@ -77,6 +87,28 @@ export function readProxyInstanceFile(file?: string): ProxyInstanceFile | { orig
 
 export function instanceFilePath(): string {
     return path.join(stateDir(), "proxy-origin");
+}
+
+/** #1225: content identity of a bili entry script (sha256 of its bytes).
+ *  The spawned child records this for ITS script; an attaching launcher
+ *  compares it against the hash of the script it would spawn — so "same
+ *  version" is never enough: two installs of 0.1.x with different dist
+ *  contents (local rebuild, npm link, unpublished branch) must not be
+ *  confused for one codebase. Unreadable file → undefined → never attach. */
+const scriptFingerprints = new Map<string, string>();
+export function entryScriptFingerprint(scriptPath?: string): string | undefined {
+    if (!scriptPath) return undefined;
+    const resolved = path.resolve(scriptPath);
+    const cached = scriptFingerprints.get(resolved);
+    if (cached !== undefined) return cached;
+    let digest: string;
+    try {
+        digest = createHash("sha256").update(fs.readFileSync(resolved)).digest("hex");
+    } catch {
+        return undefined;
+    }
+    scriptFingerprints.set(resolved, digest);
+    return digest;
 }
 
 /** tmp+fsync+rename (same shape as web/api.ts atomicWriteConfig) — a torn
@@ -133,6 +165,9 @@ export interface ProxyStartingMarker {
     host: string;
     port: number;
     startedAt: number;
+    /** #1225: starter's lane — cross-lane concurrent launches skip the wait
+     *  instead of stalling behind a bring-up they could never attach to. */
+    lane?: string;
 }
 
 export function startingMarkerPath(): string {
@@ -157,6 +192,7 @@ export function readStartingMarker(file?: string): ProxyStartingMarker | undefin
             host: typeof parsed.host === "string" ? parsed.host : "",
             port: typeof parsed.port === "number" ? parsed.port : 0,
             startedAt: parsed.startedAt,
+            ...(typeof parsed.lane === "string" && parsed.lane !== "" ? { lane: parsed.lane } : {}),
         };
     } catch {
         return undefined;

@@ -93,7 +93,7 @@ const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(
 async function bootstrap(): Promise<string | undefined> {
     try {
         const handle = await ensureProxyRunning(
-            { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false },
+            { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "pi" },
             { scriptPath: nativeProxyScriptPath() },
         );
         const origin = handle.origin;

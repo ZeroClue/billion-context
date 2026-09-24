@@ -256,6 +256,7 @@ async function run(): Promise<void> {
                 debug: false,
                 parentPid: watchPid,
                 strictPort: true,
+                lane: "claude",
             },
             { scriptPath: proxyScriptPath() },
         );
