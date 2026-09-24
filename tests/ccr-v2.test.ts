@@ -183,6 +183,12 @@ test("acp_status exposes BLOCK SPANS and counts range-restores separately", () =
     assert.match(after, /range-restored 1/);
 });
 
+test("acp_status hides BLOCK SPANS when CCR is disarmed (#1207 review)", () => {
+    const f = fold({ ccr: false });
+    const out = handleAcpStatus({}, { core: f.core, config: f.config, messages: f.msgs, session: f.session });
+    assert.doesNotMatch(out, /BLOCK SPANS/);
+});
+
 function listen(server: http.Server): Promise<void> {
     if (server.listening) return Promise.resolve();
     return once(server, "listening").then(() => undefined);

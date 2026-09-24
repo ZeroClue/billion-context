@@ -92,16 +92,20 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         extra.push(`STORE (CCR) — ${storeCount} item(s) · ${fmtBytes(st.storedBytes ?? 0)} stored · ${fmtBytes(st.storeBytesSaved ?? 0)} saved on wire · retrieved ${hits}/${calls}${calls > 0 ? ` (${rate}%)` : ""}${rangeRestores > 0 ? ` · range-restored ${rangeRestores}` : ""}`);
     }
     // #1179 CCR v2: block → covered message-ref linkage, so the model can
-    // target acp_retrieve / range decompress at individual messages.
-    const spans: string[] = [];
-    for (const b of ctx.session.state.blocks) {
-        if (!b.active) continue;
-        const s = coveredRefSpan(ctx.session.state, b);
-        if (s) spans.push(`${b.blockId}=${s.text}`);
-    }
-    if (spans.length > 0) {
-        extra.push("");
-        extra.push(`BLOCK SPANS — ${spans.slice(0, 12).join(" · ")}${spans.length > 12 ? ` (+${spans.length - 12} more)` : ""}`);
+    // target acp_retrieve / range decompress at individual messages. Gated on
+    // arming (#1207 review): with CCR off those refs are unretrievable, so
+    // listing them would advertise a capability that doesn't exist.
+    if (ccrArmed) {
+        const spans: string[] = [];
+        for (const b of ctx.session.state.blocks) {
+            if (!b.active) continue;
+            const s = coveredRefSpan(ctx.session.state, b);
+            if (s) spans.push(`${b.blockId}=${s.text}`);
+        }
+        if (spans.length > 0) {
+            extra.push("");
+            extra.push(`BLOCK SPANS — ${spans.slice(0, 12).join(" · ")}${spans.length > 12 ? ` (+${spans.length - 12} more)` : ""}`);
+        }
     }
     const archive = preCompactionArchiveOf(ctx.session);
     const archivedIds = Object.keys(archive);

@@ -267,8 +267,10 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
             maxHeadChars: s.ccr.maxHeadChars ?? d.maxHeadChars,
         };
     } else {
-        // #1179 default-on: unset means enabled; other fields inherit
-        // base.ccr (advanced kernelConfig passthrough), then kernel defaults.
+        // #1179 default-on: unset means enabled. base.ccr is the kernel's
+        // shipping default (enabled: false) or a prior resolved level, so the
+        // kernel default must be overridden here; other fields inherit
+        // base.ccr, then kernel defaults. Opt-out: ccr.enabled:false above.
         const d = DEFAULT_CCR_CONFIG;
         const b = base.ccr;
         ccr = {
