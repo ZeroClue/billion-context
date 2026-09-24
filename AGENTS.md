@@ -84,6 +84,43 @@ billion-context/
 6. **Single-writer plugin copies (#991)** — every bili presence has exactly one writer. Host-managed copies (pi's npm entry, opencode's plugin dir, dsh profile bundles in pnpm's store) are NEVER overwritten in place by bili: `src/update.ts` → `hostManagedInstall()` detects pnpm virtual-store (`.pnpm`) and host-home trees (pi/opencode/dsh/kimi/omp) and the self-updater skips them; `installViaTarball` refuses them structurally. Reference lanes (omp/claude/codex/kimi) point at the global install and update with it. `bili plugin update [agent]` drives each lane through its own owner. Mixing user commands is fine (they share channels); mixing writers is what the guard forbids.
 7. **Two compression modes with different summary carriers** — `pluginMode` (the `x-bili-plugin` header / registered agent, e.g. `bili pi`) means the ACP-native agent OWNS compression: it executes `compress` locally, the call+result live in its own re-sent history, and the summary carrier on the wire is the **tool call** (the proxy suppresses tool + nudge injection; the agent's view never renders the kernel's `acp_summary`). Proxy mode (plain client, no header) means the proxy executes `compress` server-side: the tool call is ephemeral (never enters the client's history) and preflight blocks have none, so the summary carrier is the **`acp_summary` message**, which the kernel renders as role `system` but `systemToUser` (`src/util.ts`) re-voices as a **`user` message** (leaving it at its anchor) so strict backends (SGLang: exactly one system at index 0, #377) accept it and the head system message stays byte-stable for the prefix cache. The mode is decided per request and bound per session (`session.metadata.pluginAgent`, sticky, upgrade-only). See README "Two compression modes".
 
+### Install-Lane & Update-Ownership Contract (#1196)
+
+Every bili presence on a machine follows ONE contract — decide changes
+against it, not ad hoc:
+
+1. **One writer per copy, chosen by the install SOURCE.** A copy installed
+   through a host's own channel (dsh plugin market, opencode/pi managers,
+   pnpm store) is owned by that host: bili NEVER writes it in place (#991,
+   `hostManagedInstall`). `bili plugin install <agent>` only ever DRIVES the
+   host's channel (e.g. `dsh plugin add`), never installs a second bili-owned
+   copy beside it (#966).
+2. **Every copy must have a LIVE update path** — this is the actual fix for
+   the "frozen forever" bug class (#1196). Exactly one of:
+   - it IS the global install (npm `i -g`): self-updates in place;
+   - it is a reference lane (omp/claude/codex/kimi/zcode/hermes entries): no
+     copy at all, points at the global dist, follows it automatically;
+   - it lives in a host world (dsh profile bundle, opencode/pi tree): updated
+     through the HOST's channel — driven by a global self-update AND, when no
+     global ever runs (market-only users), by the copy's own periodic check
+     (`refreshDshProfileCopy`, #1196). Self-heal goes THROUGH the owner's
+     sanctioned channel, never around it.
+3. **Terminal users get the one-copy experience via launchers** (`bili dsh`
+   overlay mode loads the global dist, no persistent copy); market users get
+   self-contained per-context copies. Both are first-class; the user picks by
+   entry point, and the two modes never mix for one lane (duplicate
+   `bili-native` loader ids hard-fail dsh boot).
+4. **Local pins stay manual.** `link:`/`file:` dev pins are never refreshed
+   (`isRegistryDepSpec` gate) — dev lanes track a live checkout by design.
+5. **Transient drift is acceptable and bounded**: lanes converge to the
+   registry version within one check cycle (~3 min) plus a host restart.
+   Permanent divergence is a bug — file it under this contract.
+
+Machine-global facilities stay SHARED across all copies (deliberately):
+`~/.local/state/billion-context/` (log + sessions, #394 multi-instance
+warning), `~/.cache/billion-context/` (update throttle + cross-process
+update lock), `~/.config/billion-context/` (providers/compress config).
+
 ### Kernel Contract: Message Ids Are Never Reused
 
 The kernel (`acp-kernel`) guarantees, and billion-context RELIES on: within a
