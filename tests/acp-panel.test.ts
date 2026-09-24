@@ -2,7 +2,7 @@ import assert from "node:assert";
 import test from "node:test";
 import { createInitialState } from "acp-kernel";
 import { buildStatusPanel } from "acp-kernel/panel";
-import { CACHE_REPORT_CLOSE, CACHE_REPORT_OPEN, isAcpPanelText, stripAcpPanelMessages, stripAcpPanelResponsesInput, wrapCacheReport } from "../src/acp-panel.ts";
+import { CACHE_REPORT_CLOSE, CACHE_REPORT_OPEN, RULE_REPORT_CLOSE, RULE_REPORT_OPEN, isAcpPanelText, stripAcpPanelMessages, stripAcpPanelResponsesInput, wrapCacheReport, wrapRuleReport } from "../src/acp-panel.ts";
 
 // Generate the REAL panel the proxy produces (handlePluginStatus →
 // buildStatusPanel), so the signature test tracks acp-kernel's actual output
@@ -166,5 +166,58 @@ test("stripAcpPanelResponsesInput removes wrapped-report user items, keeps other
     ];
     const stripped = stripAcpPanelResponsesInput(input);
     assert.equal(stripped, 2, "two wrapped-report user items removed (typed + type-less)");
+    assert.deepEqual(input.map((i) => i.type ?? "message"), ["message", "function_call"]);
+});
+
+// #1251: /acp-rule persists the executeRule output via wrapRuleReport — same
+// marker contract as wrapCacheReport: only plugin-wrapped messages are stripped.
+const RULES = [
+    "Recorded rules:",
+    "rule1: always run npm test before committing",
+].join("\n");
+
+test("isAcpPanelText detects the wrapped rule report (#1251)", () => {
+    assert.equal(isAcpPanelText(wrapRuleReport(RULES)), true);
+});
+
+test("isAcpPanelText rejects an unwrapped rule report (only the plugin's wrapper is stripped)", () => {
+    assert.equal(isAcpPanelText(RULES), false);
+});
+
+test("isAcpPanelText rejects a wrapped rule report with a follow-up appended (suffix case)", () => {
+    assert.equal(isAcpPanelText(`${wrapRuleReport(RULES)}\nmy follow-up question`), false, "report + follow-up is a real user message");
+    assert.equal(isAcpPanelText(`${wrapRuleReport(RULES)} and what about X?`), false, "report + inline follow-up preserved");
+});
+
+test("isAcpPanelText tolerates surrounding whitespace on the wrapped rule report", () => {
+    assert.equal(isAcpPanelText(`\n  ${wrapRuleReport(RULES)}  \n`), true);
+});
+
+test("isAcpPanelText rejects a message that merely quotes the rule wrapper markers", () => {
+    assert.equal(isAcpPanelText(`here is my custom block:\n${RULE_REPORT_OPEN}\nsome text\n${RULE_REPORT_CLOSE}\nafter`), false, "markers inside a longer message are not a report");
+});
+
+test("stripAcpPanelMessages removes wrapped rule-report user messages (string + block content)", () => {
+    const messages = [
+        { role: "user", content: "hi" },
+        { role: "user", content: wrapRuleReport(RULES) },
+        { role: "user", content: [{ type: "text", text: wrapRuleReport(RULES) }] },
+        { role: "assistant", content: wrapRuleReport(RULES) },
+        { role: "user", content: "next question" },
+    ];
+    const stripped = stripAcpPanelMessages(messages);
+    assert.equal(stripped, 2, "two wrapped rule-report user messages removed");
+    assert.deepEqual(messages.map((m) => m.role), ["user", "assistant", "user"]);
+});
+
+test("stripAcpPanelResponsesInput removes wrapped rule-report user items, keeps others", () => {
+    const input = [
+        { type: "message", role: "user", content: "hi" },
+        { type: "message", role: "user", content: wrapRuleReport(RULES) },
+        { role: "user", content: [{ type: "input_text", text: wrapRuleReport(RULES) }] },
+        { type: "function_call", name: "acp_rule", arguments: "{}", id: "fc1" },
+    ];
+    const stripped = stripAcpPanelResponsesInput(input);
+    assert.equal(stripped, 2, "two wrapped rule-report user items removed (typed + type-less)");
     assert.deepEqual(input.map((i) => i.type ?? "message"), ["message", "function_call"]);
 });
