@@ -5,17 +5,20 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
     buildStoredPlaceholder,
+    createContentStore,
     createCore,
     createInitialState,
     DEFAULT_CCR_CONFIG,
     defaultConfig,
+    retrieveByRef,
     STORED_PLACEHOLDER_MARKER,
+    storeOriginal,
     type CoreMessage,
     type MessageContentStore,
 } from "acp-kernel";
 import { parseCompressSettings } from "../src/config.ts";
 import { applyCompressSettings, mergeCompress } from "../src/compress-settings.ts";
-import { adoptContentStore, drainPendingRetrievals, executeRetrieve, retrieveToolName, storeEffectiveCcr, contentStoreOf } from "../src/store.ts";
+import { adoptContentStore, drainPendingRetrievals, executeRetrieve, retrieveToolName, storeEffectiveCcr, contentStoreOf, DEFAULT_MAX_STORE_BYTES, enforceStoreCap } from "../src/store.ts";
 import { RETRIEVE_TOOL_NAME } from "../src/compress-tool.ts";
 import { getSession } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -179,6 +182,148 @@ test("envelope round-trip: dirty flag gates the write; reload restores the store
         session.contentStoreDirty = true;
         store.flushSync(session);
         assert.equal(findEnvelope(PERSIST_TMP), null, "emptied store deletes the envelope");
+    } finally {
+        _setStoreForTest(new SessionStore({ enabled: false }));
+        rmSync(PERSIST_TMP, { recursive: true, force: true });
+    }
+});
+
+// ---- #1282: content-store byte cap + oldest-first eviction ----
+
+function multiStore(entries: Array<{ ref: string; rawId: string; text: string }>): MessageContentStore {
+    let store = createContentStore();
+    for (const e of entries) {
+        store = storeOriginal(store, {
+            ref: e.ref,
+            rawId: e.rawId,
+            text: e.text,
+            kind: "shell output",
+            tokens: Math.ceil(e.text.length / 4),
+            head: e.text.slice(0, 32),
+        });
+    }
+    return store;
+}
+
+function storeBytes(s: MessageContentStore): number {
+    let n = 0;
+    for (const t of Object.values(s.byHash)) n += Buffer.byteLength(t, "utf8");
+    return n;
+}
+
+test("parseCompressSettings: ccr.maxStoreBytes (0=unbounded, >0=cap, <0 invalid)", () => {
+    assert.equal(parseCompressSettings({ ccr: { enabled: true, maxStoreBytes: 0 } }).ccr?.maxStoreBytes, 0);
+    assert.equal(parseCompressSettings({ ccr: { enabled: true, maxStoreBytes: 4096 } }).ccr?.maxStoreBytes, 4096);
+    assert.equal(parseCompressSettings({ ccr: { enabled: true } }).ccr?.maxStoreBytes, undefined);
+    // invalid values reject the whole settings block (fail loudly, #155)
+    assert.equal(parseCompressSettings({ ccr: { enabled: true, maxStoreBytes: -1 } }), undefined);
+    assert.equal(parseCompressSettings({ ccr: { enabled: true, maxStoreBytes: Number.NaN } }), undefined);
+    assert.equal(parseCompressSettings({ ccr: { enabled: true, maxStoreBytes: "32" } }), undefined);
+});
+
+test("enforceStoreCap evicts oldest refs first until under the byte cap", () => {
+    const session = getSession(`ccr-cap-${Math.random().toString(36).slice(2)}`);
+    const store = multiStore([
+        { ref: "m00001", rawId: "r1", text: "x".repeat(1000) + "1" },
+        { ref: "m00002", rawId: "r2", text: "x".repeat(1000) + "2" },
+        { ref: "m00003", rawId: "r3", text: "x".repeat(1000) + "3" },
+        { ref: "m00004", rawId: "r4", text: "x".repeat(1000) + "4" },
+    ]);
+    const CAP = 2560;
+    assert.ok(storeBytes(store) > CAP, "precondition: store exceeds the cap");
+    storeEffectiveCcr(session, { enabled: true, minToolTokens: 50, maxStoreBytes: CAP });
+    session.contentStore = store;
+    const evicted = enforceStoreCap(session);
+    assert.equal(evicted, 2);
+    assert.deepEqual(Object.keys(session.contentStore!.byRef).sort(), ["m00003", "m00004"]);
+    assert.equal(Object.keys(session.contentStore!.byHash).length, 2, "freed hashes drop from byHash");
+    assert.ok(storeBytes(session.contentStore!) <= CAP);
+    // honest miss for evicted refs, hit for survivors
+    assert.equal(retrieveByRef(session.contentStore!, "m00001").ok, false);
+    assert.equal(retrieveByRef(session.contentStore!, "m00004").ok, true);
+});
+
+test("enforceStoreCap is dedup-aware: shared content frees only on its last ref", () => {
+    const session = getSession(`ccr-dedup-${Math.random().toString(36).slice(2)}`);
+    const shared = "s".repeat(1500);
+    const store = multiStore([
+        { ref: "m00001", rawId: "r1", text: shared },
+        { ref: "m00002", rawId: "r2", text: shared },
+        { ref: "m00003", rawId: "r3", text: "u".repeat(1500) },
+    ]);
+    assert.equal(Object.keys(store.byHash).length, 2, "two unique contents despite three refs");
+    storeEffectiveCcr(session, { enabled: true, minToolTokens: 50, maxStoreBytes: 1500 });
+    session.contentStore = store;
+    enforceStoreCap(session);
+    // evicting m00001 frees nothing (m00002 still shares the hash); m00002 frees it.
+    assert.deepEqual(Object.keys(session.contentStore!.byRef).sort(), ["m00003"]);
+    assert.equal(Object.keys(session.contentStore!.byHash).length, 1);
+    assert.equal(retrieveByRef(session.contentStore!, "m00001").ok, false);
+    assert.equal(retrieveByRef(session.contentStore!, "m00003").ok, true);
+});
+
+test("maxStoreBytes 0 disables the cap (unbounded lossless retention)", () => {
+    const session = getSession(`ccr-unb-${Math.random().toString(36).slice(2)}`);
+    const store = multiStore(Array.from({ length: 5 }, (_, i) => ({
+        ref: `m0000${i + 1}`,
+        rawId: `r${i + 1}`,
+        text: "z".repeat(1000) + String(i),
+    })));
+    storeEffectiveCcr(session, { enabled: true, minToolTokens: 50, maxStoreBytes: 0 });
+    session.contentStore = store;
+    assert.equal(enforceStoreCap(session), 0);
+    assert.equal(Object.keys(session.contentStore!.byRef).length, 5);
+});
+
+test("default cap (unset) leaves a modest store intact; constant is 32 MiB", () => {
+    assert.equal(DEFAULT_MAX_STORE_BYTES, 32 * 1024 * 1024);
+    const session = getSession(`ccr-def-${Math.random().toString(36).slice(2)}`);
+    const store = multiStore([{ ref: "m00001", rawId: "r1", text: "a".repeat(100_000) }]);
+    storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
+    session.contentStore = store;
+    assert.equal(enforceStoreCap(session), 0);
+    assert.equal(retrieveByRef(session.contentStore!, "m00001").ok, true);
+});
+
+test("adoptContentStore enforces the cap on growth (over-cap arrival is evicted)", () => {
+    const session = getSession(`ccr-grow-${Math.random().toString(36).slice(2)}`);
+    storeEffectiveCcr(session, { enabled: true, minToolTokens: 50, maxStoreBytes: 5000 });
+    const turn = turnWith(ccrConfig());
+    assert.ok(storeBytes(turn.contentStore) > 5000, "precondition: arrival exceeds the cap");
+    adoptContentStore(session, turn.contentStore);
+    assert.equal(Object.keys(session.contentStore!.byRef).length, 0, "single over-cap entry is evicted");
+    assert.equal(session.stats.storedBytes, 0);
+});
+
+test("legacy oversized envelope is trimmed to the cap on first touch (load path)", () => {
+    const store = new SessionStore({ dir: PERSIST_TMP, debounceMs: 0 });
+    _setStoreForTest(store);
+    const id = `ccr-capload-${Math.random().toString(36).slice(2)}`;
+    try {
+        const s = getSession(id);
+        // Phase 1: persist an oversized envelope under an unbounded cap — a file
+        // written before the cap existed / by a larger-cap config.
+        storeEffectiveCcr(s, { enabled: true, minToolTokens: 50, maxStoreBytes: 0 });
+        s.contentStore = multiStore([
+            { ref: "m00001", rawId: "r1", text: "a".repeat(1000) + "1" },
+            { ref: "m00002", rawId: "r2", text: "b".repeat(1000) + "2" },
+            { ref: "m00003", rawId: "r3", text: "c".repeat(1000) + "3" },
+            { ref: "m00004", rawId: "r4", text: "d".repeat(1000) + "4" },
+        ]);
+        s.contentStoreDirty = true;
+        assert.ok(store.flushSync(s));
+        // Phase 2: reload the same id with a tight cap → first touch trims it.
+        s.contentStore = undefined;
+        s.contentStoreDirty = false;
+        storeEffectiveCcr(s, { enabled: true, minToolTokens: 50, maxStoreBytes: 2560 });
+        const loaded = contentStoreOf(s);
+        assert.deepEqual(Object.keys(loaded.byRef).sort(), ["m00003", "m00004"], "oldest refs trimmed on load");
+        assert.ok(storeBytes(loaded) <= 2560);
+        // the persisted file converges too
+        assert.ok(store.flushSync(s));
+        s.contentStore = undefined;
+        const reloaded = contentStoreOf(getSession(id));
+        assert.deepEqual(Object.keys(reloaded.byRef).sort(), ["m00003", "m00004"]);
     } finally {
         _setStoreForTest(new SessionStore({ enabled: false }));
         rmSync(PERSIST_TMP, { recursive: true, force: true });

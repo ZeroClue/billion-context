@@ -250,6 +250,13 @@ export type CompressSettings = {
         /** Max characters for the placeholder head/command preview (kernel
          *  default 96). */
         maxHeadChars?: number;
+        /** [#1282] Host-side byte cap for this session's content-store envelope
+         *  (.content-store.json). The kernel delegates retention downstream, so
+         *  bili evicts oldest refs (mNNNNN ascending) once the store exceeds the
+         *  cap — folded content drops out before recent arrivals. Absent = 32 MiB
+         *  default; 0 = unbounded (lossless-retention escape hatch); >0 = cap in
+         *  bytes. Evicted refs degrade to honest retrieve misses. */
+        maxStoreBytes?: number;
     };
     /** [#1095] Image pre-compression (kernel `Config.imageCompression`,
      *  acp-kernel >= 0.0.84). When `enabled`, screenshot-like images in tool
@@ -1077,7 +1084,7 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         } else {
             const co = c as Record<string, unknown>;
             const cleaned: NonNullable<CompressSettings["ccr"]> = {};
-            for (const key of ["enabled", "minToolTokens", "excludeTools", "toolName", "maxHeadChars"] as const) {
+            for (const key of ["enabled", "minToolTokens", "excludeTools", "toolName", "maxHeadChars", "maxStoreBytes"] as const) {
                 if (!(key in co)) continue;
                 const v = co[key];
                 if (key === "enabled") {
@@ -1086,6 +1093,10 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
                 } else if (key === "minToolTokens" || key === "maxHeadChars") {
                     if (typeof v !== "number" || !Number.isFinite(v)) { ok = false; continue; }
                     cleaned[key] = v;
+                } else if (key === "maxStoreBytes") {
+                    // 0 = unbounded escape hatch; >0 = cap in bytes; <0 / non-finite invalid.
+                    if (typeof v !== "number" || !Number.isFinite(v) || v < 0) { ok = false; continue; }
+                    cleaned.maxStoreBytes = v;
                 } else if (key === "excludeTools") {
                     if (!Array.isArray(v) || v.some((x) => typeof x !== "string")) { ok = false; continue; }
                     cleaned.excludeTools = [...v] as string[];

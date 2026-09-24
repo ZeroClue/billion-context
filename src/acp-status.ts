@@ -8,7 +8,7 @@ import {
     type CoreMessage,
 } from "acp-kernel";
 import { getBlindTunnelStats } from "./mitm.js";
-import { ccrEnabled, contentStoreOf } from "./store.js";
+import { DEFAULT_MAX_STORE_BYTES, ccrEnabled, contentStoreOf, effectiveCcr } from "./store.js";
 import { preCompactionArchiveOf, type Session } from "./session.js";
 import { VERSION } from "./version.js";
 
@@ -80,14 +80,23 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     // #1097: the processTurn above already resolved the envelope when armed
     // (contentStoreOf is idempotent); when disarmed skip the disk read.
     const ccrArmed = ccrEnabled(ctx.session);
-    const storeCount = ccrArmed ? Object.keys(contentStoreOf(ctx.session).byRef).length : 0;
+    const store = ccrArmed ? contentStoreOf(ctx.session) : undefined;
+    const storeCount = store ? Object.keys(store.byRef).length : 0;
     if (ccrArmed && (storeCount > 0 || (ctx.session.stats.retrieveCalls ?? 0) > 0)) {
         const st = ctx.session.stats;
         const calls = st.retrieveCalls ?? 0;
         const hits = st.retrieveHits ?? 0;
         const rate = calls > 0 ? Math.round((hits / calls) * 100) : 0;
+        // #1282: surface the envelope byte cap beside current usage so an
+        // operator can see how close a session is to eviction.
+        const stored = st.storedBytes ?? 0;
+        const capRaw = effectiveCcr(ctx.session)?.maxStoreBytes;
+        const cap = capRaw === undefined ? DEFAULT_MAX_STORE_BYTES : capRaw > 0 ? capRaw : null;
+        const quota = cap === null
+            ? `${fmtBytes(stored)} stored`
+            : `${fmtBytes(stored)} of ${fmtBytes(cap)} cap${stored > 0 ? ` (${Math.round((stored / cap) * 100)}%)` : ""}`;
         extra.push("");
-        extra.push(`STORE (CCR) — ${storeCount} item(s) · ${fmtBytes(st.storedBytes ?? 0)} stored · ${fmtBytes(st.storeBytesSaved ?? 0)} saved on wire · retrieved ${hits}/${calls}${calls > 0 ? ` (${rate}%)` : ""}`);
+        extra.push(`STORE (CCR) — ${storeCount} item(s) · ${quota} · ${fmtBytes(st.storeBytesSaved ?? 0)} saved on wire · retrieved ${hits}/${calls}${calls > 0 ? ` (${rate}%)` : ""}`);
     }
     const archive = preCompactionArchiveOf(ctx.session);
     const archivedIds = Object.keys(archive);
