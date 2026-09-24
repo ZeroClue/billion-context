@@ -1,6 +1,7 @@
 import {
     collectBlockContent,
     parseBoundary,
+    retrieveByRef,
     retrievedMessageId,
     type CompressionBlock,
     type CompressionCore,
@@ -13,7 +14,7 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { markDirty, preCompactionArchiveOf, peekSession, findSessionByCanonicalId, type Session } from "./session.js";
 import { getStore } from "./persist.js";
-import { ccrEnabled } from "./store.js";
+import { ccrEnabled, contentStoreOf } from "./store.js";
 
 /** Bounded retention for large-decompress temp files. Each decompress with
  *  body > 10000 writes one file under tmpdir(); the reaper unlinks oldest past
@@ -117,7 +118,7 @@ export function resolveDecompress(
     if (outPath) {
         try {
             mkdirSync(dirname(outPath), { recursive: true });
-            writeFileSync(outPath, body, "utf8");
+            writeFileSync(outPath, body, { encoding: "utf8", mode: 0o600 });
             trackedTempFiles.push({ path: outPath, mtimeMs: Date.now() });
             reapTempFiles();
             return `${header}\nContent (${body.length} chars) written to: ${outPath}\nUse the read tool to access it.`;
@@ -177,7 +178,16 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
     const startRaw = typeof args.startId === "string" ? args.startId.trim() : "";
     const endRaw = typeof args.endId === "string" ? args.endId.trim() : "";
     if (!startRaw || !endRaw) return "[decompress FAILED: startId and endId must be given together]";
-    if (!ccrEnabled(ctx.session)) return "[decompress FAILED: range restore (startId/endId) requires CCR — enable compress.ccr.enabled]";
+    if (!ccrEnabled(ctx.session)) {
+        // [#1207 review F3] Plugin mode structurally never arms CCR (the agent
+        // owns its folds; bili never executes them) — the generic "enable
+        // compress.ccr.enabled" advice is unsatisfiable there and would send
+        // the model chasing a config that cannot help.
+        if (typeof ctx.session.metadata.pluginAgent === "string") {
+            return "[decompress FAILED: range restore (startId/endId) is proxy-mode only — plugin mode owns its folds natively]";
+        }
+        return "[decompress FAILED: range restore (startId/endId) requires CCR — enable compress.ccr.enabled]";
+    }
     const sb = parseBoundary(startRaw);
     const eb = parseBoundary(endRaw);
     if (!sb || sb.kind !== "message" || !eb || eb.kind !== "message") {
@@ -195,18 +205,38 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
         const text = m.text ?? "";
         parts.push(m.toolName && m.contentType !== "text" ? `[${m.role} • ${m.toolName}]\n${text}` : `[${m.role}]\n${text}`);
     }
+    let restoredFromStore = 0;
+    // [#1207 review F1] Covered originals may have left the client's re-sent
+    // view (native-compaction archive adoption, client-side trimming, restart
+    // with a compacted client) — exactly the scenario storeCoveredOriginals
+    // exists for. Fall back to the fold-time content store, keyed by the
+    // coverage's own ref numbers (byRef is mNNNNN-indexed; ids are never
+    // reused, so num → ref is stable). Same arming gate as the entry path.
     if (parts.length === 0) {
-        return `[decompress FAILED: originals for ${startRaw}–${endRaw} are no longer in this request's view (session restarted?) — whole-block decompress may still work from cache]`;
+        const store = contentStoreOf(ctx.session);
+        for (const { raw, num } of cov.raws) {
+            if (!pickedSet.has(raw)) continue;
+            const r = retrieveByRef(store, `m${String(num).padStart(5, "0")}`);
+            if (!r.ok) continue;
+            parts.push(r.entry.toolName ? `[${r.entry.toolName} • stored]\n${r.text}` : `[${r.entry.kind} • stored]\n${r.text}`);
+            restoredFromStore++;
+        }
+        if (parts.length === 0) {
+            return `[decompress FAILED: originals for ${startRaw}–${endRaw} are neither in this request's view nor in the content store (pre-CCR fold) — whole-block decompress may still work from cache]`;
+        }
     }
     const header = `[Block ${block.blockId} content — ${startRaw}–${endRaw} — ${parts.length} item(s)]`;
     let injText: string;
     const body = parts.join("\n\n");
     if (body.length > 10000) {
         const safeBlockId = block.blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
-        const outPath = join(tmpdir(), `acp-decompress-${safeBlockId}-${Date.now()}.txt`);
+        // [#1207 review F4] Span in the filename (two spans of one block in the
+        // same millisecond must not clobber each other) and 0600 (folded
+        // conversation content is not world-readable on multi-user hosts).
+        const outPath = join(tmpdir(), `acp-decompress-${safeBlockId}-${startRaw}-${endRaw}-${Date.now()}.txt`);
         try {
             mkdirSync(dirname(outPath), { recursive: true });
-            writeFileSync(outPath, body, "utf8");
+            writeFileSync(outPath, body, { encoding: "utf8", mode: 0o600 });
             trackedTempFiles.push({ path: outPath, mtimeMs: Date.now() });
             reapTempFiles();
             injText = `${header}\nContent (${body.length} chars) written to: ${outPath}\nUse the read tool to access it.`;
@@ -216,10 +246,16 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
     } else {
         injText = `${header}\n${body}`;
     }
-    ctx.session.pendingRetrievals.push({ id: retrievedMessageId(`range_${block.blockId}_${startRaw}-${endRaw}`), role: "system", contentType: "text", text: injText });
-    ctx.session.stats.rangeRestores = (ctx.session.stats.rangeRestores ?? 0) + 1;
+    // [#1207 review F5] A client retry re-executes this path; the injection id
+    // is deterministic, so dedupe on it — retries re-ack without queueing a
+    // duplicate full-text message or inflating rangeRestores.
+    const injId = retrievedMessageId(`range_${block.blockId}_${startRaw}-${endRaw}`);
+    if (!ctx.session.pendingRetrievals.some((p) => p.id === injId)) {
+        ctx.session.pendingRetrievals.push({ id: injId, role: "system", contentType: "text", text: injText });
+        ctx.session.stats.rangeRestores = (ctx.session.stats.rangeRestores ?? 0) + 1;
+    }
     markDirty(ctx.session);
-    ctx.log(`[acp-decompress-range] ${block.blockId} ${startRaw}–${endRaw}: restored ${parts.length} item(s) via ephemeral injection`);
+    ctx.log(`[acp-decompress-range] ${block.blockId} ${startRaw}–${endRaw}: restored ${parts.length} item(s)${restoredFromStore ? ` (${restoredFromStore} from content store)` : ""} via ephemeral injection`);
     return `[decompress ${block.blockId} ${startRaw}–${endRaw}: restored ${parts.length} item(s) — full content follows]`;
 }
 

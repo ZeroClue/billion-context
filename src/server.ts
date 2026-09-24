@@ -1384,7 +1384,15 @@ async function handle(
                 windowShrinkReason = "operator";
             }
             const compressCfg = resolveCompress(opts.routes, embeddedUrl, model, opts.compress);
-            resolvedCcrCfg = compressCfg.ccr;
+            // [#1179 default-on / #1207 review] `resolveCompress` returns the
+            // RAW three-level merge — the unset-means-enabled default lives in
+            // `applyCompressSettings`, which this arming path bypasses. Without
+            // re-applying it here, a config with no `ccr` at any level leaves
+            // resolvedCcrCfg undefined and the session NEVER arms: "on by
+            // default in proxy mode" would be dead at its only enforcement
+            // point (kernelConfig already gets the default via
+            // resolveRequestConfig — only this stamp was raw).
+            resolvedCcrCfg = compressCfg.ccr ?? { enabled: true };
         resolvedImageCompressionCfg = compressCfg.imageCompression;
             reqPrompts = resolveCompressPrompts(compressCfg);
             const surfaceRes = resolveCompressSurfaceDetailed(compressCfg);

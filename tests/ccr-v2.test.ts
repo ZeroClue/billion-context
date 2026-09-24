@@ -134,6 +134,32 @@ test("CCR v2 range decompress: restores only the span via ephemeral injection", 
     assert.ok(f.session.blockContents.has(f.blockId), "whole-block cache untouched");
 });
 
+test("CCR v2 range decompress: falls back to the content store when the client view lacks originals (#1207 F1)", () => {
+    const f = fold({ ccr: true });
+    // Native-compaction archive adoption / client-side trimming / restart with
+    // a compacted client: the re-sent history no longer carries the covered
+    // originals — only the fold-time content store does.
+    const trimmed = { core: f.core, config: f.config, messages: f.msgs.slice(10), session: f.session, log: () => {} };
+    const ack = resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004" }, trimmed);
+    assert.match(ack, /restored 3 item\(s\)/, `store fallback should restore, got: ${ack.slice(0, 200)}`);
+    const injs = drainPendingRetrievals(f.session);
+    assert.equal(injs.length, 1);
+    assert.match(injs[0]!.text!, /Historical detail 1\./);
+    assert.match(injs[0]!.text!, /Historical detail 3\./);
+    assert.doesNotMatch(injs[0]!.text!, /Historical detail 0\./);
+});
+
+test("CCR v2 range decompress: client retry dedupes the injection and the stat (#1207 F5)", () => {
+    const f = fold({ ccr: true });
+    const ctx = ctxOf(f);
+    const a1 = resolveDecompress({ blockId: f.blockId, startId: "m00001", endId: "m00002" }, ctx);
+    const a2 = resolveDecompress({ blockId: f.blockId, startId: "m00001", endId: "m00002" }, ctx);
+    assert.match(a1, /restored 2 item\(s\)/);
+    assert.equal(a2, a1, "retry re-acks identically");
+    assert.equal(drainPendingRetrievals(f.session).length, 1, "no duplicate full-text injection");
+    assert.equal(f.session.stats.rangeRestores, 1);
+});
+
 test("CCR v2 range decompress: failure modes queue nothing", () => {
     const f = fold({ ccr: true });
     const ctx = ctxOf(f);
@@ -241,7 +267,7 @@ function anthropicTextSse(res: http.ServerResponse, id: string, text: string): v
     res.end();
 }
 
-async function startV2Proxy(captured: string[]): Promise<{ proxyPort: number; upstreamPort: number; closeAll: () => Promise<void> }> {
+async function startV2Proxy(captured: string[], noCcr?: boolean): Promise<{ proxyPort: number; upstreamPort: number; closeAll: () => Promise<void> }> {
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -271,7 +297,7 @@ async function startV2Proxy(captured: string[]): Promise<{ proxyPort: number; up
         },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        compress: { injectTool: true, minCompressRangeChars: 1000, ccr: { enabled: true } },
+        compress: noCcr ? { injectTool: true, minCompressRangeChars: 1000 } : { injectTool: true, minCompressRangeChars: 1000, ccr: { enabled: true } },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
@@ -326,6 +352,34 @@ test("e2e CCR v2 streaming: range restore rides the re-request with pair integri
             assert.ok(systemAnchorHasCc(captured[i]!), `request ${i + 1}: client cache_control survives on the anchor block`);
         }
         assert.equal(ccOnInjectedContent(captured[2]!), false, "no breakpoint lands on injected range-restore content");
+    } finally {
+        await closeAll();
+    }
+});
+
+test("e2e CCR v2 default-on: no ccr config at any level still arms the session through the real server path (#1207)", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const captured: string[] = [];
+    const { proxyPort, upstreamPort, closeAll } = await startV2Proxy(captured, true);
+    const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
+
+    try {
+        const msgs = Array.from({ length: 20 }, (_, i) => ({ role: i % 2 === 0 ? "user" : "assistant", content: `Historical detail ${i}. ${"y".repeat(2000)}` }));
+        const res = await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "ccr-v2-e2e-default-on", "anthropic-version": "2023-06-01" },
+            body: JSON.stringify({ model: "claude-test", max_tokens: 1000, stream: true, system: [{ type: "text", text: "SYS ANCHOR", cache_control: { type: "ephemeral" } }], messages: msgs }),
+        });
+        const sse = await res.text();
+        assert.ok(res.ok, `client turn failed: HTTP ${res.status}: ${sse}`);
+        assert.equal(captured.length, 3, "initial request + one re-request per executed tool");
+        // The arming fix (#1179 default-on at server.ts resolvedCcrCfg) is what
+        // lets the range decompress succeed with NO ccr key in any config
+        // level — without it the ack would be "requires CCR" and nothing would
+        // be restored.
+        assert.match(captured[2]!, /restored 3 item\(s\)/, "range restore ack present (session armed by default)");
+        assert.match(captured[2]!, /Historical detail 2\./, "restored span text rides the re-request");
     } finally {
         await closeAll();
     }
