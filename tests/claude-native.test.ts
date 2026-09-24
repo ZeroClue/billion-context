@@ -382,7 +382,13 @@ test("resolveClaudeHostPid: live ps walk finds a spawned claude host", { timeout
         assert.equal(readPsProcInfo(999_999_999), null);
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
-        if (claude !== null && claude.pid !== undefined && claude.pid > 1) process.kill(claude.pid, "SIGKILL");
+        if (claude !== null && claude.pid !== undefined && claude.pid > 1) {
+            try {
+                process.kill(claude.pid, "SIGKILL");
+            } catch {
+                // already gone (e.g. OOM-killed mid-test on a loaded box)
+            }
+        }
         if (leafPid > 1) {
             try {
                 process.kill(leafPid, "SIGKILL");
