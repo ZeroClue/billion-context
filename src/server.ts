@@ -74,7 +74,7 @@ import { imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, typ
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
-import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./logger.js";
+import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError } from "./logger.js";
 import { configFile, defaultLogFile, dumpsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, isPidAlive, registerInstanceAndWarn, unregisterInstance } from "./instance.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
@@ -576,7 +576,21 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // Catch stray rejections/throws from background work (compress loops,
     // auto-update, initSessions) that escape the per-request try/catch —
     // Node 20+ aborts the process on these by default. Log loudly and flush.
+    let suppressedWriteErrors = 0;
     process.on("uncaughtException", (err) => {
+        if (isStreamWriteError(err)) {
+            // Belt-and-suspenders for #1233: the logger's own stderr path is
+            // guarded and never reaches here; a stream-write error that does
+            // comes from some other writer hitting a dead stream. Log the
+            // first, drop the rest — logging a storm through the logger would
+            // only feed it.
+            if (suppressedWriteErrors === 0) {
+                log("error", `uncaughtException (stream-write; suppressing repeats): ${String(err?.stack ?? err)}`);
+            } else {
+                suppressedWriteErrors += 1;
+            }
+            return;
+        }
         log("error", `uncaughtException: ${String(err?.stack ?? err)}`);
     });
     process.on("unhandledRejection", (reason) => {
