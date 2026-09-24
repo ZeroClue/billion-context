@@ -1115,7 +1115,8 @@ CCR content stores (#1097) live next to their session file as
 `<hash>.content-store.json` and follow the same lifecycle (#1180): a store is
 deleted together with its session file, an orphaned store (session file
 already gone) is swept once past the age gate, and the store's token footprint
-(unique-content chars ÷ 4) counts toward the size ceiling above. Compressed
+(unique-content counted with the kernel's CJK-aware `defaultCountTokens` — the
+same estimator as `rawInputTokens`) counts toward the size ceiling above. Compressed
 sessions are never deleted (their summaries cannot be rebuilt losslessly). Every deletion is audit-logged individually, plus one summary
 line per non-empty sweep. Live sessions, unreadable files, and encrypted
 files are handled conservatively (decoded via `BILI_ENCRYPTION_KEY` before

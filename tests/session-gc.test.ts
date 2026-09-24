@@ -154,7 +154,7 @@ after(() => {
         assert.equal(isGcEligible({ ...base, storedTokens: 0 }, now, cfg), true, "zero footprint changes nothing");
     });
 
-    test("contentStoreTokens: unique-content chars ÷ 4; null for anything that is not a store envelope (#1180)", () => {
+    test("contentStoreTokens: unique-content via CJK-aware estimator; null for anything that is not a store envelope (#1180)", () => {
         assert.equal(contentStoreTokens({ version: 1, byHash: { h1: "aaaa", h2: "bbbb" }, byRef: { m00001: {} } }), 2, "sums byHash values via the CJK-aware estimator");
         assert.equal(contentStoreTokens({ version: 1, byHash: { h1: "测试测试测试" }, byRef: { m00001: {} } }), 6, "CJK content counts per character (not chars÷4)");
         assert.equal(contentStoreTokens({ version: 1, byHash: {}, byRef: {} }), 0, "valid empty envelope → 0");

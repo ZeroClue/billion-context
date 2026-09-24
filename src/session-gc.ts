@@ -56,8 +56,9 @@ import { dropSessionForGc, peekSession } from "./session.js";
  *     goes;
  *   - swept directly when orphaned (session file already gone — leftovers
  *     from versions that deleted sessions without their stores);
- *   - its token footprint (unique-content chars ÷ 4) counts toward the size
- *     gate, so a tiny session with a huge store does not slip under it;
+ *   - its token footprint (unique-content via the kernel's CJK-aware
+ *     defaultCountTokens, same estimator as rawInputTokens) counts toward the
+ *     size gate, so a tiny session with a huge store does not slip under it;
  *   - attached to a kept session → kept untouched; an unreadable/foreign
  *     companion next to an otherwise-eligible session → both kept (never
  *     guess at unreadable files).
