@@ -155,7 +155,8 @@ after(() => {
     });
 
     test("contentStoreTokens: unique-content chars ÷ 4; null for anything that is not a store envelope (#1180)", () => {
-        assert.equal(contentStoreTokens({ version: 1, byHash: { h1: "aaaa", h2: "bbbb" }, byRef: { m00001: {} } }), 2, "sums byHash values, ÷4 rounded up");
+        assert.equal(contentStoreTokens({ version: 1, byHash: { h1: "aaaa", h2: "bbbb" }, byRef: { m00001: {} } }), 2, "sums byHash values via the CJK-aware estimator");
+        assert.equal(contentStoreTokens({ version: 1, byHash: { h1: "测试测试测试" }, byRef: { m00001: {} } }), 6, "CJK content counts per character (not chars÷4)");
         assert.equal(contentStoreTokens({ version: 1, byHash: {}, byRef: {} }), 0, "valid empty envelope → 0");
         assert.equal(contentStoreTokens({ version: 1, byHash: { h1: "x" } }), null, "missing byRef → not an envelope");
         assert.equal(contentStoreTokens(envelope("s1", 1234)), null, "session record (version 3) is not a store envelope");

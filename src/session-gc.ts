@@ -2,6 +2,7 @@ import { readdir, rm, rmdir, stat } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import path from "node:path";
 import { log as loggerLog } from "./logger.js";
+import { defaultCountTokens } from "acp-kernel";
 import { getStore, type SessionStore } from "./persist.js";
 import { sessionsDir } from "./paths.js";
 import { dropSessionForGc, peekSession } from "./session.js";
@@ -141,8 +142,10 @@ export function viewFromParsed(parsed: unknown): FileView | null {
 }
 
 /** Approximate token footprint of a parsed CCR content-store envelope
- *  (#1097): unique-content chars (byHash values) ÷ 4, matching bili's default
- *  char-based estimator. Null when the value is not a store envelope — the
+ *  (#1097): unique-content (byHash values) tokens via the kernel's CJK-aware
+ *  defaultCountTokens — the same estimator rawInputTokens uses (persist.ts),
+ *  so the size gate never mixes estimators (chars÷4 undercounts CJK-heavy
+ *  stores up to 4×). Null when the value is not a store envelope — the
  *  caller keeps the session rather than guessing at an unknown companion. */
 export function contentStoreTokens(parsed: unknown): number | null {
     const rec = asRecord(parsed);
@@ -150,11 +153,11 @@ export function contentStoreTokens(parsed: unknown): number | null {
     const byHash = asRecord(rec.byHash);
     const byRef = asRecord(rec.byRef);
     if (!byHash || !byRef) return null;
-    let chars = 0;
+    let tokens = 0;
     for (const text of Object.values(byHash)) {
-        if (typeof text === "string") chars += text.length;
+        if (typeof text === "string") tokens += defaultCountTokens(text);
     }
-    return Math.ceil(chars / 4);
+    return tokens;
 }
 
 export function isGcEligible(view: FileView, now: number, cfg: Pick<GcConfig, "maxAgeMs" | "maxTokens">): boolean {
@@ -246,6 +249,7 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
                 // Companion present but not a recognizable store envelope —
                 // cannot verify what deletion would lose. Keep both (same rule
                 // as unreadable session files: never guess).
+                loggerLog("info", `[gc] kept session ${path.relative(dir, file)}: companion ${path.basename(companion)} is not a recognizable content store`);
                 result.kept++;
                 continue;
             }
@@ -303,8 +307,12 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
                 let twinHasOwnStore = false;
                 try {
                     const s2 = await stat(sf.slice(0, -".json".length) + companionSuffix);
-                    twinHasOwnStore = s2.isFile();
-                } catch { /* no sibling */ }
+                    // Existence alone is not adoption: loadContentStore falls
+                    // through to _unknown/ when the namespaced store exists but
+                    // is UNREADABLE — the stale sibling stays the twin's live
+                    // store. Probe the shape, not the inode.
+                    twinHasOwnStore = s2.isFile() && contentStoreTokens(await store.readRawFile(sf.slice(0, -".json".length) + companionSuffix)) !== null;
+                } catch { /* no sibling, or unreadable: keep — never guess */ }
                 if (!twinHasOwnStore) {
                     keepCompanion = true;
                     break;
