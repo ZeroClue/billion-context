@@ -8,10 +8,10 @@
 // (Node ignores them, which is why the defect shipped silently). See the
 // issue filed from #1234.
 
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 const RELATIVE_CALL = /(?:import|require)\(\s*['"]\.{1,2}\/[^'"]*['"][^)]*\)/g;
 
@@ -41,7 +41,10 @@ export function checkDistImportAnnotations(distDir) {
     return violations;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+const invoked = process.argv[1];
+// Realpath both sides: Node resolves entry-point symlinks, so argv[1] can differ from import.meta.url
+const isMain = !!invoked && realpathSync(fileURLToPath(import.meta.url)) === realpathSync(invoked);
+if (isMain) {
     const distDir = process.argv[2] ?? "dist";
     const violations = checkDistImportAnnotations(distDir);
     if (violations.length > 0) {
