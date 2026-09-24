@@ -31,6 +31,7 @@ import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
+import { renderDoctorReport, runDoctor } from "./doctor.js";
 import { VERSION, PACKAGE_NAME } from "./version.js";
 
 const HELP = `bili ${VERSION} — billion-context proxy
@@ -62,6 +63,9 @@ Usage:
   bili export [session] [--full]   list sessions / export one as a Markdown handoff
                                     (--full includes original messages; --output FILE)
   bili update                      check for & install a newer version now
+  bili doctor                      audit every install lane: versions, owners,
+                                    freshness vs registry, running proxy processes
+                                    (read-only; --json for machine-readable output)
   bili plugin install <agent>      install the thin plugin into a host (pi/omp/
                                     claude/codex/opencode/dsh/kimi; original backed up once)
                                     --with-mcp (opencode only) also adds the mcp.bili
@@ -134,7 +138,7 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin";
+    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin";
     client?: ClientName;
     clientArgs: string[];
     mitmDomains: string[];
@@ -146,6 +150,7 @@ type Parsed = {
     pluginAction?: "install" | "remove" | "update" | "list";
     pluginAgent?: PluginAgent;
     pluginWithMcp?: boolean;
+    doctorJson?: boolean;
 };
 
 export function parseArgs(argv: string[]): Parsed {
@@ -162,6 +167,7 @@ export function parseArgs(argv: string[]): Parsed {
     let pluginAction: Parsed["pluginAction"];
     let pluginAgent: Parsed["pluginAgent"];
     let pluginWithMcp = false;
+    let doctorJson = false;
 
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i]!;
@@ -222,6 +228,9 @@ export function parseArgs(argv: string[]): Parsed {
             case "--with-mcp":
                 pluginWithMcp = true;
                 break;
+            case "--json":
+                doctorJson = true;
+                break;
             case "-F":
             case "--port":
             case "--host":
@@ -269,6 +278,8 @@ export function parseArgs(argv: string[]): Parsed {
             command = command === "help" || command === "version" ? command : "start";
         } else if (cmd === "update") {
             command = "update";
+        } else if (cmd === "doctor") {
+            command = "doctor";
         } else if (cmd === "export") {
             command = "export";
             exportSelector = positional[1];
@@ -313,11 +324,11 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent, pluginWithMcp };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, doctorJson };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent, pluginWithMcp } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, doctorJson } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -424,6 +435,30 @@ export async function main(): Promise<void> {
             process.stdout.write(text + "\n");
         } catch (error) {
             console.error(`bili export: ${error instanceof Error ? error.message : String(error)}`);
+            process.exit(1);
+        }
+        return;
+    }
+    if (command === "doctor") {
+        // Read-only lane audit (#1235). Same egress/channel wiring as `bili
+        // update` so the registry freshness check honors -F and updateTag.
+        for (const [k, v] of Object.entries(overrides)) {
+            if (v !== undefined) process.env[k] = v;
+        }
+        let updaterResolveProxy: ((url: string) => string | undefined) | undefined;
+        let updateTag: string | undefined;
+        try {
+            const o = loadOptions();
+            updaterResolveProxy = (url) => resolveProxy(o.routes, o.proxy, url, o.proxyFallback);
+            updateTag = o.updateTag;
+        } catch {
+            // config unloadable — registry egress goes direct
+        }
+        try {
+            const report = await runDoctor({ packageName: PACKAGE_NAME, runningVersion: VERSION, resolveProxy: updaterResolveProxy, updateTag });
+            process.stdout.write(doctorJson ? JSON.stringify(report, null, 2) + "\n" : renderDoctorReport(report));
+        } catch (error) {
+            console.error(`bili doctor: ${error instanceof Error ? error.message : String(error)}`);
             process.exit(1);
         }
         return;

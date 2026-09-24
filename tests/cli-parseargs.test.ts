@@ -33,3 +33,14 @@ test("parseArgs: -F composes with other bili flags before the client (#346)", ()
     assert.equal(r.overrides.BILI_UPSTREAM_PROXY, "http://127.0.0.1:7897");
     assert.deepEqual(r.clientArgs, []);
 });
+
+// #1235: `bili doctor` is a first-class command; --json selects the
+// machine-readable report.
+test("parseArgs: doctor is a command and --json sets doctorJson (#1235)", () => {
+    const r = parseArgs(["doctor"]);
+    assert.equal(r.command, "doctor");
+    assert.equal(r.doctorJson, false);
+    const j = parseArgs(["--json", "doctor"]);
+    assert.equal(j.command, "doctor");
+    assert.equal(j.doctorJson, true);
+});
