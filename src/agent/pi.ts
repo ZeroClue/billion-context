@@ -186,7 +186,7 @@ function noProxyWarning(agent: string): string {
 
 const RETRY_INTERVAL_MS = 10000;
 
-type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; retryIntervalMs: number };
+type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; retryIntervalMs: number; manifestPrime?: { base: string; tools: Promise<ManifestTool[] | undefined> } };
 
 // omp never emits before_provider_headers, so the x-bili-plugin marker cannot
 // be stamped per request. Register the conversation id once (after tools are
@@ -214,13 +214,22 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
     if (state.retryAt !== undefined && Date.now() < state.retryAt) return;
     const wait = state.retryIntervalMs;
     state.pending = (async () => {
-        let tools: ManifestTool[];
-        try {
-            tools = await fetchManifest(proxyBase);
-        } catch (err) {
-            state.retryAt = Date.now() + wait;
-            console.error(`bili-plugin(${agent}): manifest fetch failed: ${err instanceof Error ? err.message : String(err)} — retrying in ${wait / 1000}s`);
-            return;
+        // #1217: consume the load-time manifest prime (see factory). It is
+        // taken exactly once and only for the same proxy origin; a failed
+        // prime resolves to undefined and falls through to the normal fetch
+        // below (same failure path, same log, then retry-throttled).
+        let tools: ManifestTool[] | undefined;
+        const prime = state.manifestPrime;
+        state.manifestPrime = undefined;
+        if (prime !== undefined && prime.base === proxyBase) tools = await prime.tools;
+        if (tools === undefined) {
+            try {
+                tools = await fetchManifest(proxyBase);
+            } catch (err) {
+                state.retryAt = Date.now() + wait;
+                console.error(`bili-plugin(${agent}): manifest fetch failed: ${err instanceof Error ? err.message : String(err)} — retrying in ${wait / 1000}s`);
+                return;
+            }
         }
         try {
             // toolsFor (not sid) guards the register loop: a retry after a
@@ -266,6 +275,18 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
     return function biliPlugin(pi: ExtensionAPI): void {
         const agent = agentName(agentOverride);
         const state: RegisterState = { retryIntervalMs: opts?.retryIntervalMs ?? RETRY_INTERVAL_MS };
+        // #1217: -p single-shot fires round 1 before session_start's manifest
+        // fetch can resolve, leaving the request unmarked → anonymous
+        // proxy-mode session. Prime the fetch at load time: the launcher
+        // health-checks the proxy before spawning pi, so by session_start the
+        // prime has almost always settled and toolsReady flips in microtasks
+        // — ahead of round 1. Native mode (#519) sets BILLION_CONTEXT_PROXY
+        // only after async bootstrap, so no prime exists there and round 1
+        // stays on wire mode (residual; the host would have to await us).
+        const primeBase = detectProxyBase(undefined);
+        if (primeBase !== undefined) {
+            state.manifestPrime = { base: primeBase, tools: fetchManifest(primeBase).then((t) => t, () => undefined) };
+        }
         // #535: file-free routing — override provider baseUrls at load from
         // the launcher-passed manifest (see buildPiEnv). registerProvider is
         // queued during initial extension load and applied before any model
@@ -486,7 +507,9 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 }
                 // The x-bili-plugin marker tells the proxy "the client owns the
                 // ACP tools natively — skip wire-level injection". Ownership is
-                // claimed only once tools are registered (#162).
+                // claimed only once tools are registered (#162). In launcher mode
+                // the manifest fetch is primed at extension load time (#1217), so
+                // by round 1 registration has almost always completed.
                 if (state.toolsReady === true) {
                     const sid = sessionIdOf(ctx);
                     if (sid !== undefined) headers["x-bili-plugin-conversation"] = sid;
