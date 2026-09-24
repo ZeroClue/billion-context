@@ -201,19 +201,22 @@ async function closeAll(...servers: http.Server[]): Promise<void> {
     }
 }
 
-test("e2e #781 (Responses): mixed text+image items render explicit placeholders in the summary input", async () => {
+test("e2e #781 (Responses): media payloads survive folding — bytes reach the forward, not the summary", async () => {
     const summaryBodies: unknown[] = [];
+    const forwards: string[] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
         req.on("end", () => {
-            const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { stream?: boolean };
+            const raw = Buffer.concat(chunks).toString("utf8");
+            const parsed = JSON.parse(raw) as { stream?: boolean };
             if (parsed.stream === false) {
                 summaryBodies.push(parsed);
                 res.writeHead(200, { "content-type": "application/json" });
                 res.end(JSON.stringify({ output_text: SUMMARY_TEXT }));
                 return;
             }
+            forwards.push(raw);
             res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
             res.write(completed(1000));
             res.end();
@@ -243,8 +246,11 @@ test("e2e #781 (Responses): mixed text+image items render explicit placeholders 
 
         assert.ok(summaryBodies.length >= 1, `preflight summarization ran (got ${summaryBodies.length})`);
         const all = summaryBodies.map((b) => JSON.stringify(b)).join("\n");
-        assert.equal(countOcc(all, "[image: png 1024x768]"), 2, "every folded image renders one explicit placeholder in the summary input");
+        assert.equal(countOcc(all, "[image: png 1024x768]"), 0, "kernel 0.0.85+ never folds media payloads — no image placeholders in the summary input (#1188 path B)");
         assert.ok(!all.includes(PNG_B64.slice(0, 24)), "no image bytes leak into the summary request");
+        assert.equal(forwards.length, 1, "exactly one forward upstream");
+        assert.equal(countOcc(forwards[0]!, PNG_B64.slice(0, 24)), 2, "both folded-range images survive byte-exact in the post-compression forward");
+        assert.ok(forwards[0]!.includes(SUMMARY_TEXT), "the rebuilt payload carries the preflight summary");
 
         const s = listSessions().find((x) => x.meta.label === "img-sess-781-resp");
         assert.ok(s, "session exists");
@@ -254,15 +260,17 @@ test("e2e #781 (Responses): mixed text+image items render explicit placeholders 
     }
 });
 
-test("e2e #781 (Anthropic): the codec's bare [image] literal is replaced by the richer note", async () => {
+test("e2e #781 (Anthropic): media payload survives folding byte-exact in the forward", async () => {
     const summaryBodies: Array<{ messages?: Array<{ role?: string; content?: unknown }> }> = [];
+    const forwards: string[] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
         req.on("end", () => {
-            const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { stream?: boolean };
+            const raw = Buffer.concat(chunks).toString("utf8");
+            const parsed = JSON.parse(raw) as { stream?: boolean };
             if (!parsed.stream) {
-                summaryBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+                summaryBodies.push(JSON.parse(raw));
                 res.writeHead(200, { "content-type": "application/json" });
                 res.end(JSON.stringify({
                     id: "msg_summary",
@@ -275,6 +283,7 @@ test("e2e #781 (Anthropic): the codec's bare [image] literal is replaced by the 
                 }));
                 return;
             }
+            forwards.push(raw);
             res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
             res.end(anthropicOkSse(1000));
         });
@@ -307,15 +316,18 @@ test("e2e #781 (Anthropic): the codec's bare [image] literal is replaced by the 
         assert.ok(summaryBodies.length >= 1, `preflight summarization ran (got ${summaryBodies.length})`);
         const userTexts = summaryBodies.flatMap((b) => (b.messages ?? []).filter((m) => m.role === "user").map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content))));
         const joined = userTexts.join("\n");
-        assert.equal(countOcc(joined, "[image: png 1024x768]"), 1, "the image block renders as the richer placeholder");
+        assert.equal(countOcc(joined, "[image: png 1024x768]"), 0, "kernel 0.0.85+ never folds media payloads — no image placeholder in the summary input (#1188 path B)");
         assert.ok(!joined.includes("[image]"), "the bare codec literal no longer appears");
         assert.ok(!joined.includes(PNG_B64.slice(0, 24)), "no image bytes leak into the summary request");
+        assert.equal(forwards.length, 1, "exactly one forward upstream");
+        assert.equal(countOcc(forwards[0]!, PNG_B64.slice(0, 24)), 1, "the folded-range image survives byte-exact in the post-compression forward");
+        assert.ok(forwards[0]!.includes(SUMMARY_TEXT), "the rebuilt payload carries the preflight summary");
     } finally {
         await closeAll(proxy, upstream);
     }
 });
 
-test("e2e #781 (OpenAI): image-bearing messages render placeholders in the summary input", async () => {
+test("e2e #781 (OpenAI): media payloads survive folding — bytes reach the forward, not the summary", async () => {
     const summaryBodies: unknown[] = [];
     const forwards: string[] = [];
     const upstream = http.createServer((req, res) => {
@@ -369,10 +381,11 @@ test("e2e #781 (OpenAI): image-bearing messages render placeholders in the summa
 
         assert.ok(summaryBodies.length >= 1, `preflight summarization ran (got ${summaryBodies.length})`);
         const all = summaryBodies.map((b) => JSON.stringify(b)).join("\n");
-        assert.equal(countOcc(all, "[image: png 1024x768]"), 2, "every folded image renders one explicit placeholder in the summary input");
+        assert.equal(countOcc(all, "[image: png 1024x768]"), 0, "kernel 0.0.85+ never folds media payloads — no image placeholders in the summary input (#1188 path B)");
         assert.ok(!all.includes(PNG_B64.slice(0, 24)), "no image bytes leak into the summary request");
         assert.equal(forwards.length, 1, "exactly one forward upstream");
         assert.ok(forwards[0]!.includes(SUMMARY_TEXT), "the rebuilt payload carries the preflight summary");
+        assert.equal(countOcc(forwards[0]!, PNG_B64.slice(0, 24)), 2, "both folded-range images survive byte-exact in the post-compression forward");
     } finally {
         await closeAll(proxy, upstream);
     }
