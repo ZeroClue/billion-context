@@ -1279,6 +1279,50 @@ test("ensureProxyRunning: stale instance file still finds a live wildcard daemon
     }
 });
 
+// #964: a strictPort client dials a STATIC url — attaching to a healthy proxy
+// on a DIFFERENT port would strand every request. The starter-wait path must
+// apply the same port rule as the fast path; before pickAttachable it only
+// checked config shape and attached to whatever the starter produced.
+test("ensureProxyRunning: strictPort launcher refuses a different-port starter's proxy during the wait (#964/#1232)", async () => {
+    const st = isoStateDir();
+    try {
+        claimStartingMarker({ token: "starter-strict", pid: process.pid, host: "127.0.0.1", port: 8807, startedAt: Date.now() });
+        let spawnCalls = 0;
+        let spawned = false;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8808, passthrough: false, debug: false, lane: "pi", strictPort: true },
+            {
+                spawnImpl: () => {
+                    spawnCalls++;
+                    spawned = true;
+                    return makeFakeChild(42473);
+                },
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async (origin) => (origin.endsWith("8807") ? { ok: true, instanceId: "inst-wait" } : undefined),
+                // Before spawn: the starter's proxy is up on ANOTHER port. After
+                // spawn: a dead-owner record so the readback falls back to the
+                // preferred-origin health probe.
+                readInstanceFile: () =>
+                    spawned
+                        ? recordedInstance({ instanceId: "inst-stale", origin: "http://127.0.0.1:8808", port: 8808, pid: 4_000_000 })
+                        : recordedInstance({ instanceId: "inst-wait", origin: "http://127.0.0.1:8807", port: 8807 }),
+                sleep: () => {
+                    removeStartingMarker();
+                    return new Promise<void>((r) => setTimeout(r, 200));
+                },
+                scriptPath: FP_SCRIPT,
+            },
+        );
+        assert.equal(spawnCalls, 1, "strictPort must not attach to a different-port proxy found while waiting");
+        assert.equal(handle.attached, undefined);
+        assert.ok(handle.child);
+        assert.equal(handle.origin, "http://127.0.0.1:8808");
+    } finally {
+        removeStartingMarker();
+        st.restore();
+    }
+});
+
 test("ensureProxyRunning: active starting marker of a different lane → spawns immediately, does not wait (#1225)", async () => {
     try {
         claimStartingMarker({ token: "starter-lane", pid: process.pid, host: "127.0.0.1", port: 8794, startedAt: Date.now(), lane: "codex" });
