@@ -1,4 +1,4 @@
-import { createInitialState, type CompressionState, type Config, type CoreMessage, type MessageContentStore } from "acp-kernel";
+import { createInitialState, resetImageFullState, type CompressionState, type Config, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import { createHash } from "node:crypto";
 import { getStore } from "./persist.js";
 import type { WireProtocol } from "./util.js";
@@ -138,6 +138,17 @@ export type Session = {
         storedBytes: number;
         /** #1097: cumulative wire bytes saved by placeholder substitution. */
         storeBytesSaved: number;
+        /** #1095: image blocks downscaled this session (lifetime; optional —
+         *  absent in pre-#1095 records). */
+        imageShrunkCount?: number;
+        /** #1095: cumulative wire bytes saved by image downscaling. */
+        imageBytesSaved?: number;
+        /** #1095: cumulative estimated visual tokens saved by downscaling. */
+        imageTokensSaved?: number;
+        /** #1095: total image_full tool calls issued. */
+        imageFullCalls?: number;
+        /** #1095: image_full calls that restored a downscaled ref. */
+        imageFullRestores?: number;
     };
     /** Free-form escape hatch for future fields not yet promoted to typed
      *  members. Persisted as-is (must be JSON-serializable). Use sparingly —
@@ -183,9 +194,18 @@ export type Session = {
     *  while this is set (adopt grew entries / reset cleared the store). */
     contentStoreDirty?: boolean;
     /** In-memory only (NOT persisted): full-text retrieval injections queued by
-    *  executeRetrieve, drained into the next re-request after the tool-result
-    *  pair (request-only, same channel as nudges). */
+     *  executeRetrieve, drained into the next re-request after the tool-result
+     *  pair (request-only, same channel as nudges). */
     pendingRetrievals: CoreMessage[];
+    /** #1095 in-memory only (NOT persisted): deterministic encode cache keyed
+     *  by sha256 of the ORIGINAL base64 → encoded payload. Identical inputs
+     *  must yield identical wire bytes across turns/restarts (prefix-cache
+     *  invariant), so this is a pure CPU cache, never a correctness source. */
+    imageEncodeCache?: Map<string, { b64: string; mediaType: string }>;
+    /** #1095 in-memory only (NOT persisted): sha256 fingerprints of the
+     *  original payloads shrunk per ref — lets image_full invalidate the exact
+     *  encode-cache entries a restored ref contributed. */
+    imageFingerprintsByRef?: Map<string, string[]>;
     /** Number of in-flight requests using this session. A session with
      *  inFlight > 0 must NOT be LRU-evicted: evicting it mid-stream flushes a
      *  half-mutated snapshot and then a miss reloads a SECOND Session object,
@@ -466,7 +486,10 @@ export function cacheBlockContent(session: Session, blockId: string, content: Bl
 }
 
 export function resetSessionCompression(session: Session): void {
-    session.state = createInitialState();
+    // Kernel contract (acp-kernel image-compress.d.ts): resetImageFullState on
+    // EVERY state reset — refs are re-issued here, so any surviving
+    // imageFullRestored/imageShrinks entries would misattribute.
+    session.state = resetImageFullState(createInitialState());
     session.blockContents.clear();
     // The kernel contract ties the store to the state ('host resets the store
     // with the state'): a full rebase restarts refs at m00001, so old entries
@@ -475,6 +498,10 @@ export function resetSessionCompression(session: Session): void {
     session.contentStore = undefined;
     session.contentStoreDirty = true;
     session.pendingRetrievals.length = 0;
+    // #1095: same ref-reissue rationale as the content store — encode-cache /
+    // fingerprint entries keyed by old refs would misattribute after rebase.
+    session.imageEncodeCache?.clear();
+    session.imageFingerprintsByRef?.clear();
     session.stats.lastInputTokens = 0;
     // #857: a zeroed baseline carries no provenance — drop any stale flag.
     delete session.stats.lastInputTokensSource;

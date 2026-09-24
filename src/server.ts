@@ -60,9 +60,10 @@ import {
     type GoogleSystemInstruction,
     type GoogleTool,
 } from "acp-kernel/wire";
-import { ABSORB_TOOL, ABSORB_TOOL_GOOGLE, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, retrieveToolsFor, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance, withSummaryBudgetNote } from "./compress-tool.js";
+import { ABSORB_TOOL, ABSORB_TOOL_GOOGLE, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, IMAGE_FULL_TOOL, IMAGE_FULL_TOOL_GOOGLE, IMAGE_FULL_TOOL_OPENAI, IMAGE_FULL_TOOL_RESPONSES, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, retrieveToolsFor, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance, withSummaryBudgetNote } from "./compress-tool.js";
 import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } from "./absorb.js";
 import { adoptContentStore, ccrEnabled, contentStoreOf, executeRetrieve, retrieveToolName, storeEffectiveCcr, type CcrSettings } from "./store.js";
+import { applyImageCompressionPass, imageCompressionEnabled, imageFullTrailingNote, storeEffectiveImageCompression, type ImageCompressionSettings } from "./image-compress.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
@@ -1256,6 +1257,7 @@ async function handle(
     // merge); resolved before the session is bound, then stamped onto it below so
     // every view / injection / execution site reads one value.
     let resolvedCcrCfg: CcrSettings | undefined;
+    let resolvedImageCompressionCfg: ImageCompressionSettings | undefined;
     let reqModelId: string | undefined;
     if (parsed && typeof parsed === "object") {
         // Gemini's model lives in the request path, every other wire carries it
@@ -1350,6 +1352,7 @@ async function handle(
             }
             const compressCfg = resolveCompress(opts.routes, embeddedUrl, model, opts.compress);
             resolvedCcrCfg = compressCfg.ccr;
+        resolvedImageCompressionCfg = compressCfg.imageCompression;
             reqPrompts = resolveCompressPrompts(compressCfg);
             const surfaceRes = resolveCompressSurfaceDetailed(compressCfg);
             reqSurface = surfaceRes.surface;
@@ -1765,6 +1768,10 @@ async function handle(
         const storeChannelOk = protocol !== "responses" ||
             (!process.env.ACP_NO_INJECT_TOOL && !FORCE_TEXT_PROTOCOL && resolveCompressProtocol(opts.routes, upstreamOrigin) !== "marker");
         storeEffectiveCcr(session, opts.compress.injectTool && !pluginMode && storeChannelOk && resolvedCcrCfg?.enabled === true ? resolvedCcrCfg : undefined);
+        // [#1095] same channel/plugin-mode gating as CCR: image_full's restore
+        // round-trip needs a tool channel on this wire; without one the model
+        // could request originals it never gets back (silent-loss trap).
+        storeEffectiveImageCompression(session, opts.compress.injectTool && !pluginMode && storeChannelOk && resolvedImageCompressionCfg?.enabled === true ? resolvedImageCompressionCfg : undefined);
         // #546: restore a client-shrunk output budget BEFORE the side gate so a
         // tool-carrying main request re-enters the pipeline at full budget (see
         // restoreOutputBudget for the starvation mechanism).
@@ -1959,7 +1966,7 @@ async function handle(
             const pendingForward = await withSessionLock(
                 session,
                 async (): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
-                const runPrepare = (): Prepared => {
+                const runPrepare = async (): Promise<Prepared> => {
                     const cs = resolveCompress(opts.routes, route?.rewrittenUrl, requestModel, opts.compress);
                     const visibilityMarkers = cs.visibilityMarkers ?? true;
                     const reasoningCfg = cs.reasoning;
@@ -1980,19 +1987,19 @@ async function handle(
                         // Both the model and the stream flag live in the URL path
                         // for this wire (the body carries neither), so they are
                         // derived here instead of read off `work`.
-                        return prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin);
+                        return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin);
                     }
                     return protocol === "anthropic"
-                        ? prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers)
+                        ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers)
                         : protocol === "openai"
-                          ? prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl)
+                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl)
                           : responsesCompact
                             // #618 review nit: when no bili compaction item is present,
                             // prepareResponsesCompact falls back to the raw bodyBuffer — forward
                             // the re-serialized post-strip work instead so dropped images don't
                             // ride along. Unchanged bodies keep the original buffer byte-identical.
                             ? prepareResponsesCompact(stripped.removed > 0 ? Buffer.from(JSON.stringify(work)) : bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
-                            : prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl);
+                            : await prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl);
                 };
                 // #332: codex's native remote-compaction request (trigger form)
                 // is dispatched BEFORE prepare/preflight. When it is not
@@ -2009,7 +2016,7 @@ async function handle(
                 if (isCodexCompactTrigger) {
                     const mode = codexCompactMode();
                     const gatePre = codexCompactGatePre(session, reqConfig.modelContextLimit);
-                    if (mode === "intercept" && gatePre) prepared = runPrepare();
+                    if (mode === "intercept" && gatePre) prepared = await runPrepare();
                     if (prepared?.codexForge) {
                         logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared.body);
                         return { body: prepared.body, prepared };
@@ -2026,7 +2033,7 @@ async function handle(
                     logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, forwardBody);
                     return { body: forwardBody, prepared: null };
                 }
-                prepared = runPrepare();
+                prepared = await runPrepare();
                 if (!countTokens && !responsesCompact) {
                     const outcome = await preflightCompressIfNeeded(
                         prepared,
@@ -2375,7 +2382,7 @@ function effectiveTokenCount(session: Session, msgs: CoreMessage[], inboundImage
     return Math.min(est, raw);
 }
 
-function prepareAnthropic(
+async function prepareAnthropic(
     parsed: AnthropicRequestBody,
     req: http.IncomingMessage,
     opts: ProxyOptions,
@@ -2389,7 +2396,7 @@ function prepareAnthropic(
     upstreamOrigin: string,
     reasoning: CompressReasoningConfig | undefined,
     visibilityMarkers: boolean,
-): Prepared {
+): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
@@ -2508,6 +2515,10 @@ function prepareAnthropic(
         }
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphanBlocks(session, msgs, deactivateBlock);
+        // [#1095] downscale screenshot-like images ONCE at arrival (kernel routing
+        // decision + recipe; originals cached for the image_full restore channel).
+        // Deterministic encode ⇒ re-runs are byte-stable for the prefix cache.
+        await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, upstreamOrigin), log });
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
         if (sysNotes.length > 0) {
             rebuiltMessages = [...rebuiltMessages, ...sysNotes.map((text) => ({ role: "user" as const, content: text }))];
@@ -2515,7 +2526,7 @@ function prepareAnthropic(
 
         systemOut = injectSystem(parsed, opts, prompts, loopConfig, ensureCanonicalId(session), surface, visibilityMarkers);
         if (injectTools) {
-            toolsOut = injectTool(parsed.tools, [...(absorbActive ? [ABSORB_TOOL] : []), ...(rulesActive ? [RULE_TOOL] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).anthropic] : [])], surface?.toolPrompts);
+            toolsOut = injectTool(parsed.tools, [...(absorbActive ? [ABSORB_TOOL] : []), ...(rulesActive ? [RULE_TOOL] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).anthropic] : []), ...(imageCompressionEnabled(session) ? [IMAGE_FULL_TOOL] : [])], surface?.toolPrompts);
         }
         // Nudge as a separate trailing user message (cache-friendly): the
         // system block stays byte-stable so the prefix cache survives.
@@ -2533,12 +2544,13 @@ function prepareAnthropic(
             } catch {
             }
         }
+        // [#1095] restore-channel guidance — ephemeral trailing user message
+        // (see prepareAnthropic for why not system).
+        const imgNote = imageFullTrailingNote(session);
+        if (imgNote) rebuiltMessages = [...rebuiltMessages, { role: "user", content: imgNote }];
     } catch (err) {
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         processedMessages = [];
-        if (sysNotes.length > 0) {
-            rebuiltMessages = [...rebuiltMessages, ...sysNotes.map((text) => ({ role: "user" as const, content: text }))];
-        }
     }
     // #532: measure the outbound system+tools overhead for the status panel's
     // SysPrompt row — the kernel breakdown classifies messages only, and on
@@ -2566,7 +2578,7 @@ function prepareAnthropic(
     return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" } as Prepared;
 }
 
-function prepareOpenai(
+async function prepareOpenai(
     parsed: OpenAIRequestBody,
     req: http.IncomingMessage,
     opts: ProxyOptions,
@@ -2582,7 +2594,7 @@ function prepareOpenai(
     reasoning: CompressReasoningConfig | undefined,
     visibilityMarkers: boolean,
     billingUpstream?: string,
-): Prepared {
+): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
@@ -2681,6 +2693,9 @@ function prepareOpenai(
         }
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphanBlocks(session, msgs, deactivateBlock);
+        // [#1095] arrival-time image downscale (see prepareAnthropic) — one
+        // deterministic encode per fingerprint; byte-stable re-runs.
+        await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, billingUpstream ?? upstreamOrigin), log });
         rebuiltMessages = systemToUser(hardenOpenaiAssistantContent(coreToOpenai(processedMessages as BiliMessage[])));
 
         // ONLY the static compress prompt goes into the system message — the
@@ -2703,7 +2718,7 @@ function prepareOpenai(
         // avoids double-counting it.
         openaiOutboundSystem = sysParts.join("\n\n");
         if (injectTools) {
-            toolsOut = injectOpenaiTool(parsed.tools, [...(absorbActive ? [ABSORB_TOOL_OPENAI] : []), ...(rulesActive ? [RULE_TOOL_OPENAI] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).openai] : [])], surface?.toolPrompts);
+            toolsOut = injectOpenaiTool(parsed.tools, [...(absorbActive ? [ABSORB_TOOL_OPENAI] : []), ...(rulesActive ? [RULE_TOOL_OPENAI] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).openai] : []), ...(imageCompressionEnabled(session) ? [IMAGE_FULL_TOOL_OPENAI] : [])], surface?.toolPrompts);
         }
         // Nudge as a separate trailing user message (cache-friendly). Injected
         // in BOTH modes (#451): plugin agents supply the ACP tools but have no
@@ -2720,6 +2735,10 @@ function prepareOpenai(
             } catch {
             }
         }
+        // [#1095] restore-channel guidance — ephemeral trailing user message
+        // (same pattern as prepareAnthropic/Google/Responses).
+        const imgNote = imageFullTrailingNote(session);
+        if (imgNote) rebuiltMessages = [...rebuiltMessages, { role: "user", content: imgNote }];
     } catch (err) {
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         processedMessages = [];
@@ -2794,7 +2813,7 @@ function appendGoogleNudge(contents: GoogleContent[], text: string): GoogleConte
  *  #651's reasoning drop deliberately does NOT apply here: Gemini 3 validates
  *  the `thoughtSignature` of replayed parts, and dropping a thought part takes
  *  its signature with it (400 INVALID_ARGUMENT). */
-function prepareGoogle(
+async function prepareGoogle(
     parsed: GoogleRequestBody,
     opts: ProxyOptions,
     core: CompressionCore,
@@ -2809,7 +2828,7 @@ function prepareGoogle(
     stream: boolean,
     visibilityMarkers: boolean,
     upstreamOrigin: string,
-): Prepared {
+): Promise<Prepared> {
     const sessionId = session.id;
     ++session.stats.requests;
     let googleClientSystem = "";
@@ -2873,6 +2892,8 @@ function prepareGoogle(
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphanBlocks(session, msgs, deactivateBlock);
+        // [#1095] arrival-time image downscale (see prepareAnthropic).
+        await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, upstreamOrigin), log });
         rebuiltContents = coreToGoogle(processedMessages as BiliMessage[]);
 
         // ONLY the static compress prompt joins the client's system text — the
@@ -2890,7 +2911,7 @@ function prepareGoogle(
         const extraSystemParts = sysParts.slice(googleClientSystem ? 1 : 0);
         systemInstruction = extraSystemParts.length > 0 ? { parts: sysParts.map((text) => ({ text })) } : parsed.systemInstruction;
         if (injectTools) {
-            toolsOut = injectGoogleTool(parsed.tools, [...(absorbActive ? [ABSORB_TOOL_GOOGLE] : []), ...(rulesActive ? [RULE_TOOL_GOOGLE] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).google] : [])], surface?.toolPrompts);
+            toolsOut = injectGoogleTool(parsed.tools, [...(absorbActive ? [ABSORB_TOOL_GOOGLE] : []), ...(rulesActive ? [RULE_TOOL_GOOGLE] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).google] : []), ...(imageCompressionEnabled(session) ? [IMAGE_FULL_TOOL_GOOGLE] : [])], surface?.toolPrompts);
         }
         if (sysNotes.length > 0) {
             rebuiltContents = appendGoogleNudge(rebuiltContents, sysNotes.join("\n\n---\n\n"));
@@ -2904,6 +2925,9 @@ function prepareGoogle(
             } catch {
             }
         }
+        // [#1095] restore-channel guidance — ephemeral trailing note (see prepareAnthropic).
+        const imgNote = imageFullTrailingNote(session);
+        if (imgNote) rebuiltContents = appendGoogleNudge(rebuiltContents, imgNote);
     } catch (err) {
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         processedMessages = [];
@@ -2963,7 +2987,7 @@ export function prepareGoogleCountTokens(
     }
 }
 
-function prepareResponses(
+async function prepareResponses(
     parsed: ResponsesRequestBody,
     req: http.IncomingMessage,
     opts: ProxyOptions,
@@ -2980,7 +3004,7 @@ function prepareResponses(
     reasoning: CompressReasoningConfig | undefined,
     visibilityMarkers: boolean,
     billingUpstream?: string,
-): Prepared {
+): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
@@ -3103,6 +3127,8 @@ function prepareResponses(
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = repairResponsesAssistantOrdering(stripReasoning(stripKernelSummaries(turn.messages, turn.state)), originalMessages);
         reapOrphanBlocks(session, msgs, deactivateBlock);
+        // [#1095] arrival-time image downscale (see prepareAnthropic).
+        await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, billingUpstream ?? upstreamOrigin), log });
         rebuiltInput = patchResponsesInput(projection, processedMessages);
         if (Array.isArray(rebuiltInput)) rebuiltInput = hoistTrappedToolItems(rebuiltInput);
         // Fallback path: when the echo did NOT come back this turn (client
@@ -3122,7 +3148,7 @@ function prepareResponses(
             responsesDevContent = devContent;
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
             if (!process.env.ACP_NO_INJECT_TOOL && injectTools) {
-                const respExtra = [...(absorbActive ? [ABSORB_TOOL_RESPONSES] : []), ...(rulesActive ? [RULE_TOOL_RESPONSES] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).responses] : [])];
+                const respExtra = [...(absorbActive ? [ABSORB_TOOL_RESPONSES] : []), ...(rulesActive ? [RULE_TOOL_RESPONSES] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).responses] : []), ...(imageCompressionEnabled(session) ? [IMAGE_FULL_TOOL_RESPONSES] : [])];
                 toolsOut = responsesTextProtocol
                     ? injectResponsesTool(parsed.tools, BILI_ACP_READONLY_TOOLS_RESPONSES, surface?.toolPrompts)
                     : injectResponsesTool(parsed.tools, respExtra.length > 0 ? [...BILI_ACP_TOOLS_RESPONSES, ...respExtra] : BILI_ACP_TOOLS_RESPONSES, surface?.toolPrompts);
@@ -3160,6 +3186,18 @@ function prepareResponses(
                 }
             } catch {
             }
+        }
+        // [#1095] restore-channel guidance — ephemeral trailing note (see
+        // prepareAnthropic). Never after a compaction_trigger: that item must
+        // stay the final input item (#283/#209), and the forge path for trigger
+        // requests builds its own body anyway.
+        const imgNote = imageFullTrailingNote(session);
+        if (imgNote && !isCompactionTrigger) {
+            const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
+                ? [{ type: "message", role: "user", content: rebuiltInput }]
+                : rebuiltInput;
+            inputItems.push({ type: "message", role: "user", content: imgNote });
+            rebuiltInput = inputItems;
         }
         transformOk = true;
     } catch (err) {
@@ -3770,7 +3808,7 @@ function beginPreflightHold(res: http.ServerResponse, prepared: Prepared, log: (
 
 async function preflightCompressIfNeeded(
     prepared: Prepared,
-    runPrepare: () => Prepared,
+    runPrepare: () => Promise<Prepared>,
     req: http.IncomingMessage,
     inboundBody: Buffer,
     res: http.ServerResponse,
@@ -3985,7 +4023,7 @@ async function preflightCompressIfNeeded(
     // #553) — the optimistic re-estimate is exactly what that regime distrusts.
     if (result.compressedRanges > 0) {
         log("info", `[${session.id}] preflight compressed ${result.compressedRanges} range(s), ~${result.savedTokens} tokens saved (${tokenCount} → ${session.stats.lastInputTokens}) in ${Date.now() - started}ms; rebuilding payload`);
-        const rebuilt = runPrepare();
+        const rebuilt = await runPrepare();
         // runPrepare re-incremented stats.requests; the rebuild is internal
         // to this single client request.
         session.stats.requests -= 1;
@@ -4809,7 +4847,7 @@ async function forward(
             const systemPrompt = withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections)), visibilityMarkers), ensureCanonicalId(prepared.session)) + absorbSection;
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes);
             const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
-                return withSessionLock(prepared.session, () => {
+                return withSessionLock(prepared.session, async () => {
                     // #422: mirror the prepare's fold with the post-compress state so
                     // the re-request shows the compression the model just performed.
                     // Records from this loop round (acp_loop_* namespace) ride on top
@@ -4826,7 +4864,13 @@ async function forward(
                     adoptContentStore(prepared.session, turn.contentStore);
                     const viewed = applyAbsorbView(turn.messages, turn.state, loopConfig, prepared.session.stats.lastInputTokens);
                     const records = current.filter((m) => typeof m.id === "string" && m.id.startsWith("acp_loop_"));
-                    return repairResponsesAssistantOrdering(stripKernelSummaries([...viewed, ...records] as BiliMessage[], turn.state), prepared.originalMessages);
+                    const out = stripKernelSummaries([...viewed, ...records] as BiliMessage[], turn.state);
+                    // [#1095] the folded re-request must carry the SAME bytes the
+                    // model saw (deterministic encode + per-fingerprint cache).
+                    await applyImageCompressionPass(prepared.session, out, { config: loopConfig, billing: imageBillingFor(opts, route?.rewrittenUrl), log: ctx.log });
+                    const imgNote = imageFullTrailingNote(prepared.session);
+                    if (imgNote) out.push({ id: "bili_image_full_note", role: "user", contentType: "text", text: imgNote });
+                    return repairResponsesAssistantOrdering(out, prepared.originalMessages);
                 });
             };
             const loop = runCompressLoop(

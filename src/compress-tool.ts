@@ -13,6 +13,10 @@
 import {
     parseCompressArgs,
     ABSORB_TOOL_OPENAI,
+    IMAGE_FULL_TOOL,
+    IMAGE_FULL_TOOL_NAME,
+    IMAGE_FULL_TOOL_OPENAI,
+    IMAGE_FULL_TOOL_RESPONSES,
     RETRIEVE_TOOL_NAME,
     RULE_TOOL_NAME,
     SEARCH_CONTEXT_TOOL,
@@ -176,6 +180,17 @@ export function retrieveToolsFor(name: string) {
         google: { name, description: RETRIEVE_TOOL_DESCRIPTION, parameters: RETRIEVE_PARAM_SCHEMA },
     };
 }
+
+// #1095: image_full (restore original-resolution images for a previously
+// downscaled message). Kernel-owned tool; the kernel ships anthropic/openai/
+// responses shapes — synthesize the missing Google variant in its flat shape
+// so every injection point serves one definition.
+export { IMAGE_FULL_TOOL, IMAGE_FULL_TOOL_OPENAI, IMAGE_FULL_TOOL_RESPONSES };
+export const IMAGE_FULL_TOOL_GOOGLE = {
+    name: IMAGE_FULL_TOOL_OPENAI.function.name,
+    description: IMAGE_FULL_TOOL_OPENAI.function.description,
+    parameters: IMAGE_FULL_TOOL_OPENAI.function.parameters,
+};
 
 export function parseCompressInput(input: unknown, callId?: string) {
     const parsed = parseCompressArgs(input, { callId });

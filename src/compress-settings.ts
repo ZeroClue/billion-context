@@ -1,4 +1,4 @@
-import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type PackSurface, type Prompts } from "acp-kernel";
+import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, DEFAULT_IMAGE_COMPRESSION_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type ImageCompressionConfig, type PackSurface, type Prompts } from "acp-kernel";
 import * as path from "node:path";
 import { findRoute, type CompressSettings, type ProviderRoutes } from "./config.js";
 import { configDir } from "./paths.js";
@@ -60,6 +60,7 @@ export function mergeCompress(
     // provider-level excludeTools.
     const absorbLevels = [global?.absorb, provider?.absorb, model?.absorb].filter(Boolean) as NonNullable<CompressSettings["absorb"]>[];
     const ccrLevels = [global?.ccr, provider?.ccr, model?.ccr].filter(Boolean) as NonNullable<CompressSettings["ccr"]>[];
+    const imageCompressionLevels = [global?.imageCompression, provider?.imageCompression, model?.imageCompression].filter(Boolean) as NonNullable<CompressSettings["imageCompression"]>[];
     const reasoningLevels = [global?.reasoning, provider?.reasoning, model?.reasoning].filter(Boolean) as NonNullable<CompressSettings["reasoning"]>[];
     const reasoningGuardLevels = [global?.reasoningGuard, provider?.reasoningGuard, model?.reasoningGuard].filter(Boolean) as NonNullable<CompressSettings["reasoningGuard"]>[];
     return {
@@ -78,6 +79,7 @@ export function mergeCompress(
         acknowledgePromptsRisk: pick("acknowledgePromptsRisk"),
         absorb: absorbLevels.length > 0 ? Object.assign({}, ...absorbLevels) : undefined,
         ccr: ccrLevels.length > 0 ? Object.assign({}, ...ccrLevels) : undefined,
+        imageCompression: imageCompressionLevels.length > 0 ? Object.assign({}, ...imageCompressionLevels) : undefined,
         rules: pick("rules"),
 
 stripImages: pick("stripImages"),
@@ -213,10 +215,15 @@ export function hasCompressSettings(s: CompressSettings): boolean {
   *    stays off unless some level enables it.
   *  - `rules` → `rules = { enabled }` (kernel RuleFeatureConfig; limits stay
   *    at kernel defaults). Absent `s.rules` leaves `base.rules` untouched.
-  *  - `ccr` → `ccr` (kernel CcrConfig, acp-kernel >= 0.0.84; the kernel runs
-  *    the ccr-store node inside processTurn between prune and absorb).
-  *    Unset fields inherit DEFAULT_CCR_CONFIG. Absent `s.ccr` leaves
-  *    `base.ccr` untouched — the feature stays off unless some level enables it. */
+   *  - `ccr` → `ccr` (kernel CcrConfig, acp-kernel >= 0.0.84; the kernel runs
+   *    the ccr-store node inside processTurn between prune and absorb).
+   *    Unset fields inherit DEFAULT_CCR_CONFIG. Absent `s.ccr` leaves
+   *    `base.ccr` untouched — the feature stays off unless some level enables it.
+   *  - `imageCompression` → `imageCompression` (kernel ImageCompressionConfig,
+   *    acp-kernel >= 0.0.84; #1095 pre-compression of image blocks). Unset
+   *    fields inherit DEFAULT_IMAGE_COMPRESSION_CONFIG. Absent
+   *    `s.imageCompression` leaves `base.imageCompression` untouched — the
+   *    feature stays off unless some level enables it. */
 export function applyCompressSettings(base: Config, limit: number, s: CompressSettings): Config {
     const nudge = { ...base.nudge };
     const truncate = { ...base.truncate };
@@ -254,6 +261,17 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
             maxHeadChars: s.ccr.maxHeadChars ?? d.maxHeadChars,
         };
     }
+    let imageCompression: ImageCompressionConfig | undefined;
+    if (s.imageCompression !== undefined) {
+        const d = DEFAULT_IMAGE_COMPRESSION_CONFIG;
+        imageCompression = {
+            enabled: s.imageCompression.enabled === true,
+            minTokens: s.imageCompression.minTokens ?? d.minTokens,
+            maxDimension: s.imageCompression.maxDimension ?? d.maxDimension,
+            quality: s.imageCompression.quality ?? d.quality,
+            format: s.imageCompression.format ?? d.format,
+        };
+    }
     return {
         ...base,
         modelContextLimit: limit,
@@ -270,6 +288,7 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         protectedTools: s.protectedTools ?? base.protectedTools,
         ...(absorb !== undefined ? { absorb } : {}),
         ...(ccr !== undefined ? { ccr } : {}),
+        ...(imageCompression !== undefined ? { imageCompression } : {}),
         ...(s.rules !== undefined ? { rules: { enabled: s.rules === true } } : {}),
     };
 }

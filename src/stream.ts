@@ -6,6 +6,7 @@ import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRa
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
 import { ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
+import { IMAGE_FULL_TOOL_NAME, executeImageFull, imageCompressionEnabled } from "./image-compress.js";
 import { containsMarkerLineText, containsRenderTagText, stripAcpTags } from "./loop/tag-echo-filter.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
 
@@ -52,6 +53,11 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
         const ack = executeRetrieve(args, ctx.session);
         const injections = drainPendingRetrievals(ctx.session);
         return injections.length > 0 ? injections.reduce((acc, inj) => `${acc}\n\n${inj.text}`, ack) : ack;
+    }
+    if (imageCompressionEnabled(ctx.session) && toolName === IMAGE_FULL_TOOL_NAME) {
+        // Restore is passive egress behavior (the next forward re-emits the
+        // cached original), so there is nothing to drain inline.
+        return executeImageFull(args, ctx.session, ctx.config);
     }
     return `[Unknown proxy tool: ${toolName}]`;
 }
