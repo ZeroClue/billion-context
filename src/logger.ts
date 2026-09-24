@@ -13,8 +13,13 @@
  *     and reopen against the current path when they diverge.
  *   - If a (re)open fails (disk full, perms, path clobbered), logging degrades
  *     to stderr-only with a single [warn] instead of crashing the proxy.
- *   - If stderr's reader is gone (broken pipe), process.stderr.write throws
- *     EPIPE — swallowed so logging can never crash the server.
+ *   - If stderr's reader is gone (broken pipe), the write fails — synchronously
+ *     on Windows, but on Linux stderr over a pipe is an async stream and EPIPE
+ *     arrives as an 'error' EVENT that a try/catch around write() can never see.
+ *     A module-init listener flips logging to file-only on the first failure;
+ *     without it the event rethrows as uncaughtException, the top-level handler
+ *     logs it through this very writer, and the feedback loop spams the log
+ *     file until rotation wipes the forensic window (#1233).
  */
 import { createWriteStream, fstatSync, mkdirSync, statSync, renameSync, unlinkSync, type WriteStream } from "node:fs";
 import path from "node:path";
@@ -30,6 +35,33 @@ let bytesWritten = 0;
 let reopenWarned = false;
 
 let capture: ((level: string, msg: string) => void) | null = null;
+
+let stderrDead = false;
+
+const STREAM_WRITE_ERROR_CODES = new Set(["EPIPE", "EIO", "EBADF", "ERR_STREAM_DESTROYED"]);
+
+/** Stream-write failures (closed pipe, destroyed stream) — the errors that storm
+ *  when a consumer exits while the process keeps writing (#1233). */
+export function isStreamWriteError(err: unknown): boolean {
+    if (typeof err !== "object" || err === null) return false;
+    const code = (err as { code?: unknown }).code;
+    return typeof code === "string" && STREAM_WRITE_ERROR_CODES.has(code);
+}
+
+/** Flip to file-only logging after stderr died. Idempotent; the [warn] goes
+ *  through log(), which now skips stderr — the logger's error path never
+ *  re-enters the writer that produced the error. */
+function markStderrDead(err: unknown): void {
+    if (stderrDead) return;
+    stderrDead = true;
+    const reason = err instanceof Error ? err.message : String(err);
+    log("warn", `stderr unavailable (${reason}); continuing with file-only logging`);
+}
+
+// Async form of a dead stderr (Linux: stderr over a pipe is an async stream,
+// EPIPE arrives as an 'error' event, see header). Attaching this listener also
+// stops the stream error from rethrowing as uncaughtException.
+process.stderr.on("error", (err) => markStderrDead(err));
 
 export function setLogCapture(fn: ((level: string, msg: string) => void) | null): void {
     capture = fn;
@@ -101,9 +133,11 @@ function warnReopenFailed(err: unknown): void {
     if (capture) {
         try { capture("warn", msg); } catch { /* best-effort */ }
     }
-    try {
-        process.stderr.write(`${new Date().toISOString()} [warn] ${msg}\n`);
-    } catch { /* stderr gone */ }
+    if (!stderrDead) {
+        try {
+            process.stderr.write(`${new Date().toISOString()} [warn] ${msg}\n`);
+        } catch { /* stderr gone */ }
+    }
 }
 
 /** Get a usable stream, opening one if needed (lazy reopen after error,
@@ -154,14 +188,16 @@ export const log: Logger = (level, msg) => {
     }
     const ts = new Date().toISOString();
     const line = `${ts} [${level}] ${msg}\n`;
-    // stderr (foreground terminal / shell redirect). MUST NOT throw — if the
-    // reader has gone (terminal closed, piped process exited, broken pipe)
-    // write() throws EPIPE and, as an uncaughtException in a hot path, kills
-    // the whole proxy. Swallow so logging can never crash the server.
-    try {
-        process.stderr.write(line);
-    } catch {
-        // best-effort: stderr is gone (EPIPE), nothing we can do
+    // stderr (foreground terminal / shell redirect). MUST NOT throw and must
+    // never re-enter its own error path: a sync failure (Windows) or the async
+    // 'error' event (Linux, module-init listener above) both flip us to
+    // file-only once, after which this branch is skipped entirely.
+    if (!stderrDead) {
+        try {
+            process.stderr.write(line);
+        } catch (err) {
+            markStderrDead(err);
+        }
     }
     // file — durable record.
     let s = getStream();
