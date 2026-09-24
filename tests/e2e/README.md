@@ -73,3 +73,56 @@ prints codex version, dist path, and an upstream `/models` probe.
 repo's own `dist` (i.e. whatever is on master at dispatch time). The forge
 phase is enabled via a repository variable `E2E_FORGE` so it can be turned on
 once interception ships.
+
+---
+
+## Native-lane suite (`e2e-native-pi.test.ts`) — real `pi` package-native vs deterministic fake
+
+`ACP_TEST_E2E_NATIVE=1` gates the suite (`npm test` stays free). It drives the
+**real `pi` CLI** in package-native mode (the repo root installed as a pi
+package — the `bili plugin install pi` lane) through a **deterministic
+chat-completions fake upstream** (`fake-upstream-chat.mjs`, zero tokens), and
+asserts the four user-facing guarantees of #1239:
+
+1. **interception + plugin-mode claim** — every upstream request carries
+   `x-bili-plugin: pi` + `x-bili-plugin-conversation` (the #1243 one-shot
+   stamp race is asserted per request, not just on the first);
+2. **`/acp` command works** — exit 0, no error strings, and the
+   `/__bili/plugin/status` endpoint it consumes answers JSON;
+3. **the model can call `acp_status`** — the tool is registered from request 2
+   onward and its result (the status report) is re-sent in history;
+4. **the model can call `compress` and compression actually happens** — the
+   compress result reports the fold, the proxy logs the plugin-channel
+   execution, and (after a graceful proxy stop) the persisted session carries
+   ≥1 compressed block.
+
+### Mechanics
+
+- The fake upstream parses scripted directives (`请调用<tool>`,
+  `请调用<tool> {json-args}`) out of the last user message and answers with
+  real `tool_calls` shapes (stream + non-stream), so the scripted "model"
+  drives pi's whole tool loop deterministically.
+- Compression needs the target message OUTSIDE the kernel's protected zone
+  (last 5 messages + most recent user message) and ≥5000 chars of
+  compressible content: run one loads ~7.6KB of filler, run two
+  (`--continue`) cites the run-one filler message in the scripted
+  `compress` call.
+- The suite spawns pi with a **hermetic `PI_CODING_AGENT_DIR`** (models.json
+  pointing at the fake, settings.json loading the repo root as a package) and
+  hermetic XDG dirs. `cleanEnv()` strips every bili side-channel
+  (`BILLION_CONTEXT_PROXY`, `BILI_*`, `ACP_*`, host pi overrides) **and
+  `NODE_TEST_CONTEXT`** — pi-native deliberately stands down inside
+  node:test, and the runner exports that variable into every spawned child.
+- The spawn cwd is outside the repo (#815, same reason as codex).
+- Sessions persist lazily: the suite SIGTERMs the hermetic proxy
+  (`stopProxiesGracefully`) before asserting on-disk state; teardown then
+  SIGKILLs survivors (fake + instance-record pids).
+- `E2E_CHECK=1` runs a zero-cost preflight (pi binary version, built
+  `dist/agent/pi-native.js`, fake `/v1/models` probe). `E2E_PI_BIN` /
+  `E2E_TMO` override the binary and per-run timeout.
+
+### CI
+
+`.github/workflows/ci-e2e-native.yml` runs the suite on every PR and on
+`workflow_dispatch` with pi pinned (`pi-stable@0.83.6`), same discipline as
+the codex pin (#815).
