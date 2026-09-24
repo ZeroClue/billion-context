@@ -1081,12 +1081,15 @@ change), so keying on them orphaned state exactly when the user kept talking
 (#280, #286). The id is used only inside the proxy (state store, persistence,
 UI label); it is never sent upstream.
 
-Where the value comes from, in priority order: per-client headers
-(`x-claude-code-session-id`, `x-grok-session-id`, `x-mavis-session-id`, the
-plugin's `x-bili-plugin-conversation`), generic headers (`x-acp-session`,
-`x-session-id`, `x-session-affinity`, `x-opencode-session`, `session-id`), or
-body fields on the OpenAI/Responses wire (`session_id`, `metadata.session_id`,
-`prompt_cache_key`).
+Where the value comes from, first hit wins: the plugin's
+`x-bili-plugin-conversation` (honored only alongside the `x-bili-plugin`
+marker header), then per-client headers (`x-claude-code-session-id`,
+`x-grok-session-id`/`x-grok-conv-id`, `x-mavis-session-id`), then generic
+headers (`x-session-affinity`, `x-acp-session`, `x-session-id`,
+`x-opencode-session`, `session-id`/`session_id`), then body fields:
+`session_id` / `metadata.session_id` on the Responses wire, and
+`prompt_cache_key` promoted over the content-fingerprint fallback on the
+Responses/OpenAI/Anthropic wires.
 
 | Client | Sends conversation id? | Source |
 |---|---|---|

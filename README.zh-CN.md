@@ -494,7 +494,7 @@ Windows 下会自动发现常见 Clash/Mihomo 静态系统代理;Web UI 会显�
 
 代理需要一个稳定的、按会话标识的 ID,以便在多个用户/账号并发时隔离压缩状态。它**原样使用客户端自己提供的会话值**(见 `src/session-id.ts`)——不做哈希,也不含协议 / 上游 origin / API key 维度。这些维度在会话中途都可能变化(凭证轮换、用户切换 relay、wire 协议变化),拿它们做 key 会在用户继续对话时恰好把状态弄丢(#280、#286)。该 id 只在代理内部使用(状态存储、持久化、UI 标签),绝不上送。
 
-取值来源(按优先级):客户端专属 header(`x-claude-code-session-id`、`x-grok-session-id`、`x-mavis-session-id`、插件的 `x-bili-plugin-conversation`)、通用 header(`x-acp-session`、`x-session-id`、`x-session-affinity`、`x-opencode-session`、`session-id`)、或 OpenAI/Responses body 字段(`session_id`、`metadata.session_id`、`prompt_cache_key`)。
+取值来源(按顺序取第一个命中的):插件的 `x-bili-plugin-conversation`(仅当同时带 `x-bili-plugin` 标记 header)、客户端专属 header(`x-claude-code-session-id`、`x-grok-session-id`/`x-grok-conv-id`、`x-mavis-session-id`)、通用 header(`x-session-affinity`、`x-acp-session`、`x-session-id`、`x-opencode-session`、`session-id`/`session_id`)、或 body 字段:Responses wire 的 `session_id`/`metadata.session_id`,以及 Responses/OpenAI/Anthropic wire 上提升替代内容指纹回退的 `prompt_cache_key`。
 
 | 客户端 | 发会话 id 吗? | 来源 |
 |---|---|---|
