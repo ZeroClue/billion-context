@@ -23,7 +23,7 @@ import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
-import { ccrEnabled, ccrPluginWireOk, contentStoreOf, executeRetrieve, PLUGIN_CCR_WIRES, retrieveToolName } from "../src/store.ts";
+import { ccrEnabled, ccrPluginWireOk, contentStoreOf, PLUGIN_CCR_WIRES, retrieveToolName } from "../src/store.ts";
 import { handlePluginManifest } from "../src/plugin.ts";
 
 const MODEL = "test-model";
@@ -92,7 +92,7 @@ function okJson(): string {
     });
 }
 
-async function startRig(): Promise<Rig> {
+async function startRig(mode?: "route-scoped"): Promise<Rig> {
     const forwards: string[] = [];
     const upstream = http.createServer((req, res) => {
         let b = "";
@@ -109,14 +109,22 @@ async function startRig(): Promise<Rig> {
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
+    // "route-scoped": CCR enabled ONLY under the route block — the base config
+    // stays off, so the plugin manifest never advertises acp_retrieve (#1273
+    // review regression rig).
+    const routes = mode === "route-scoped"
+        ? { [`http://127.0.0.1:${upstreamPort}`]: { compress: { ccr: { enabled: true, minToolTokens: 50 } } } }
+        : { [`http://127.0.0.1:${upstreamPort}`]: {} };
     const proxy = await startServer({
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: {} },
+        routes,
         modelContextLimit: 200_000,
         kernelConfig: defaultConfig(200_000),
-        compress: { injectTool: true, injectNudge: false, ccr: { enabled: true, minToolTokens: 50 } },
+        compress: mode === "route-scoped"
+            ? { injectTool: true, injectNudge: false }
+            : { injectTool: true, injectNudge: false, ccr: { enabled: true, minToolTokens: 50 } },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
@@ -173,9 +181,18 @@ test("e2e plugin lane: CCR arms, stores+placeholderes, and acp_retrieve rides fu
         const ref = Object.keys(contentStoreOf(sess).byRef)[0];
         assert.ok(ref, "oversized tool result was stored under a ref");
 
-        // The agent calls acp_retrieve (via the tool endpoint in reality); here we
-        // drive the same executeRetrieve the endpoint dispatches to.
-        const ack = executeRetrieve({ ref }, sess);
+        // The agent calls acp_retrieve through the REAL plugin tool endpoint
+        // (`POST /__bili/plugin/tool`, the same dispatch the MCP shim drives) —
+        // covers the conversation gate (isProxyToolFor under the armed session)
+        // and the ack round-trip, not just the inner executeRetrieve.
+        const toolRes = await fetch(`http://127.0.0.1:${rig.proxyPort}/__bili/plugin/tool`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ conversationId: "ccr-e2e-conv", tool: "acp_retrieve", args: { ref } }),
+        });
+        const toolJson = JSON.parse(await toolRes.text()) as { ok: boolean; result?: string; error?: string };
+        assert.ok(toolRes.status === 200 && toolJson.ok === true, `plugin tool endpoint returned ${toolRes.status}: ${JSON.stringify(toolJson)}`);
+        const ack = toolJson.result!;
         assert.match(ack, new RegExp(`retrieved ${ref}: [\\d,]+ tok`), "retrieve returns the ack receipt");
 
         // Turn 2: agent re-sends history plus the acp_retrieve call + ack. The
@@ -189,6 +206,42 @@ test("e2e plugin lane: CCR arms, stores+placeholderes, and acp_retrieve rides fu
         assert.equal(rig.forwards.length, 2, "second outbound forward after turn 2");
         const f2 = rig.forwards[1]!;
         assert.ok(f2.includes(BIG_TEXT.slice(0, 120)), "full original rides back onto the turn-2 wire");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+// [review #1273] Route-scoped CCR (base config off) must NOT arm the plugin
+// lane: the manifest reads only the base config (server.ts:969 builds it from
+// opts.compress.ccr), so arming from the route merge would emit placeholders
+// advertising an acp_retrieve the host never registered — silent loss. The
+// proxy lane keeps working: it injects the tool itself, per-request.
+test("e2e route-scoped CCR: plugin lane stays verbatim, proxy lane arms", async () => {
+    const rig = await startRig("route-scoped");
+    try {
+        // Plugin lane (x-bili-plugin header): the oversized tool result must
+        // ride the wire byte-exact — no store, no placeholder, no arming.
+        await postOpenai(rig, BASE_MSGS());
+        assert.equal(rig.forwards.length, 1, "one outbound forward after the plugin turn");
+        const f1 = rig.forwards[0]!;
+        assert.ok(f1.includes(BIG_TEXT), "plugin lane forwards the oversized result verbatim when CCR is route-scoped only");
+        assert.ok(!f1.includes("[acp-stored"), "no stored placeholder on the plugin wire");
+        assert.equal(listSessions().filter((s) => ccrEnabled(s)).length, 0, "no session arms CCR from a route-scoped-only config on the plugin lane");
+
+        // Proxy lane (no plugin header, fresh conversation id): the
+        // route-level merge arms CCR and the proxy injects acp_retrieve.
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
+        const res = await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "ccr-e2e-conv-proxy" },
+            body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: BASE_MSGS() }),
+        });
+        const txt = await res.text();
+        assert.equal(res.status, 200, `proxy lane returned ${res.status}: ${txt}`);
+        assert.equal(rig.forwards.length, 2, "second outbound forward after the proxy turn");
+        const f2 = rig.forwards[1]!;
+        assert.ok(f2.includes("[acp-stored"), "proxy lane arms CCR from the route-scoped config");
+        assert.ok(!f2.includes(BIG_TEXT), "full original must not leak on the proxy wire");
     } finally {
         await closeRig(rig);
     }

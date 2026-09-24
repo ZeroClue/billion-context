@@ -21,6 +21,13 @@ const EFFECTIVE_CCR_KEY = "effectiveCcr";
  *  processTurn loop config must match or be stripped, mirroring absorb). */
 export function storeEffectiveCcr(session: Session, ccr: CcrSettings | undefined): void {
     session.metadata[EFFECTIVE_CCR_KEY] = ccr ?? null;
+    // [review #1273] Disarming must also drop any queued full-text injection:
+    // a retrieve issued on a lane that later switches to a non-CCR wire
+    // (responses/google, or the plugin base-config gate above) would otherwise
+    // flush as a stale trailing full-text message whenever the lane re-arms at
+    // an unrelated conversation point. Not persisted either way (#persist resets
+    // on load) — this only tightens the in-memory window.
+    if (!ccr) session.pendingRetrievals.length = 0;
 }
 
 /** Read back the CCR policy stamped by {@link storeEffectiveCcr}. */

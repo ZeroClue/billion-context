@@ -1805,7 +1805,15 @@ async function handle(
         // leave placeholders unretrievable.
         const storeChannelOk = protocol !== "responses" ||
             (!process.env.ACP_NO_INJECT_TOOL && !FORCE_TEXT_PROTOCOL && resolveCompressProtocol(opts.routes, upstreamOrigin) !== "marker");
-        const pluginCcrOk = !pluginMode || ccrPluginWireOk(protocol);
+        // [review #1273] The plugin arm MUST gate on the BASE config because that
+        // is the only source the manifest reads (handlePluginManifest sees
+        // opts.compress.ccr, never the route/model-scoped merge). Route-scoped
+        // enablement without a base-level enabled flag would otherwise arm the
+        // store and emit placeholders while the manifest never advertised
+        // acp_retrieve — the model would see "→ acp_retrieve(...)" with no
+        // retrieval channel (silent loss). Route-scoped-only enablement stays
+        // proxy-mode-only (the proxy injects the tool itself, per-request).
+        const pluginCcrOk = !pluginMode || (ccrPluginWireOk(protocol) && opts.compress.ccr?.enabled === true);
         storeEffectiveCcr(session, opts.compress.injectTool && pluginCcrOk && storeChannelOk && resolvedCcrCfg?.enabled === true ? resolvedCcrCfg : undefined);
         // [#1095] same channel/plugin-mode gating as CCR: image_full's restore
         // round-trip needs a tool channel on this wire; without one the model
