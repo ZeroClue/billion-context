@@ -104,7 +104,7 @@ async function respawnOwnProxy(): Promise<string | undefined> {
     }
     try {
         const handle = await ensureProxyRunning(
-            { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false },
+            { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "opencode" },
             { scriptPath: nativeProxyScriptPath() },
         );
         if (intercept !== undefined) intercept.origin = handle.origin;

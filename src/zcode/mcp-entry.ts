@@ -40,7 +40,7 @@ function startWatchdog(applied: ZcodeRouteApplied, attached: boolean, log: (msg:
                 return;
             }
             const handle = await ensureProxyRunning(
-                { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false },
+                { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "zcode" },
                 { scriptPath: nativeProxyScriptPath() },
             );
             if (handle.origin !== state.origin) {

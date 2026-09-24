@@ -332,7 +332,7 @@ async function defaultEnsureProxy(): Promise<{ origin: string; attached: boolean
     // keys off OUR pid: zcode kills this MCP child when its session ends, so
     // the per-session proxy tears itself down with it.
     const handle = await ensureProxyRunning(
-        { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false },
+        { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "zcode" },
         { scriptPath: nativeProxyScriptPath() },
     );
     return { origin: handle.origin, attached: !!handle.attached };

@@ -38,6 +38,8 @@ import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
 import {
     claimStartingMarker,
     clearStartingMarker,
+    discoverLiveInstances,
+    entryScriptFingerprint,
     isPidAlive,
     isProxyInstanceFile,
     readProxyInstanceFile,
@@ -190,6 +192,13 @@ export interface LaunchOptions {
      * native posture dials a STATIC url baked into settings.json; a proxy
      * that silently landed on port+1 would strand every model request). */
     strictPort?: boolean;
+    /** #1225: which client/lane this launch belongs to. Recorded by the
+     *  spawned child (BILI_LAUNCHER_LANE) and compared on attach: two
+     *  DIFFERENT declared lanes never share an instance, while an undeclared
+     *  side (manual `bili start` daemon, pre-#1225 instance) stays a
+     *  wildcard. Without this, pi and codex with identical config shape
+     *  silently shared one proxy and cross-wrote each other's state. */
+    lane?: string;
 }
 
 export interface ProxyHandle {
@@ -2393,7 +2402,14 @@ function isStartingMarkerActive(marker: ProxyStartingMarker, nowMs: number): boo
     return isPidAlive(marker.pid) && nowMs - marker.startedAt < STARTING_MARKER_TTL_MS;
 }
 
-function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions): boolean {
+/** #1225: reuse requires identical CODE, not just identical config shape —
+ *  same version number with different dist contents (local rebuild, npm link,
+ *  unpublished branch) must not be served by the stale instance. codeFingerprint
+ *  is the attaching side's hash of the script it WOULD spawn; undefined means
+ *  it cannot be verified, which is treated as incompatible (never attach). */
+function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions, codeFingerprint?: string): boolean {
+    if (inst.codeFingerprint === undefined || inst.codeFingerprint !== codeFingerprint) return false;
+    if (opts.lane !== undefined && inst.lane !== undefined && inst.lane !== opts.lane) return false;
     if (inst.host !== opts.host || inst.passthrough !== opts.passthrough) return false;
     const wantDomains = opts.mitmDomains ?? [];
     if (inst.mitmDomains.length !== wantDomains.length || inst.mitmDomains.some((d, i) => d !== wantDomains[i])) return false;
@@ -2407,17 +2423,56 @@ function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions): boole
     return maxKeys.every((k) => (inst.modelMaxOutputs ?? {})[k] === wantMax[k]);
 }
 
-async function probeExistingInstance(
+/** #1232: every healthy live instance — not just the last writer of the
+ *  single proxy-origin file. With per-lane proxies (#1225/#1231) that file
+ *  points at whichever instance registered LAST, which may be another
+ *  client's, so the attach decision unions the file view with the
+ *  multi-instance registry (every instance self-registers on startup) and
+ *  health-probes each candidate in parallel. */
+async function probeLiveInstances(
     readInstance: () => ProxyInstanceFile | { origin: string } | undefined,
     fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
-): Promise<ProxyInstanceFile | undefined> {
+): Promise<ProxyInstanceFile[]> {
+    const seen = new Map<string, ProxyInstanceFile>();
     const inst = readInstance();
-    if (!isProxyInstanceFile(inst)) return undefined;
-    if (!isPidAlive(inst.pid)) return undefined;
-    const health = await fetchHealthInfo(inst.origin);
-    if (!health || !health.ok) return undefined;
-    if (health.instanceId !== undefined && health.instanceId !== inst.instanceId) return undefined;
-    return inst;
+    if (isProxyInstanceFile(inst)) seen.set(inst.instanceId || inst.origin, inst);
+    for (const live of discoverLiveInstances()) seen.set(live.instanceId || live.origin, live);
+    const checked = await Promise.all(
+        [...seen.values()].map(async (c): Promise<ProxyInstanceFile | undefined> => {
+            if (!isPidAlive(c.pid)) return undefined;
+            const health = await fetchHealthInfo(c.origin);
+            if (!health || !health.ok) return undefined;
+            if (health.instanceId !== undefined && health.instanceId !== c.instanceId) return undefined;
+            return c;
+        }),
+    );
+    return checked.filter((c): c is ProxyInstanceFile => c !== undefined);
+}
+
+/** #1232: choose the attach target among healthy candidates. Must be
+ *  compatible (code fingerprint + config shape + lane rules) and, under
+ *  strictPort, bound to our exact port. Same declared lane beats wildcard —
+ *  concurrent same-lane launches must converge on the lane's own instance,
+ *  not a general-purpose daemon either could use — newest within class. */
+function pickAttachable(
+    candidates: ProxyInstanceFile[],
+    opts: LaunchOptions,
+    codeFingerprint?: string,
+): ProxyInstanceFile | undefined {
+    let best: ProxyInstanceFile | undefined;
+    let bestClass = 2;
+    let bestStartedAt = Number.NEGATIVE_INFINITY;
+    for (const c of candidates) {
+        if (!instanceCompatible(c, opts, codeFingerprint)) continue;
+        if (opts.strictPort && c.port !== opts.port) continue;
+        const cls = opts.lane !== undefined && c.lane === opts.lane ? 0 : 1;
+        if (cls < bestClass || (cls === bestClass && c.startedAt > bestStartedAt)) {
+            best = c;
+            bestClass = cls;
+            bestStartedAt = c.startedAt;
+        }
+    }
+    return best;
 }
 
 /** #707: wait for another launcher's in-flight bring-up to produce a live
@@ -2431,17 +2486,21 @@ async function waitForStarterInstance(
     fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
     now: () => number,
     sleepImpl: (ms: number) => Promise<void>,
+    opts: LaunchOptions,
+    codeFingerprint?: string,
 ): Promise<ProxyInstanceFile | undefined> {
     const deadline = now() + SPAWN_WAIT_MS;
+    const probe = async (): Promise<ProxyInstanceFile | undefined> =>
+        pickAttachable(await probeLiveInstances(readInstance, fetchHealthInfo), opts, codeFingerprint);
     let inst: ProxyInstanceFile | undefined;
     while (now() < deadline) {
         await sleepImpl(HEALTH_POLL_INTERVAL_MS);
-        inst = await probeExistingInstance(readInstance, fetchHealthInfo);
+        inst = await probe();
         if (inst) break;
         const still = readStartingMarker();
         if (!still || !isStartingMarkerActive(still, now())) break;
     }
-    return inst ?? (await probeExistingInstance(readInstance, fetchHealthInfo));
+    return inst ?? (await probe());
 }
 
 export function findFreePort(preferred: number, host = LAUNCHER_DEFAULT_HOST): Promise<number> {
@@ -2586,15 +2645,21 @@ export async function ensureProxyRunning(
         await registerWatcher(inst.origin, watchPid);
         return { origin: inst.origin, port: inst.port, attached: true };
     };
+    const script = deps.scriptPath ?? process.argv[1];
+    const codeFingerprint = entryScriptFingerprint(script);
 
     // #394/#417: a healthy proxy with a compatible config is SHARED, not
     // doubled — two concurrent launches of the same client would otherwise
-    // spawn two writers over one sessions dir.
-    const existing = await probeExistingInstance(readInstance, fetchHealthInfo);
-    if (existing && instanceCompatible(existing, opts) && (!opts.strictPort || existing.port === opts.port)) {
-        // strictPort (#964): the client dials a STATIC url — attaching to a
-        // healthy proxy on a DIFFERENT port would strand every request. Only
-        // an instance already bound to the exact port may be shared.
+    // spawn two writers over one sessions dir. #1225 tightens "compatible":
+    // same code AND same declared lane, not just same config shape. #1232:
+    // candidates come from every live registry entry, not only the last
+    // writer of the single proxy-origin file (that pointer can belong to
+    // another client's per-lane proxy).
+    const existing = pickAttachable(await probeLiveInstances(readInstance, fetchHealthInfo), opts, codeFingerprint);
+    if (existing) {
+        // strictPort (#964) is enforced inside pickAttachable: the client
+        // dials a STATIC url — attaching to a healthy proxy on a DIFFERENT
+        // port would strand every request.
         return attachTo(existing);
     }
 
@@ -2605,19 +2670,24 @@ export async function ensureProxyRunning(
     // (singleFlight, #706); this is the cross-process half.
     const waitForOtherStarter = async (): Promise<ProxyHandle | undefined> => {
         console.error("bili: another bili launch is bringing up a proxy — waiting for it instead of spawning a second");
-        const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl);
-        if (waited && instanceCompatible(waited, opts)) {
+        const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl, opts, codeFingerprint);
+        if (waited) {
             return attachTo(waited);
         }
         // starter failed/timed out (or incompatible config) — caller falls
         // through and spawns itself, as before
         return undefined;
     };
+    // #1225: an in-flight starter of a DIFFERENT declared lane can never
+    // produce an instance we may attach to — waiting would only stall this
+    // launch behind its SPAWN_WAIT_MS window. Undeclared lanes wildcard.
+    const starterLaneMatches = (m: ProxyStartingMarker): boolean =>
+        opts.lane === undefined || m.lane === undefined || m.lane === opts.lane;
     const marker = readStartingMarker();
     if (marker) {
         if (!isStartingMarkerActive(marker, now())) {
             removeStartingMarker();
-        } else {
+        } else if (starterLaneMatches(marker)) {
             const attached = await waitForOtherStarter();
             if (attached) return attached;
         }
@@ -2632,7 +2702,6 @@ export async function ensureProxyRunning(
     // pointed there only ever reach an explicitly-started `bili start`.
     // The child's EADDRINUSE retry covers the pick/spawn race.
     const port = opts.port > 0 ? opts.port : await pickEphemeralPort(opts.host);
-    const script = deps.scriptPath ?? process.argv[1];
     if (!script) throw new Error("bili: cannot resolve launcher script path");
     const logPath = path.join(os.tmpdir(), `bili-proxy-${port}.log`);
     const logFd = fs.openSync(logPath, "a");
@@ -2643,15 +2712,20 @@ export async function ensureProxyRunning(
     // Cleared on every terminal path below; a hard crash leaves a stale marker
     // that the dead-owner/TTL check treats as inert.
     const claimMarker = (): boolean =>
-        claimStartingMarker({ token: launchToken, pid: process.pid, host: opts.host, port, startedAt: now() });
+        claimStartingMarker({ token: launchToken, pid: process.pid, host: opts.host, port, startedAt: now(), lane: opts.lane });
     let claimed = claimMarker();
     if (!claimed) {
         const holder = readStartingMarker();
         if (holder && isStartingMarkerActive(holder, now())) {
-            // Lost the read→claim race to a live starter — honor its bring-up.
-            const attached = await waitForOtherStarter();
-            if (attached) return attached;
-            claimed = claimMarker();
+            if (starterLaneMatches(holder)) {
+                // Lost the read→claim race to a live starter — honor its bring-up.
+                const attached = await waitForOtherStarter();
+                if (attached) return attached;
+                claimed = claimMarker();
+            }
+            // #1225: live but a DIFFERENT lane — spawn without coordinating,
+            // and leave its marker ALONE: removing it would break THAT
+            // starter's coordination with its own same-lane launches.
         } else {
             // Stale or unreadable (crash mid-write): safe to remove — while any
             // marker file exists, O_EXCL bars a newer claimant, so we cannot
@@ -2677,6 +2751,7 @@ export async function ensureProxyRunning(
                         ...captureInheritedProxyEnv(process.env),
                         BILI_LAUNCH_TOKEN: launchToken,
                         BILI_PARENT_PID: String(opts.parentPid ?? process.pid),
+                        ...(opts.lane ? { BILI_LAUNCHER_LANE: opts.lane } : {}),
                         ...(opts.mitmDomains && opts.mitmDomains.length
                             ? { BILI_MITM_DOMAINS: opts.mitmDomains.join(",") }
                             : {}),
@@ -3006,7 +3081,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     // used to resolve the budget-alignment window, #321).
     const biliRoutes = loadRoutes(process.env);
     const domains = dedupeInOrder([...routes.httpsDomains, ...(params.mitmDomains ?? [])]);
-    const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config, base), modelMaxOutputs: collectModelMaxOutputs(config, base) }, deps);
+    const handle = await ensureProxyRunning({ host, port, passthrough, debug, lane: base, mitmDomains: domains, modelWindows: collectModelWindows(config, base), modelMaxOutputs: collectModelMaxOutputs(config, base) }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
             ((base !== "kimi" && base !== "mcode" && base !== "aider" && routes.httpRewrites.length > 0) ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
@@ -3504,7 +3579,7 @@ export async function runTestPi(params: RunTestPiParams, deps: LauncherDeps = {}
         ...discoverDomains("pi", config),
         ...(params.mitmDomains ?? []),
     ]);
-    const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config, "pi"), modelMaxOutputs: collectModelMaxOutputs(config, "pi") }, deps);
+    const handle = await ensureProxyRunning({ host, port, passthrough, debug, lane: "pi", mitmDomains: domains, modelWindows: collectModelWindows(config, "pi"), modelMaxOutputs: collectModelMaxOutputs(config, "pi") }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})`,
     );
