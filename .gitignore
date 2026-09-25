@@ -5,3 +5,6 @@ dist/
 *.tgz
 .bili-coop-build-stamp
 tmp/
+
+# Agent/runtime hygiene (added by /init-agents 2026-09-25; convention: ignore runtime state, keep workflow docs tracked)
+.codegraph/
