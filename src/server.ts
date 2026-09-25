@@ -3,8 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
-import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges, resolveOutputSteeringConfig, DEFAULT_CCR_CONFIG } from "acp-kernel";
-import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
+import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges, resolveOutputSteeringConfig } from "acp-kernel";
+import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, applyCompressSettings, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
 import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
 import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
@@ -968,11 +968,14 @@ async function handle(
     // search_context/acp_status against the session the plugin drives. Both
     // live under the /__bili/ loopback + trusted-origin gate above.
     if (req.method === "GET" && req.url === "/__bili/plugin/manifest") {
-        // [#1271] kernelConfig carries no file/global compress settings; layer the global
-        // CCR view onto base config so acp_retrieve is advertised exactly when the operator
-        // enabled it (DEFAULT_CCR_CONFIG floors unset fields; per-request overrides are still
-        // enforced at execution, so the manifest stays conservative as #1192 requires).
-        return handlePluginManifest(res, { ...config, ccr: { ...DEFAULT_CCR_CONFIG, ...config.ccr, ...opts.compress.ccr } });
+        // [#1271/#1278] kernelConfig carries no file/global compress settings; resolve the
+        // GLOBAL view exactly like the request path does (applyCompressSettings) so every
+        // opt-in tool — acp_retrieve (#1271), absorb (#1278) — is advertised exactly when the
+        // operator enabled it at the global level. Unset fields floor to kernel defaults
+        // (DEFAULT_CCR_CONFIG et al. inside applyCompressSettings); per-request/route overrides
+        // are still enforced at execution time, so the manifest stays conservative as #1192
+        // requires. Do not "simplify" this back to `config`.
+        return handlePluginManifest(res, applyCompressSettings(config, opts.modelContextLimit, opts.compress));
     }
     if (req.method === "GET" && req.url?.startsWith("/__bili/plugin/status")) {
         const query = req.url.slice(req.url.indexOf("?") + 1);
