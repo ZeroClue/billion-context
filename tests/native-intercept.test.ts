@@ -89,6 +89,30 @@ test("install: leaves non-model URLs untouched", async () => {
     assert.deepEqual(sink, ["https://registry.npmjs.org/billion-context", "http://127.0.0.1:40001/__bili/plugin/manifest"]);
 });
 
+test("install: non-model-API URLs fire onUnroutedModelUrl so direct sends are visible (#1290)", async () => {
+    const unrouted: string[] = [];
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40001",
+        ready: Promise.resolve("http://127.0.0.1:40001"),
+        onUnroutedModelUrl: (u) => { unrouted.push(u); },
+    };
+    const { sink } = await withPatch(state, async (fetch) => {
+        // A third-party plugin's custom wire (commandcode's Go plan) — not a
+        // recognized model endpoint, so it goes direct AND is reported.
+        await fetch("https://api.commandcode.example/alpha/generate");
+        await fetch("https://api.commandcode.example/alpha/generate");
+        // A real model endpoint — routed, never reported as unrouted.
+        await fetch("http://127.0.0.1:8199/v1/messages");
+        // Bili's own control plane — direct by design, never reported either.
+        await fetch("http://127.0.0.1:40001/__bili/plugin/manifest");
+        await fetch("http://127.0.0.1:40001/bili/openai/http://127.0.0.1:9/alpha/generate");
+    });
+    assert.ok(sink.includes("https://api.commandcode.example/alpha/generate"), "custom wire sent direct");
+    assert.ok(sink.includes("http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"), "model endpoint routed");
+    assert.equal(unrouted.length, 2, "hook fires per unrouted request (host dedups)");
+    for (const u of unrouted) assert.ok(u.endsWith("/alpha/generate"), `unexpected unrouted: ${u}`);
+});
+
 test("install: proxy-origin URLs are never re-proxied (self guard)", async () => {
     const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") };
     const { sink } = await withPatch(state, async (fetch) => {

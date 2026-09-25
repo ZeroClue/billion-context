@@ -1,10 +1,12 @@
-import { collectBlockContent, type CompressionCore, type Config, type CoreMessage, type CompressionState } from "acp-kernel";
+import { collectBlockContent, defaultCountTokens, storeCoveredOriginals, type CompressionCore, type Config, type CoreMessage, type CompressionState } from "acp-kernel";
 import { handleAcpStatus } from "./acp-status.js";
 import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
+import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
+import { IMAGE_FULL_TOOL_NAME, executeImageFull, imageCompressionEnabled } from "./image-compress.js";
 import { containsMarkerLineText, containsRenderTagText, stripAcpTags } from "./loop/tag-echo-filter.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
 
@@ -30,7 +32,13 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
         return applyRanges(parseCompressInput(args), ctx);
     }
     if (toolName === "decompress") {
-        return resolveDecompress(args, ctx);
+        const ack = resolveDecompress(args, ctx);
+        // #1179 CCR v2: range-restore rides the same ephemeral channel as
+        // acp_retrieve; this non-stream rewrite has no separate re-request, so
+        // drained injections ride inline right after the ack. Whole-block
+        // decompress queues nothing — behavior unchanged.
+        const injections = drainPendingRetrievals(ctx.session);
+        return injections.length > 0 ? injections.reduce((acc, inj) => `${acc}\n\n${inj.text}`, ack) : ack;
     }
     if (toolName === "search_context") {
         return executeSearchContextTarget(args, ctx.core, ctx.session.id, ctx.session.state);
@@ -44,6 +52,18 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
     const absorb = effectiveAbsorbConfig(ctx.session, ctx.config);
     if (absorb?.enabled === true && toolName === (absorb.toolName ?? ABSORB_TOOL_NAME)) {
         return executeAbsorb(args, undefined, absorb, ctx);
+    }
+    if (ccrEnabled(ctx.session) && toolName === retrieveToolName(ctx.session)) {
+        // Non-stream rewrite has no re-request to ride, so the full text rides
+        // inline right after the ack inside the converted text block.
+        const ack = executeRetrieve(args, ctx.session);
+        const injections = drainPendingRetrievals(ctx.session);
+        return injections.length > 0 ? injections.reduce((acc, inj) => `${acc}\n\n${inj.text}`, ack) : ack;
+    }
+    if (imageCompressionEnabled(ctx.session) && toolName === IMAGE_FULL_TOOL_NAME) {
+        // Restore is passive egress behavior (the next forward re-emits the
+        // cached original), so there is nothing to drain inline.
+        return executeImageFull(args, ctx.session, ctx.config);
     }
     return `[Unknown proxy tool: ${toolName}]`;
 }
@@ -227,6 +247,19 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                     one: sameView ? null : { text: one.text, count: one.count },
                     full: { text: full.text, count: full.count },
                 });
+            }
+        }
+        // #1179 CCR v2 (fold-time storing): the moment a fold lands, its covered
+        // originals are still in hand — persist them into the content store so
+        // retrieve-by-ref / range-restore work for FOLDED content, not just
+        // oversized tool results stored at arrival. First-write-wins keeps
+        // arrival-time entries authoritative; reasoning is skipped. Proxy mode
+        // only: plugin-mode agents own their folds, so bili never sees those
+        // originals.
+        if (ccrEnabled(ctx.session)) {
+            const newBlocks = res.state.blocks.filter((b) => !beforeIds.has(b.blockId));
+            if (newBlocks.length > 0) {
+                adoptContentStore(ctx.session, storeCoveredOriginals(contentStoreOf(ctx.session), ctx.compressMessages ?? ctx.messages, res.state, newBlocks.map((b) => b.blockId), defaultCountTokens));
             }
         }
         const r = res.result;

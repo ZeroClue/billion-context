@@ -139,6 +139,32 @@ export function isRegistryDepSpec(spec: string): boolean {
     return !/^[a-z][a-z0-9+.-]*:/i.test(spec);
 }
 
+function underDir(dir: string, root: string): boolean {
+    return dir === root || dir.startsWith(root + path.sep);
+}
+
+/** True when `installDir` is a copy of billion-context living inside a dsh
+ *  profile bundle (<dshHome>/profiles/<name>/…), as written or after symlink
+ *  resolution (pnpm store links, dev link: pins). #1196: such a copy has no
+ *  global bili driving its refresh — the process running FROM it is the only
+ *  candidate to trigger the channel refresh. */
+export function isDshProfileCopy(installDir: string, env: NodeJS.ProcessEnv = process.env): boolean {
+    const profiles = path.join(resolveDshHome(env), "profiles");
+    const roots = new Set<string>([profiles]);
+    try {
+        roots.add(fs.realpathSync(profiles));
+    } catch {
+        // profiles root absent — the literal path is the only form
+    }
+    const dirs = [installDir];
+    try {
+        dirs.push(fs.realpathSync(installDir));
+    } catch {
+        // nonexistent or unreadable — evaluate the literal path
+    }
+    return dirs.some((dir) => [...roots].some((root) => underDir(dir, root)));
+}
+
 // — driving `dsh plugin …` ————————————————————————————————————————————————
 
 export type DshPlan = { command: string; args: string[]; windowsVerbatimArguments?: boolean };
@@ -291,6 +317,6 @@ export async function refreshDshProfileBundles(
         }
     }
     if (refreshed > 0) {
-        log("info", `[update] refreshed ${refreshed} dsh profile bundle(s) to ${targetVersion} — profile copies track the global version`);
+        log("info", `[update] refreshed ${refreshed} dsh profile bundle(s) to ${targetVersion} — restart dsh to load it`);
     }
 }

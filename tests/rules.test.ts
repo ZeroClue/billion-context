@@ -179,17 +179,29 @@ test("applyCompressSettings: maps settings rules onto kernel RuleFeatureConfig",
     assert.equal(absent.rules, undefined, "absent settings leave the base rules block untouched");
 });
 
-test("handlePluginManifest: advertises acp_rule alongside the ACP tools on all three wires", () => {
+// #1192: hosts register manifest tools verbatim, so a disabled acp_rule must
+// not be advertised at all — only a rules-enabled config may list it.
+test("handlePluginManifest: acp_rule advertised on all three wires only when rules enabled", () => {
     let body = "";
-    handlePluginManifest({ writeHead: () => {}, end: (b: string) => { body = b; } } as never);
-    const data = JSON.parse(body) as {
+    const res = { writeHead: () => {}, end: (b: string) => { body = b; } } as unknown as Parameters<typeof handlePluginManifest>[0];
+    const data = (): {
         toolNames: string[];
         tools: { anthropic: { name: string; input_schema?: unknown }[]; openai: { name?: string; function?: { name: string } }[]; responses: { name?: string; type?: string }[] };
-    };
-    assert.ok(data.toolNames.includes(RULE_TOOL_NAME));
-    assert.ok(data.tools.anthropic.some((t) => t.name === RULE_TOOL_NAME), "anthropic schema present");
-    assert.ok(data.tools.openai.some((t) => t.function?.name === RULE_TOOL_NAME));
-    assert.ok(data.tools.responses.some((t) => t.name === RULE_TOOL_NAME));
+    } => JSON.parse(body);
+
+    handlePluginManifest(res, defaultConfig(200_000));
+    let d = data();
+    assert.ok(!d.toolNames.includes(RULE_TOOL_NAME), "disabled by default → not advertised");
+    assert.ok(!d.tools.anthropic.some((t) => t.name === RULE_TOOL_NAME));
+    assert.ok(!d.tools.openai.some((t) => t.function?.name === RULE_TOOL_NAME));
+    assert.ok(!d.tools.responses.some((t) => t.name === RULE_TOOL_NAME));
+
+    handlePluginManifest(res, { ...defaultConfig(200_000), rules: { enabled: true } });
+    d = data();
+    assert.ok(d.toolNames.includes(RULE_TOOL_NAME));
+    assert.ok(d.tools.anthropic.some((t) => t.name === RULE_TOOL_NAME), "anthropic schema present");
+    assert.ok(d.tools.openai.some((t) => t.function?.name === RULE_TOOL_NAME));
+    assert.ok(d.tools.responses.some((t) => t.name === RULE_TOOL_NAME));
 });
 
 test("persist round-trip: recorded rules survive save/load", () => {

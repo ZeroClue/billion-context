@@ -15,7 +15,7 @@ import { _setForTest as setRegistryForTest } from "../src/registry.js";
 import { createStorageCodec, parseEncryptionKey } from "../src/encrypt.js";
 import { _resetSessionsForTest, getSession, markDirty, peekSession } from "../src/session.js";
 import type { Session } from "../src/session.js";
-import { gcConfigFromEnv, gcSessionFiles, isGcEligible, viewFromParsed } from "../src/session-gc.js";
+import { contentStoreTokens, gcConfigFromEnv, gcSessionFiles, isGcEligible, viewFromParsed } from "../src/session-gc.js";
 
 const DAY = 86_400_000;
 
@@ -69,6 +69,12 @@ function flatLegacy(id: string, savedAt: number, blocks: unknown[], contextToken
         contextTokens,
         state: { blocks },
     };
+}
+
+function contentStoreFile(dir: string, rel: string, chars: number, ageDays: number): string {
+    const text = "y".repeat(chars);
+    const store = { version: 1, byHash: { h1: text }, byRef: { m00001: { hash: "h1", rawId: "raw-1", kind: "tool output", chars, head: "y", tokens: Math.ceil(chars / 4) } } };
+    return writeFile(dir, rel, JSON.stringify(store), ageDays);
 }
 
 function writeFile(dir: string, rel: string, content: string | Buffer, ageDays: number): string {
@@ -136,6 +142,26 @@ after(() => {
         assert.equal(isGcEligible({ id: "a", savedAt: oldSavedAt, contextTokens: 8_000, everCompressed: false, rawInputTokens: null }, now, cfg), true);
         assert.equal(isGcEligible({ id: "b", savedAt: oldSavedAt, contextTokens: 2_000_000, everCompressed: false, rawInputTokens: null }, now, cfg), false);
         assert.equal(isGcEligible({ id: "c", savedAt: oldSavedAt, contextTokens: 8_000, everCompressed: true, rawInputTokens: null }, now, cfg), false, "compressed session keeps even when small");
+    });
+
+    test("isGcEligible: companion store footprint folds into the size gate (#1180)", () => {
+        const cfg = { maxAgeMs: 7 * DAY, maxTokens: 1_000_000 };
+        const now = Date.parse("2026-09-21T00:00:00Z");
+        const oldSavedAt = now - 10 * DAY;
+        const base = { id: "a", savedAt: oldSavedAt, contextTokens: 0, everCompressed: false, rawInputTokens: 900_000 };
+        assert.equal(isGcEligible(base, now, cfg), true, "900K alone fits under 1M");
+        assert.equal(isGcEligible({ ...base, storedTokens: 200_000 }, now, cfg), false, "+200K store pushes over the gate");
+        assert.equal(isGcEligible({ ...base, storedTokens: 0 }, now, cfg), true, "zero footprint changes nothing");
+    });
+
+    test("contentStoreTokens: unique-content via CJK-aware estimator; null for anything that is not a store envelope (#1180)", () => {
+        assert.equal(contentStoreTokens({ version: 1, byHash: { h1: "aaaa", h2: "bbbb" }, byRef: { m00001: {} } }), 2, "sums byHash values via the CJK-aware estimator");
+        assert.equal(contentStoreTokens({ version: 1, byHash: { h1: "测试测试测试" }, byRef: { m00001: {} } }), 6, "CJK content counts per character (not chars÷4)");
+        assert.equal(contentStoreTokens({ version: 1, byHash: {}, byRef: {} }), 0, "valid empty envelope → 0");
+        assert.equal(contentStoreTokens({ version: 1, byHash: { h1: "x" } }), null, "missing byRef → not an envelope");
+        assert.equal(contentStoreTokens(envelope("s1", 1234)), null, "session record (version 3) is not a store envelope");
+        assert.equal(contentStoreTokens(null), null);
+        assert.equal(contentStoreTokens("garbage"), null);
     });
 
 test("viewFromParsed: envelope v3, legacy flat, corrupt input", () => {
@@ -314,6 +340,164 @@ test("gcSessionFiles: pending in-memory saves are not deleted before they land",
     });
 });
 
+test("gcSessionFiles: stale CCR session co-deletes its content-store companion (#1180)", async () => {
+    const dir = tmpDir("bili-gc-crs-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        const oldSavedAt = Date.now() - 10 * DAY;
+        const fSess = writeFile(dir, "anthropic/host_crs.json", JSON.stringify(envelope("gc-crs", oldSavedAt, { metadata: { rawInputTokens: 5000 } })), 10);
+        const fCmp = contentStoreFile(dir, "anthropic/host_crs.content-store.json", 8000, 10);
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 1, JSON.stringify(res));
+        assert.equal(res.companionsRemoved, 1, JSON.stringify(res));
+        assert.ok(!existsSync(fSess));
+        assert.ok(!existsSync(fCmp), "companion co-deleted — no orphan left behind");
+    });
+});
+
+test("gcSessionFiles: live session keeps its companion even when the companion is old (#1180)", async () => {
+    const dir = tmpDir("bili-gc-live-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        const fSess = writeFile(dir, "anthropic/host_live.json", JSON.stringify(envelope("gc-live", Date.now() - DAY, { metadata: { rawInputTokens: 5000 } })), 1);
+        // Companion last written 10 days ago (long idle tail) but still referenced.
+        const fCmp = contentStoreFile(dir, "anthropic/host_live.content-store.json", 8000, 10);
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 0, JSON.stringify(res));
+        assert.equal(res.companionsRemoved, 0, JSON.stringify(res));
+        assert.ok(existsSync(fSess));
+        assert.ok(existsSync(fCmp), "referenced companion never orphan-swept");
+    });
+});
+
+test("gcSessionFiles: companion in another namespace than its session is still referenced (#1180)", async () => {
+    const dir = tmpDir("bili-gc-xns-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        // Session re-homed to the namespaced layout (meta fill-once) while a
+        // store copy from before the move sits in _unknown/, aged out.
+        const stem = "deadbeefcafe1234";
+        const fSess = writeFile(dir, `anthropic/api.example.com_${stem}.json`, JSON.stringify(envelope(`gc-xns-${stem}`, Date.now() - DAY, { metadata: { rawInputTokens: 5000 } })), 1);
+        const fCmp = contentStoreFile(dir, `_unknown/${stem}.content-store.json`, 8000, 10);
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 0, JSON.stringify(res));
+        assert.equal(res.companionsRemoved, 0, JSON.stringify(res));
+        assert.ok(existsSync(fSess));
+        assert.ok(existsSync(fCmp), "hash-stem match across namespaces prevents false-orphan deletion of live store bytes");
+    });
+});
+
+test("gcSessionFiles: stale duplicate keeps its companion while a namespaced twin still relies on it (#1180)", async () => {
+    const dir = tmpDir("bili-gc-twin-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        // Meta fill-once migrated the session _unknown/ -> namespaced without
+        // cleaning the old path; the store was never re-saved since the move
+        // (saveContentStore only writes when dirty), so the _unknown/ sibling
+        // is still the LIVE store — loadContentStore falls back to it when
+        // the namespaced one is absent.
+        const stem = "twinbeefcafe1234";
+        const fDup = writeFile(dir, `_unknown/${stem}.json`, JSON.stringify(envelope(`gc-twin-${stem}`, Date.now() - 10 * DAY, { metadata: { rawInputTokens: 5000 } })), 10);
+        const fTwin = writeFile(dir, `anthropic/api.example.com_${stem}.json`, JSON.stringify(envelope(`gc-twin-${stem}`, Date.now() - DAY, { metadata: { rawInputTokens: 5000 } })), 1);
+        const fCmp = contentStoreFile(dir, `_unknown/${stem}.content-store.json`, 8000, 10);
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 1, JSON.stringify(res));
+        assert.equal(res.companionsRemoved, 0, JSON.stringify(res));
+        assert.ok(!existsSync(fDup), "stale duplicate deleted");
+        assert.ok(existsSync(fTwin), "live twin untouched");
+        assert.ok(existsSync(fCmp), "live fallback store of the surviving twin is never co-deleted");
+    });
+});
+
+test("gcSessionFiles: stale duplicate's companion IS co-deleted once the twin owns its own store (#1180)", async () => {
+    const dir = tmpDir("bili-gc-twinown-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        // The store was re-saved after the namespace move: the namespaced copy
+        // shadows the flat one (loadContentStore stops at the first existing
+        // candidate), so the flat sibling is dead bytes and co-deletion is safe.
+        const stem = "twincafedeadbeef";
+        const fDup = writeFile(dir, `_unknown/${stem}.json`, JSON.stringify(envelope(`gc-twinown-${stem}`, Date.now() - 10 * DAY, { metadata: { rawInputTokens: 5000 } })), 10);
+        const fTwin = writeFile(dir, `anthropic/api.example.com_${stem}.json`, JSON.stringify(envelope(`gc-twinown-${stem}`, Date.now() - DAY, { metadata: { rawInputTokens: 5000 } })), 1);
+        const fDead = contentStoreFile(dir, `_unknown/${stem}.content-store.json`, 8000, 10);
+        const fLive = contentStoreFile(dir, `anthropic/api.example.com_${stem}.content-store.json`, 8000, 1);
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 1, JSON.stringify(res));
+        assert.equal(res.companionsRemoved, 1, JSON.stringify(res));
+        assert.ok(!existsSync(fDup));
+        assert.ok(existsSync(fTwin));
+        assert.ok(!existsSync(fDead), "shadowed dead copy co-deleted with its duplicate");
+        assert.ok(existsSync(fLive), "the live namespaced store stays referenced");
+    });
+});
+
+test("gcSessionFiles: both copies eligible → whole session incl. its lone store is swept (#1180)", async () => {
+    const dir = tmpDir("bili-gc-twogone-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        // Both copies aged out; the lone store sits next to the flat duplicate.
+        // Whichever copy is processed first, the sweep ends with everything
+        // gone: if the duplicate goes first the guard keeps the store, then
+        // the twin deletion leaves it an unreferenced orphan swept in the
+        // same pass; if the twin goes first the duplicate's sibling has no
+        // surviving reference-holder left and is co-deleted directly.
+        const stem = "twogonecafe1234";
+        const fDup = writeFile(dir, `_unknown/${stem}.json`, JSON.stringify(envelope(`gc-twogone-${stem}`, Date.now() - 10 * DAY, { metadata: { rawInputTokens: 5000 } })), 10);
+        const fTwin = writeFile(dir, `anthropic/api.example.com_${stem}.json`, JSON.stringify(envelope(`gc-twogone-${stem}`, Date.now() - 10 * DAY, { metadata: { rawInputTokens: 5000 } })), 10);
+        const fCmp = contentStoreFile(dir, `_unknown/${stem}.content-store.json`, 8000, 10);
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 2, JSON.stringify(res));
+        assert.equal(res.companionsRemoved, 1, JSON.stringify(res));
+        assert.ok(!existsSync(fDup) && !existsSync(fTwin) && !existsSync(fCmp));
+    });
+});
+
+test("gcSessionFiles: orphaned content stores are swept once old, fresh ones kept (#1180)", async () => {
+    const dir = tmpDir("bili-gc-orph-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        const fOld = contentStoreFile(dir, "anthropic/host_orph_old.content-store.json", 8000, 10);
+        const fFresh = contentStoreFile(dir, "anthropic/host_orph_fresh.content-store.json", 8000, 1);
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 0, "no session files were removed");
+        assert.equal(res.companionsRemoved, 1, JSON.stringify(res));
+        assert.ok(!existsSync(fOld), "aged orphan swept");
+        assert.ok(existsSync(fFresh), "fresh orphan kept (still inside any resume window)");
+    });
+});
+
+test("gcSessionFiles: tiny session with a huge store does not slip under the token gate (#1180)", async () => {
+    const dir = tmpDir("bili-gc-hugestore-");
+    await withEnv({ BILI_SESSION_GC: "1", BILI_SESSION_GC_MAX_TOKENS: "1000" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        const oldSavedAt = Date.now() - 10 * DAY;
+        const fSmall = writeFile(dir, "anthropic/host_small.json", JSON.stringify(envelope("gc-small", oldSavedAt, { metadata: { rawInputTokens: 500 } })), 10);
+        const fBigStore = writeFile(dir, "anthropic/host_bigstore.json", JSON.stringify(envelope("gc-bigstore", oldSavedAt, { metadata: { rawInputTokens: 500 } })), 10);
+        const fCmp = contentStoreFile(dir, "anthropic/host_bigstore.content-store.json", 8000, 10);
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 1, JSON.stringify(res));
+        assert.equal(res.companionsRemoved, 0, JSON.stringify(res));
+        assert.ok(!existsSync(fSmall), "same-size session without a store is deleted");
+        assert.ok(existsSync(fBigStore), "store footprint (2000tok) + 500tok exceeds the 1000tok gate");
+        assert.ok(existsSync(fCmp));
+    });
+});
+
+test("gcSessionFiles: unreadable companion next to an eligible session keeps both (#1180)", async () => {
+    const dir = tmpDir("bili-gc-badcmp-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        const oldSavedAt = Date.now() - 10 * DAY;
+        const fSess = writeFile(dir, "anthropic/host_badcmp.json", JSON.stringify(envelope("gc-badcmp", oldSavedAt, { metadata: { rawInputTokens: 5000 } })), 10);
+        const fCmp = writeFile(dir, "anthropic/host_badcmp.content-store.json", "{not json", 10);
+        const res = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(res.removed, 0, JSON.stringify(res));
+        assert.equal(res.unreadable, 0, "the session file itself parsed fine");
+        assert.ok(existsSync(fSess), "never guess at an unreadable companion — keep the session too");
+        assert.ok(existsSync(fCmp));
+    });
+});
+
 test("records rawInputTokens per turn and persists it (#1082)", async () => {
     const dir = tmpDir("bili-gc-rec-");
     await withEnv({ BILI_SESSIONS_DIR: dir, BILI_SESSION_GC: "0" }, async () => {
@@ -389,6 +573,9 @@ test("records rawInputTokens per turn and persists it (#1082)", async () => {
             const expected = estimateRawBodyTokens(imgBody) + imageTokensInParsedBody("openai", imgBody);
             const raw2 = sess!.metadata.rawInputTokens;
             assert.ok(typeof raw2 === "number" && raw2 >= expected, `image turn records text+image (want >= ${expected}, got ${String(raw2)})`);
+            // #1208: a debounced save from an earlier turn can still be in flight
+            // here; drain it so its stale rename cannot land after this read.
+            await store.flushAll([]);
             assert.ok(store.flushSync(sess as Session), "flush lands the session file");
             const file = findSessionFile(dir, "gc-rec-integration");
             assert.ok(file, "session file written to disk");

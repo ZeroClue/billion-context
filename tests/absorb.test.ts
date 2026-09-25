@@ -215,20 +215,32 @@ test("parseCompressSettings: validates absorb sub-object field-by-field, rejects
     assert.equal(parseCompressSettings({ tiers: false, absorb: { enabled: 1 } }), undefined);
 });
 
-test("handlePluginManifest: advertises absorb alongside the ACP tools on all three wires", () => {
+// #1192: hosts register manifest tools verbatim, so a disabled absorb must not
+// be advertised at all — only an absorb-enabled config may list it.
+test("handlePluginManifest: absorb advertised on all three wires only when enabled", () => {
     let body = "";
-    handlePluginManifest({ writeHead: () => {}, end: (b: string) => { body = b; } } as never);
-    const data = JSON.parse(body) as {
+    const res = { writeHead: () => {}, end: (b: string) => { body = b; } } as unknown as Parameters<typeof handlePluginManifest>[0];
+    const data = (): {
         toolNames: string[];
         tools: { anthropic: { name: string; input_schema?: unknown }[]; openai: { name?: string; function?: { name: string } }[]; responses: { name?: string; type?: string }[] };
-    };
-    assert.ok(data.toolNames.includes("absorb"));
-    const anthro = data.tools.anthropic.find((t) => t.name === "absorb");
+    } => JSON.parse(body);
+
+    handlePluginManifest(res, defaultConfig(200_000));
+    let d = data();
+    assert.ok(!d.toolNames.includes("absorb"), "disabled by default → not advertised");
+    assert.ok(!d.tools.anthropic.some((t) => t.name === "absorb"));
+    assert.ok(!d.tools.openai.some((t) => t.function?.name === "absorb"));
+    assert.ok(!d.tools.responses.some((t) => t.name === "absorb"));
+
+    handlePluginManifest(res, { ...defaultConfig(200_000), absorb: { enabled: true } });
+    d = data();
+    assert.ok(d.toolNames.includes("absorb"));
+    const anthro = d.tools.anthropic.find((t) => t.name === "absorb");
     assert.ok(anthro, "anthropic schema present");
     const schema = anthro!.input_schema as { required?: string[] };
     assert.deepEqual(schema.required, ["ref", "summary"]);
-    assert.ok(data.tools.openai.some((t) => t.function?.name === "absorb"));
-    assert.ok(data.tools.responses.some((t) => t.name === "absorb"));
+    assert.ok(d.tools.openai.some((t) => t.function?.name === "absorb"));
+    assert.ok(d.tools.responses.some((t) => t.name === "absorb"));
 });
 
 test("persist round-trip: absorbed records and absorbedTokens survive save/load", () => {

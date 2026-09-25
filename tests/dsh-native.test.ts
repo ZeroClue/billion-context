@@ -433,8 +433,9 @@ test("apply() attach mode: registers manifest tools verbatim, gates headers, for
             const ctx = mockCtx();
             apply(ctx);
             // under node:test the fetch patch is deliberately NOT installed
-            assert.equal(ctx.registeredCommands.length, 1);
+            assert.equal(ctx.registeredCommands.length, 2);
             assert.equal(ctx.registeredCommands[0].name, "acp");
+            assert.equal(ctx.registeredCommands[1].name, "acp-cache");
 
             // headers gate on toolsReady — no session, no headers; and before
             // registration completes nothing is stamped
@@ -481,6 +482,72 @@ test("apply() attach mode: registers manifest tools verbatim, gates headers, for
         });
     } finally {
         proxy.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("apply() /acp-cache (#1146): forwards acp_cache bound to the initiator session, falls back to latest", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-cache-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
+            const calls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+            const cap = await startMockProxy(calls, (url) =>
+                url.includes("fallback=latest") ? { ok: true, conversationId: "conv-latest", panel: "PANEL-OK" } : undefined);
+            try {
+                _resetRegisterForTest(cap.origin);
+                process.env.BILLION_CONTEXT_PROXY = cap.origin;
+                const ctx = mockCtx();
+                apply(ctx);
+                const cacheCmd = ctx.registeredCommands.find((c) => c.name === "acp-cache");
+                assert.ok(cacheCmd, "acp-cache registered");
+
+                ctx.setInitiator({ session: { id: "session-9" } });
+                const bound = await cacheCmd.handler();
+                assert.equal(bound.kind, "success");
+                assert.deepEqual(calls, [{ conversationId: "session-9", tool: "acp_cache", args: {} }]);
+
+                ctx.setInitiator(undefined);
+                calls.length = 0;
+                const latest = await cacheCmd.handler();
+                assert.equal(latest.kind, "success");
+                assert.deepEqual(calls, [{ conversationId: "conv-latest", tool: "acp_cache", args: {} }]);
+            } finally {
+                cap.close();
+                _resetRegisterForTest(undefined);
+            }
+        });
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("apply() /acp-cache (#1146): unreachable proxy reports an error", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-cache-down-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
+            // healthy attach first (so register.base is set), then kill the
+            // proxy before the handler runs — a dead preset would instead
+            // trigger the #983 spawn fallback, which this test does not want
+            const proxy = await startMockProxy([]);
+            try {
+                _resetRegisterForTest(proxy.origin);
+                process.env.BILLION_CONTEXT_PROXY = proxy.origin;
+                const ctx = mockCtx();
+                apply(ctx);
+                await waitFor(() => ctx.registeredTools.length === 1, "tool registration");
+                const cacheCmd = ctx.registeredCommands.find((c) => c.name === "acp-cache");
+                assert.ok(cacheCmd, "acp-cache registered");
+                proxy.close();
+                const out = await cacheCmd.handler();
+                assert.equal(out.kind, "error");
+                assert.match(out.text, /proxy not reachable/);
+            } finally {
+                _resetRegisterForTest(undefined);
+            }
+        });
+    } finally {
         fs.rmSync(home, { recursive: true, force: true });
         _resetRegisterForTest(undefined);
     }
@@ -645,7 +712,7 @@ test("apply() /acp pre-first-request (#955): renders the runtime-table entry bef
             _resetRegisterForTest(proxy.origin);
             const ctx = mockCtx();
             apply(ctx);
-            assert.equal(ctx.registeredCommands.length, 1);
+            assert.equal(ctx.registeredCommands.length, 2);
             const out = await ctx.registeredCommands[0].handler();
             assert.equal(out.kind, "success");
             assert.match(out.text, /model=qwen-ri/);
@@ -766,9 +833,10 @@ test("#983 maybeRetry self-heals a base-less register after a failed respawn", a
 
 test("#1117 apply() installs takeoverGate keyed on currentInitiator attribution", async () => {
     const proxy = await startMockProxy([]);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1117-state-"));
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1117-"));
     try {
-        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
             _resetRegisterForTest(proxy.origin);
             const ctx = mockCtx();
             apply(ctx);
@@ -788,6 +856,7 @@ test("#1117 apply() installs takeoverGate keyed on currentInitiator attribution"
         });
     } finally {
         proxy.close();
+        fs.rmSync(stateHome, { recursive: true, force: true });
         fs.rmSync(home, { recursive: true, force: true });
         _resetRegisterForTest(undefined);
     }
@@ -795,9 +864,10 @@ test("#1117 apply() installs takeoverGate keyed on currentInitiator attribution"
 
 test("#1158 apply() gate refusal logs each endpoint once per process with attribution state", async () => {
     const proxy = await startMockProxy([]);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1158-state-"));
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1158-"));
     try {
-        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
             _resetRegisterForTest(proxy.origin);
             const ctx = mockCtx();
             apply(ctx);
@@ -834,6 +904,76 @@ test("#1158 apply() gate refusal logs each endpoint once per process with attrib
         });
     } finally {
         proxy.close();
+        fs.rmSync(stateHome, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts accumulate; transitions re-print (+bili.log)", async () => {
+    const proxy = await startMockProxy([]);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1158e-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1158e-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const gate = _stateTakeoverGateForTest();
+            assert.ok(gate !== undefined, "takeoverGate installed");
+            const origCI = ctx.agents.currentInitiator;
+            const origErr = console.error;
+            const errs: string[] = [];
+            console.error = (...args: unknown[]) => {
+                errs.push(args.map(String).join(" "));
+            };
+            try {
+                const url = "https://api.gate-l2.test/v1/chat/completions";
+                // four same-state (none) refusals → exactly one line; counting continues silently
+                assert.equal(gate(url), false);
+                assert.equal(gate(url), false);
+                assert.equal(gate(url), false);
+                assert.equal(gate(url), false);
+                let lines = errs.filter((e) => e.includes("takeover gate refused"));
+                assert.equal(lines.length, 1, `expected one line for repeated same-state refusals, got: ${errs.join(" | ")}`);
+                assert.match(lines[0]!, /no active initiator attribution/);
+                assert.match(lines[0]!, /refusals so far: 1$/);
+                // the ALS boundary starts throwing (disposed/closing agent scope) →
+                // new category → re-print carrying the accumulated count
+                ctx.agents.currentInitiator = () => {
+                    throw new Error("agent initiator scope is disposed");
+                };
+                assert.equal(gate(url), false);
+                lines = errs.filter((e) => e.includes("takeover gate refused"));
+                assert.equal(lines.length, 2, `expected a state-transition re-print, got: ${errs.join(" | ")}`);
+                assert.match(lines[1]!, /currentInitiator\(\) threw \(agent initiator scope is disposed\)/);
+                assert.match(lines[1]!, /refusals so far: 5 \(state none→threw\)$/);
+                // further thrown refusals stay silent again
+                assert.equal(gate(url), false);
+                assert.equal(errs.filter((e) => e.includes("takeover gate refused")).length, 2);
+                // back to plain none → transition the other way, count keeps running
+                ctx.agents.currentInitiator = () => undefined;
+                assert.equal(gate(url), false);
+                lines = errs.filter((e) => e.includes("takeover gate refused"));
+                assert.equal(lines.length, 3);
+                assert.match(lines[2]!, /refusals so far: 7 \(state threw→none\)$/);
+                // attributed traffic claims silently — no line
+                ctx.agents.currentInitiator = origCI;
+                ctx.setInitiator({ session: { id: "s1158l2" } });
+                assert.equal(gate(url), true);
+                assert.equal(errs.filter((e) => e.includes("takeover gate refused")).length, 3);
+                // the durable copy carries the same lines into bili.log, [dsh-client]-marked
+                const logFile = path.join(stateHome, "billion-context", "bili.log");
+                const content = fs.readFileSync(logFile, "utf8");
+                assert.match(content, /\[warn\] \[dsh-client\] bili-native-dsh: model request sent DIRECT \(uncompressed\) — takeover gate refused https:\/\/api\.gate-l2\.test\/v1\/chat\/completions: currentInitiator\(\) threw \(agent initiator scope is disposed\) — agent scope disposed\/closing mid-request\? — refusals so far: 5 \(state none→threw\)$/m);
+            } finally {
+                console.error = origErr;
+            }
+        });
+    } finally {
+        proxy.close();
+        fs.rmSync(stateHome, { recursive: true, force: true });
         fs.rmSync(home, { recursive: true, force: true });
         _resetRegisterForTest(undefined);
     }

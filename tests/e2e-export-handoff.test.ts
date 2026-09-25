@@ -189,6 +189,8 @@ test("e2e export: real proxy compresses via real tool call, block persists, bili
     } finally {
         await close(proxy);
         await close(upstream);
+        // #1208: drain in-flight persist writes before deleting the store dir (#1194 pattern).
+        await store.flushAll([]);
         rmSync(dir, { recursive: true, force: true });
     }
 });

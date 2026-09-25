@@ -13,6 +13,8 @@ import {
 } from "acp-kernel";
 import { PROXY_TOOL_NAMES, RULE_TOOL_NAME } from "./compress-tool.js";
 import { effectiveRulesConfig } from "./rules-feature.js";
+import { IMAGE_FULL_TOOL_NAME, imageCompressionEnabled } from "./image-compress.js";
+import { ccrEnabled, retrieveToolName } from "./store.js";
 import { log as loggerLog } from "./logger.js";
 import type { Session } from "./session.js";
 
@@ -48,6 +50,8 @@ export function isProxyToolFor(name: string, session: Session | undefined, confi
     if (PROXY_TOOL_NAMES.has(name)) return true;
     const absorb = effectiveAbsorbConfig(session, config);
     if (absorb?.enabled === true && name === (absorb.toolName ?? ABSORB_TOOL_NAME)) return true;
+    if (ccrEnabled(session) && name === retrieveToolName(session)) return true;
+    if (imageCompressionEnabled(session) && name === IMAGE_FULL_TOOL_NAME) return true;
     return effectiveRulesConfig(session, config)?.enabled === true && name === RULE_TOOL_NAME;
 }
 

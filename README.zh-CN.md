@@ -72,6 +72,10 @@ QQ群:
 
 可选的第六个工具 `acp_rule`(`compress.rules: true` —— 见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md))记录**持久化的原则级提醒**:模型记录的简短规则(用户强调的教训、要求记住的行为、撞到的大坑)受硬性保护不被压缩——调用及结果在每次折叠中都保留在上下文中——省略参数则列出已记录规则;传入 `delete`(规则 id,如 `"rule3"`)删除单条规则,传入 `clear: true` 清空全部规则([ranxianglei/billion-context-pi#433](https://github.com/ranxianglei/billion-context-pi/issues/433))。
 
+第七个工具 `acp_retrieve`(全车道默认关闭、显式开启 —— 任意层级设 `compress.ccr.enabled: true` 方可启用,建议先本地验证;插件车道需全局显式 `true` 才会在 manifest 广播工具,#1271/#1273;见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md))支撑**内容寻址消息存储**(内置 CCR,#1097/#1179):超大工具结果**在到达时改为 ID 引用,而非强制蒸馏**——线上保留字节稳定的占位符,原文进入按会话的内容存储信封(按内容哈希去重),模型通过一次廉价工具调用按需取回。v2 让折叠同样无损:折叠落定时被覆盖的原文会存入存储,`decompress` 可按区间恢复(`startId`/`endId` ref)而无需整块展开,`search_context` 命中条目携带覆盖的 `mNNNNN` ref,让你精确取回所需内容。默认无损:未执行的 retrieve 只花一次调用;而被 absorb 蒸馏掉的细节则永久丢失。仅代理模式、仅原生工具线(marker/文本协议没有执行 retrieve 的通道,存储在这些场景下自动解除武装,而不是静默丢失内容)。
+
+可选工具 `image_full`(`compress.imageCompression.enabled: true` —— 见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md))支撑**图像预压缩**(#1095):工具结果中的截图类图像在到达时降采样一次——内核做路由决策与 recipe,宿主经可选的 `sharp` 执行编码——在进入 wire 前降低计费像素(供应商按像素面积计费;尺寸减半约省 4 倍计费 token)。非截图图像逐字节原样透传。天然有损:模型看不清细节时用消息 ref 调用 `image_full`,为整个会话恢复原始分辨率——无需代理侧存储原图(客户端自己的历史仍持有原始字节,它从未见过降采样形态)。默认关闭。
+
 同族的保护开关 `compress.protectedLatestTools`(见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md))让累积型工具(客户端的 todo/任务清单,如 `["todo_list", "TodoWrite"]`)的**最新**快照永远不被压缩,旧实例照常折叠 —— agent 的活跃任务清单不会在折叠中丢失(#639)。其全历史对应项 `compress.protectedTools` 对工具的**全部实例**做硬排除 —— 适用于各次结果相互独立、后续结果不会取代旧结果的内容(如 opencode/pi 的 `skill` 加载);对高频或累积快照型工具保护全部实例会让上下文无界增长(#639),请只用于低频高价值工具。
 
 **如何确认压缩真的生效了。** 代理执行 `compress` 后会以普通 assistant 文本发出确认标记(`📦 [ACP] Compressed …`)—— 但曾观察到模型在持续上下文压力下*自行书写该标记格式*而从未调用工具(#717):约 2 小时内 17 次假"压缩",真实用量一路爬到 89%。因此对话中看到的标记行本身不是持久化完成的证据 —— 请先用 `acp_status` 复核(块数 +1、可压缩区间起点前移)再采信。作为兜底,代理会剥离模型自发的标记形文本并记录 `[marker-echo]` 警告;注入的 nudge 与系统提示词也明确声明标记只由代理发出。
@@ -229,7 +233,7 @@ curl -s http://localhost:8787/__bili/stats
 
 - **启动器:** `bili dsh` 经 `--patch` overlay(`~/.dsh-bili/.bili-acp.patch.yml`)注入完整原生插件 —— 每个 profile 启动即注册 bili 工具，模型请求盖 `x-bili-plugin` + dsh 会话 id(plugin 模式)，`/acp` 会话绑定。同一份 patch 同时禁用 dsh 原生自动压缩(`compaction-basic` → `auto: false`);手动 `/compact` 仍可用。
 - **Profile 安装(免启动器)——统一泳道(#966):** `bili plugin install dsh` 对每个已存在的 profile 执行 `dsh plugin --profile <name> add billion-context` —— pnpm 把包装进各 profile 自己的 `node_modules`,dsh 自动挂载包内 patch 层(`dsh.bundle.patch.yml`)。装哪个源取决于 bili 自身的安装形态(#925):npm 安装传注册表名,checkout/dev 构建传绝对路径(`link:` 依赖,本地改动实时生效)。旧版受管块(`# bili begin` / `# bili end`,#966 之前的安装所写)在安装与卸载时都会被剥离 —— 用户条目与注释保留,清空的文件还原占位 `[]`。先在每个 profile 里跑过一次 dsh 让目录存在。插件加载时自拉起代理(已有健康实例则附看，不重复拉;父进程 pid 看门狗)，经全局 fetch 补丁把模型流量改写为 `<proxy>/bili/<上游URL>`，原样注册清单工具，并按工具就绪门控 plugin 模式头(第一轮走 wire 模式)。退出开关:`BILI_NATIVE_DSH=0`。卸载:`bili plugin remove dsh` 或 `dsh plugin --profile <name> remove billion-context` —— 两者走同一通道。经注册表安装要求 npm 上已发布含 `dsh.bundle.patch.yml` 的版本。若 add 后 dsh 启动即报 `billion-context/dsh` 的 `ERR_MODULE_NOT_FOUND`,说明 profile 从陈旧的包元数据缓存里解析到了不含 bundle 子路径导出的旧版本(#953)——固定版本重装:`dsh plugin --profile <name> add billion-context@latest`。
-- **自动更新保持各 profile 同步:** 全局自更新完成后,bili 会扫描 `~/.dsh/profiles/*/package.json`,把注册表钉住的 `billion-context` 依赖刷新回新的全局版本 —— 加载的插件与代理从此不再漂移(#953);钉在本地源的 profile 不动。刷新是尽力而为,绝不会让更新本身失败。
+- **自动更新保持各 profile 同步:** 刷新有两个触发器 —— 全局自更新完成后,以及**profile 自己的代理**在周期检查里发现注册表有新版本时(全局 bili 从不运行也一样刷新,#1196 —— 插件市场安装的用户往往根本没有全局安装)。两种触发器都扫描 `~/.dsh/profiles/*/package.json`,把注册表钉住的 `billion-context` 依赖刷新到目标版本(全局触发器刷到新全局版本,自触发刷到注册表最新),统一经 dsh 自己的 `plugin add` 通道,绝不在位覆盖 —— 加载的插件与代理从此不再漂移(#953);钉在本地源的 profile 不动。刷新是尽力而为,失败下个周期重试,绝不会让代理或更新本身失败。
 - **已报告:Profile 安装下部分传输零代理流量(#1158,调查中):** dsh `llm-pi-ai` 层的部分传输服务会话**从未有任何模型请求到达代理**(日志无 `processTurn`,调用 bili 工具返回 404 "no model request has arrived"),而同宿主的其他 provider 正常。根因仍在用运行时证据定性 —— 候选:传输层 fetch 形态(SDK 注入 fetch / 非全局 dispatcher)或宿主侧归属缺口导致流量未被 takeover gate 认领。检测:此类情况会打一次性 `[plugin] NO MODEL REQUESTS seen for conversation …` 告警,dsh 插件还会把归属 gate 放行的每个端点各记一条日志(每进程一次)。期间可靠规避:改用 `bili dsh` 启动 —— 启动器的 settings overlay 会把那些 provider 的 `baseURL` 重写为 `/bili/` URL,无论传输层使用哪种 fetch、归属状态如何,流量都必然过代理。
 
 `bili dsh` 启动下插件**附看**(attach)启动器的代理(不二次拉起)。裸上游 URL 与 spawn 模式一样重写为 `<proxy>/bili/<url>`(回环代理目标永不被代理 env 拦截，等于直接绕开 MITM)；已经路由的 `/bili/` 前缀请求原样放行、只盖章。已知局限:手动 `/compact` 没有 dsh 侧事件钩子，其边界交给内核的自然 ingest diff(自动压缩已关，影响罕见)。
@@ -301,6 +305,18 @@ fork 继承同一面)。按设计保持 launcher-only。
 
 要真正压缩这类客户端:把它的模型域名加进 `billion-context.json` 的 `"mitm".domains`(如 `"mitm": { "domains": ["copilot.tencent.com"] }`)或环境变量 `BILI_MITM_DOMAINS`,重启 bili,并让客户端信任 bili 的根 CA(Node 系客户端用 `NODE_EXTRA_CA_CERTS=~/.local/share/billion-context/ca/root-ca.pem`,有 CA 路径设置的用其设置)。`/bili/` 前缀方案在这里不适用——没有 URL 可改。详见 [CONFIGURATION.zh-CN.md → MITM](CONFIGURATION.zh-CN.md#mitm-透明代理登录客户端)。
 
+### 未识别的端点直连、什么都不压缩(#1290)
+
+bili 只压缩路径匹配已知 wire 协议(`/chat/completions`、`/llm_raw_chat`、`/v1/messages`、`/responses`……)的请求。发往其它路径的请求——例如第三方插件的**自定义 wire**(Command Code 的 Go 套餐发 `POST /alpha/generate`)——会逐字节中继,**永不压缩**。目前没有任何配置口可以声明一种任意新 wire;那是一项独立功能,不是一个能打开的开关。
+
+这个结果现在不再静默(#1290):
+
+- 客户端侧 fetch 钩子对每个不同的未路由端点每进程记一次日志(`…is not a recognized model endpoint, so bili did not route it through the proxy…`);
+- `curl -s http://localhost:8787/__bili/stats` 输出 `unrecognizedPaths`(按路径计数,仅 loopback);
+- 存在此类请求时,`acp_status` 输出会多一节 `UNRECOGNIZED PATHS (instance-level)`。
+
+如果你期望这类端点被压缩,改用 provider 的标准协议端点(Command Code 的 Provider 套餐发 `/provider/v1/chat/completions`,bili 能正常压缩);真正的自定义 wire 需要单独的支持。
+
 ## OpenCode
 
 同一个内置插件同时服务两代 OpenCode:agent 文件同时保留 V1 `server()` 与 V2 `setup()` 导出 —— ≥ 1.18.29 的 1.x 宿主加载 V1 形状,2.x 宿主加载 V2 `setup()`。独立扩展 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) 仅支持 V1,在 2.x 下**不加载** —— 对 OpenCode 2.x,**billion-context 是推荐的上下文管理方案**。以下均在 `@opencode/cli` 2.0.3 上端到端验证过(V1 泳道:1.14.46 与 1.18.31)。
@@ -348,6 +364,8 @@ HTTPS 走证书 MITM,HTTP 走临时 `opencode.json` 副本(`/bili/` 改写;JSONC
 ### 状态:`/acp` 与 `acp_status`
 
 `/acp` 面板在所有模式下都绑定当前会话,`acp_status` 工具是其宿主内等价手段。在命令编辑器支持新增条目的宿主(2.0.x 稳定版,`editor.add`)上,V2 插件额外注册 `/acp` 斜杠命令 —— 以合成非模型消息渲染,面板优先(与 `acp_status` 工具一致);旧形状上该注册保持惰性。注意 `opencode run` 模式完全不派发斜杠命令(它们会透传给模型)—— 请用 TUI。
+
+同一接缝还承载 `/acp-rule`(#1251)—— 持久指令功能的人侧入口(输出与 `acp_rule` 工具一致):pi/omp 原生注册 —— 裸 `/acp-rule` 逐字列出全部已记录指令,`/acp-rule <文本>` 直接记录一条(等价于模型调用)。包裹后的 transcript 消息按内容签名从模型上下文剥离(与缓存报告同机制)—— 已记录的指令本来就每轮经 system prompt 注入。delete/clear 子命令随 #1178 落地;其他 lane 见后续工作。
 
 ### 旧 opencode-acp 会话(#920)
 
@@ -512,7 +530,7 @@ Windows 下会自动发现常见 Clash/Mihomo 静态系统代理;Web UI 会显�
 
 ### 会话文件清理（#1082）
 
-短命会话会留下永远不会再被恢复的小状态文件。清理是**可选开启（opt-in）**的：设 `BILI_SESSION_GC=1` 才启用（默认关闭 —— 会话文件属于用户数据，不应有静默删除策略）。启用且持久化开启时，bili 在启动时和每小时扫描一次会话目录，且只有**两个条件同时满足**才删除一个文件：年龄超过 `BILI_SESSION_GC_MAX_AGE_DAYS`（默认 7 天），并且该会话**从未被压缩过**（没有折叠块）、最近一次请求体 ≤ `BILI_SESSION_GC_MAX_TOKENS` token（默认 1M；未记录大小的旧文件用 `contextTokens`）—— 这样删除只丢字节不丢内容：继续对话会用客户端自己的历史重建上下文，代价只是一次冷重建。被压缩过的会话永不删除（其摘要无法无损重建）。每次删除都会逐条写审计日志，另有一次非空扫描的汇总日志。活会话、不可读文件和加密文件（判断前先用 `BILI_ENCRYPTION_KEY` 解码）都按保守策略处理。详见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。
+短命会话会留下永远不会再被恢复的小状态文件。清理是**可选开启（opt-in）**的：设 `BILI_SESSION_GC=1` 才启用（默认关闭 —— 会话文件属于用户数据，不应有静默删除策略）。启用且持久化开启时，bili 在启动时和每小时扫描一次会话目录，且只有**两个条件同时满足**才删除一个文件：年龄超过 `BILI_SESSION_GC_MAX_AGE_DAYS`（默认 7 天），并且该会话**从未被压缩过**（没有折叠块）、最近一次请求体 ≤ `BILI_SESSION_GC_MAX_TOKENS` token（默认 1M；未记录大小的旧文件用 `contextTokens`）—— 这样删除只丢字节不丢内容：继续对话会用客户端自己的历史重建上下文，代价只是一次冷重建。CCR 内容存储（#1097）以 `<hash>.content-store.json` 的形式存放在会话文件旁边，遵循同样的生命周期（#1180）：存储随其会话文件一起删除；孤儿存储（会话文件已不存在）在超过年龄门后被清扫；存储的 token 占用（唯一内容经内核 CJK-aware `defaultCountTokens` 计数，与 `rawInputTokens` 同一估算器）计入上述大小上限。被压缩过的会话永不删除（其摘要无法无损重建）。每次删除都会逐条写审计日志，另有一次非空扫描的汇总日志。活会话、不可读文件和加密文件（判断前先用 `BILI_ENCRYPTION_KEY` 解码）都按保守策略处理。详见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。
 
 ## 状态
 

@@ -87,9 +87,9 @@ async function startProxy(upstream: http.Server): Promise<Harness> {
     };
 }
 
-test("anthropic path: parseable body without messages → 400, upstream untouched (#806)", async () => {
-    const seen: string[] = [];
-    const upstream = await upstreamServer(200, (p) => seen.push(p));
+test("anthropic path: parseable body without messages → relays verbatim, upstream rejects it itself (#806/#1284)", async () => {
+    const seen: Array<{ path: string; body: string }> = [];
+    const upstream = await upstreamServer(200, (p, b) => seen.push({ path: p, body: b }));
     const harness = await startProxy(upstream);
     try {
         const res = await fetch(`http://127.0.0.1:${harness.port}/v1/messages`, {
@@ -97,12 +97,12 @@ test("anthropic path: parseable body without messages → 400, upstream untouche
             headers: { "content-type": "application/json" },
             body: "{}",
         });
-        assert.equal(res.status, 400);
+        assert.equal(res.status, 200);
         const body = (await res.json()) as Record<string, any>;
-        assert.equal(body.type, "error");
-        assert.equal(body.error.type, "invalid_request_error");
-        assert.match(String(body.error.message), /messages/);
-        assert.equal(seen.length, 0, "malformed body must not reach the upstream");
+        assert.equal(body.ok, true);
+        assert.equal(seen.length, 1, "body must reach the upstream verbatim");
+        assert.equal(seen[0].path, "/v1/messages");
+        assert.equal(seen[0].body, "{}");
     } finally {
         await harness.stop();
         harness.cleanup();
@@ -110,9 +110,9 @@ test("anthropic path: parseable body without messages → 400, upstream untouche
     }
 });
 
-test("anthropic path: top-level array body → 400 (used to crash the kernel fingerprint) (#806)", async () => {
-    const seen: string[] = [];
-    const upstream = await upstreamServer(200, (p) => seen.push(p));
+test("anthropic path: top-level array body → relays verbatim, kernel fingerprint never sees it (#806/#1284)", async () => {
+    const seen: Array<{ path: string; body: string }> = [];
+    const upstream = await upstreamServer(200, (p, b) => seen.push({ path: p, body: b }));
     const harness = await startProxy(upstream);
     try {
         const res = await fetch(`http://127.0.0.1:${harness.port}/v1/messages`, {
@@ -120,8 +120,9 @@ test("anthropic path: top-level array body → 400 (used to crash the kernel fin
             headers: { "content-type": "application/json" },
             body: "[1,2]",
         });
-        assert.equal(res.status, 400);
-        assert.equal(seen.length, 0);
+        assert.equal(res.status, 200);
+        assert.equal(seen.length, 1);
+        assert.equal(seen[0].body, "[1,2]");
     } finally {
         await harness.stop();
         harness.cleanup();
@@ -129,9 +130,9 @@ test("anthropic path: top-level array body → 400 (used to crash the kernel fin
     }
 });
 
-test("openai path: parseable body without messages → 400 openai-shaped error (#806)", async () => {
-    const seen: string[] = [];
-    const upstream = await upstreamServer(200, (p) => seen.push(p));
+test("openai path: parseable body without messages → relays verbatim (#806/#1284)", async () => {
+    const seen: Array<{ path: string; body: string }> = [];
+    const upstream = await upstreamServer(200, (p, b) => seen.push({ path: p, body: b }));
     const harness = await startProxy(upstream);
     try {
         const res = await fetch(`http://127.0.0.1:${harness.port}/v1/chat/completions`, {
@@ -139,11 +140,12 @@ test("openai path: parseable body without messages → 400 openai-shaped error (
             headers: { "content-type": "application/json" },
             body: "{}",
         });
-        assert.equal(res.status, 400);
+        assert.equal(res.status, 200);
         const body = (await res.json()) as Record<string, any>;
-        assert.equal(body.error.type, "invalid_request_error");
-        assert.match(String(body.error.message), /messages/);
-        assert.equal(seen.length, 0);
+        assert.equal(body.ok, true);
+        assert.equal(seen.length, 1);
+        assert.equal(seen[0].path, "/v1/chat/completions");
+        assert.equal(seen[0].body, "{}");
     } finally {
         await harness.stop();
         harness.cleanup();

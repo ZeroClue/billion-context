@@ -88,3 +88,26 @@ export function singleFlight(fn: () => Promise<string | undefined>): () => Promi
         return inFlight;
     };
 }
+
+// ———— Native-origin waiter (#1243) ——————————————————————————————————
+// Native entries spawn the proxy asynchronously and publish its origin via
+// NativeInterceptState; the shared factory's before_provider_headers reads
+// BILLION_CONTEXT_PROXY, which bootstrap() writes only after the spawn. A
+// one-shot's single header event can fire inside that window, so the reader
+// awaits the writer through this channel instead of racing it. Hosts without
+// a native entry register no waiter — awaitNativeProxyOrigin() resolves
+// undefined immediately and the session rides wire mode as before.
+
+export interface NativeOriginWaiter {
+    wait: () => Promise<string | undefined>;
+}
+
+let originWaiter: NativeOriginWaiter | undefined;
+
+export function setNativeOriginWaiter(waiter: NativeOriginWaiter): void {
+    originWaiter = waiter;
+}
+
+export async function awaitNativeProxyOrigin(): Promise<string | undefined> {
+    return originWaiter === undefined ? undefined : originWaiter.wait();
+}
