@@ -84,9 +84,13 @@ test("applyCompressSettings: maps ccr onto kernel CcrConfig with DEFAULT_CCR_CON
     const base = defaultConfig(200000);
     const out = applyCompressSettings(base, 200_000, { ccr: { enabled: true, minToolTokens: 200 } });
     assert.deepEqual(out.ccr, { ...DEFAULT_CCR_CONFIG, minToolTokens: 200, enabled: true });
-    // absent block leaves base.ccr untouched (kernel default = feature off)
-    const untouched = applyCompressSettings(base, 200_000, {});
-    assert.equal(untouched.ccr, base.ccr);
+    // absent block → stays off (#1207 opt-in): no default-on flip, base.ccr
+    // carries through untouched
+    const defaulted = applyCompressSettings(base, 200_000, {});
+    assert.ok(!defaulted.ccr?.enabled, "unset ccr resolves to off (#1207 opt-in)");
+    // explicit false still wins (opt-out preserved)
+    const off = applyCompressSettings(base, 200_000, { ccr: { enabled: false } });
+    assert.equal(off.ccr?.enabled, false);
 });
 
 test("integration: kernel processTurn ID-references the oversized tool result (ccr+absorb enabled)", () => {
@@ -105,9 +109,31 @@ test("integration: kernel processTurn ID-references the oversized tool result (c
     assert.equal(turn.messages.find((m) => m.id === "a-tc")!.text, JSON.stringify({ command: "npm run build" }));
 });
 
-test("integration: ccr off → byte-identical pass-through", () => {
-    const cfg = applyCompressSettings(defaultConfig(200000), 200_000, {});
-    assert.notEqual(cfg.ccr?.enabled, true);
+test("integration: ccr stays inert with no explicit config; explicit enable arms the kernel store node", () => {
+    const disarmed = applyCompressSettings(defaultConfig(200000), 200_000, {});
+    assert.ok(!disarmed.ccr?.enabled, "unset ccr → off (#1207 opt-in)");
+    const inert = turnWith(disarmed);
+    const res0 = inert.messages.find((m) => m.role === "tool" && m.toolCallId === "call_1")!;
+    assert.equal(res0.text, BIG_TEXT, "no placeholder without explicit opt-in");
+    assert.equal(Object.keys(inert.contentStore.byRef).length, 0);
+
+    const cfg = applyCompressSettings(defaultConfig(200000), 200_000, { ccr: { enabled: true } });
+    assert.equal(cfg.ccr?.enabled, true, "explicit enable arms");
+    const msgs: CoreMessage[] = [
+        { id: "u1", role: "user", contentType: "text", text: "run a big build" },
+        { id: "a-tc", role: "assistant", contentType: "tool-call", toolName: "bash", toolCallId: "call_1", text: JSON.stringify({ command: "npm run build" }) },
+        { id: "t-res", role: "tool", contentType: "tool-result", toolCallId: "call_1", toolName: "bash", text: "line of build output ".repeat(3000) },
+    ];
+    const core = createCore();
+    const turn = core.processTurn({ messages: msgs, state: createInitialState(), config: cfg, tokenCount: 0, renderTags: "text-only" });
+    const res = turn.messages.find((m) => m.role === "tool" && m.toolCallId === "call_1")!;
+    assert.ok(res.text!.includes(STORED_PLACEHOLDER_MARKER), `placeholder expected at the default threshold: ${res.text!.slice(0, 160)}`);
+    assert.equal(Object.keys(turn.contentStore.byRef).length, 1, "one entry stored via the default minToolTokens");
+});
+
+test("integration: ccr explicitly off → byte-identical pass-through", () => {
+    const cfg = applyCompressSettings(defaultConfig(200000), 200_000, { ccr: { enabled: false } });
+    assert.equal(cfg.ccr?.enabled, false);
     const turn = turnWith(cfg);
     const res = turn.messages.find((m) => m.role === "tool" && m.toolCallId === "call_1")!;
     assert.equal(res.text, BIG_TEXT);

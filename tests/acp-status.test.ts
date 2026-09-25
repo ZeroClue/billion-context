@@ -74,8 +74,12 @@ test("#389: acp_status after compress lists no already-compressed refs, without 
     // #389 scenario. The report must derive ranges/nudge from live state.
     const after = handleAcpStatus({}, ctx);
     assert.ok(after.includes("b1"), "base report shows the new active block");
-    assert.ok(!rangesSection(after).includes("m00001"), "compressed refs must not reappear in Compressible ranges");
-    assert.ok(!rangesSection(after).includes("m00006"), "compressed refs must not reappear in Compressible ranges");
+    // #1179: BLOCK SPANS (and other sections) legitimately name covered refs —
+    // scope the check to actual range-entry lines ("  mNNNNN–mNNNNN …").
+    const rangeLines = rangesSection(after).split("\n").filter((l) => /^\s{2}m\d{5}–/.test(l));
+    assert.ok(rangeLines.length > 0, "remaining compressible ranges still listed");
+    assert.ok(!rangeLines.some((l) => l.includes("m00001")), "compressed refs must not reappear in Compressible ranges");
+    assert.ok(!rangeLines.some((l) => l.includes("m00006")), "compressed refs must not reappear in Compressible ranges");
     assert.ok(after.includes("Nudge: "), "Nudge line present and derived from live state");
 });
 
@@ -121,7 +125,9 @@ test("#389: same-turn loop — acp_status after compress in one round shows live
         const statusPart = out.slice(markerIdx);
         assert.ok(statusPart.includes("Compressible ranges"), "responses loop acp_status now carries the ranges section");
         assert.ok(statusPart.includes("b1"), "status marker shows the newly created block");
-        assert.ok(!statusPart.includes("m00001–m00006"), "compressed range must not be listed as compressible in the same-turn status");
+        // #1179: BLOCK SPANS names the covered span in the same report — check
+        // the range-entry shape ("  mNNNNN–mNNNNN  …") instead of a bare substring.
+        assert.ok(!statusPart.includes("  m00001–m00006  "), "compressed range must not be listed as compressible in the same-turn status");
     } finally {
         globalThis.fetch = orig;
     }

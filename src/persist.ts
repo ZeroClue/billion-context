@@ -114,6 +114,7 @@ interface PersistedSession {
         imageTokensSaved?: number;
         imageFullCalls?: number;
         imageFullRestores?: number;
+        rangeRestores?: number;
     };
     /** Free-form escape hatch (v2+). */
     metadata?: Record<string, unknown>;
@@ -735,6 +736,7 @@ function buildSession(parsed: PersistedSession): Session {
             imageTokensSaved: stats.imageTokensSaved ?? 0,
             imageFullCalls: stats.imageFullCalls ?? 0,
             imageFullRestores: stats.imageFullRestores ?? 0,
+            rangeRestores: stats.rangeRestores ?? 0,
         },
         metadata: parsed.metadata ?? {},
         state: mergeState(parsed.state),

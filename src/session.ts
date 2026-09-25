@@ -141,7 +141,7 @@ export type Session = {
         /** #1095: image blocks downscaled this session (lifetime; optional —
          *  absent in pre-#1095 records). */
         imageShrunkCount?: number;
-        /** #1095: cumulative wire bytes saved by image downscaling. */
+        /** #1095: cumulative wire bytes saved by downscaling. */
         imageBytesSaved?: number;
         /** #1095: cumulative estimated visual tokens saved by downscaling. */
         imageTokensSaved?: number;
@@ -149,6 +149,8 @@ export type Session = {
         imageFullCalls?: number;
         /** #1095: image_full calls that restored a downscaled ref. */
         imageFullRestores?: number;
+        /** #1179 CCR v2: range-level decompress restores served (ephemeral channel). */
+        rangeRestores: number;
     };
     /** Free-form escape hatch for future fields not yet promoted to typed
      *  members. Persisted as-is (must be JSON-serializable). Use sparingly —
@@ -326,7 +328,7 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
     const session: Session = {
         id,
         meta: { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin, label: meta?.label },
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),

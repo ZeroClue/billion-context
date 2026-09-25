@@ -1384,6 +1384,11 @@ async function handle(
                 windowShrinkReason = "operator";
             }
             const compressCfg = resolveCompress(opts.routes, embeddedUrl, model, opts.compress);
+            // [#1207 owner decision] CCR is opt-in on every lane: the raw
+            // three-level merge IS the arming decision — no `ccr` key at any
+            // level leaves resolvedCcrCfg undefined and the session never
+            // arms. Turn it on only by setting compress.ccr.enabled=true at
+            // some config level, after local verification.
             resolvedCcrCfg = compressCfg.ccr;
         resolvedImageCompressionCfg = compressCfg.imageCompression;
             reqPrompts = resolveCompressPrompts(compressCfg);
