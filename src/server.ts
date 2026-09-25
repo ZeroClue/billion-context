@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
-import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges, resolveOutputSteeringConfig } from "acp-kernel";
+import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges, resolveOutputSteeringConfig, DEFAULT_CCR_CONFIG } from "acp-kernel";
 import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
 import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
 import type { ProxyOptions } from "./config.js";
@@ -62,7 +62,7 @@ import {
 } from "acp-kernel/wire";
 import { ABSORB_TOOL, ABSORB_TOOL_GOOGLE, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, IMAGE_FULL_TOOL, IMAGE_FULL_TOOL_GOOGLE, IMAGE_FULL_TOOL_OPENAI, IMAGE_FULL_TOOL_RESPONSES, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, retrieveToolsFor, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance, withSummaryBudgetNote } from "./compress-tool.js";
 import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } from "./absorb.js";
-import { adoptContentStore, ccrEnabled, contentStoreOf, executeRetrieve, retrieveToolName, storeEffectiveCcr, type CcrSettings } from "./store.js";
+import { adoptContentStore, ccrEnabled, ccrPluginWireOk, contentStoreOf, drainPendingRetrievals, executeRetrieve, retrieveToolName, storeEffectiveCcr, type CcrSettings } from "./store.js";
 import { applyImageCompressionPass, imageCompressionEnabled, imageFullTrailingNote, storeEffectiveImageCompression, type ImageCompressionSettings } from "./image-compress.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
@@ -961,7 +961,13 @@ async function handle(
     // tool endpoint lets an agent-side plugin execute compress/decompress/
     // search_context/acp_status against the session the plugin drives. Both
     // live under the /__bili/ loopback + trusted-origin gate above.
-    if (req.method === "GET" && req.url === "/__bili/plugin/manifest") return handlePluginManifest(res, config);
+    if (req.method === "GET" && req.url === "/__bili/plugin/manifest") {
+        // [#1271] kernelConfig carries no file/global compress settings; layer the global
+        // CCR view onto base config so acp_retrieve is advertised exactly when the operator
+        // enabled it (DEFAULT_CCR_CONFIG floors unset fields; per-request overrides are still
+        // enforced at execution, so the manifest stays conservative as #1192 requires).
+        return handlePluginManifest(res, { ...config, ccr: { ...DEFAULT_CCR_CONFIG, ...config.ccr, ...opts.compress.ccr } });
+    }
     if (req.method === "GET" && req.url?.startsWith("/__bili/plugin/status")) {
         const query = req.url.slice(req.url.indexOf("?") + 1);
         const params = new URLSearchParams(query);
@@ -1780,21 +1786,35 @@ async function handle(
         //    exactly one system at index 0, #377) accept it and the head system
         //    message stays byte-stable for the prefix cache.
         const pluginMode = pluginAgent !== undefined;
-        // [#1097] Stamp the resolved CCR policy. acp_retrieve needs a tool
-        // channel, so CCR is only armed in proxy mode with tool injection
-        // armed (mirrors absorb); every processTurn site strips `ccr` from the
-        // loop config unless this stamp says armed — the kernel's ccr-store
-        // node must never substitute placeholders the wire cannot resolve.
-        // on — we must never emit a placeholder the model cannot retrieve (silent
-        // loss). Plugin mode is out of scope for v1: the agent would need
-        // acp_retrieve advertised in the plugin manifest to avoid that same trap.
+        // [#1097/#1271] Stamp the resolved CCR policy. acp_retrieve needs a tool
+        // channel that can round-trip the full original, so CCR arms only where
+        // that channel exists and is resolvable: proxy mode always (the proxy
+        // executes compress/retrieve server-side), and — #1271 — plugin mode on
+        // the anthropic/openai wires (the agent advertises acp_retrieve from the
+        // manifest and rides the full text back via the request-only injection in
+        // prepare*). Every processTurn site strips `ccr` from the loop config
+        // unless this stamp says armed — the kernel's ccr-store node must never
+        // substitute placeholders the wire cannot resolve (we must never emit a
+        // placeholder the model cannot retrieve = silent loss).
+        // The responses wire stays out even in plugin mode: its developer-message /
+        // strict-alternation injection mechanics have no proven request-only carrier
+        // here (and no real plugin lane uses it), so arming it would risk silent loss.
         // The responses text/marker protocol has no native tool channel either
         // (absorb/rules strip themselves there for the same reason), and
         // ACP_NO_INJECT_TOOL disables all injection on that wire — both would
         // leave placeholders unretrievable.
         const storeChannelOk = protocol !== "responses" ||
             (!process.env.ACP_NO_INJECT_TOOL && !FORCE_TEXT_PROTOCOL && resolveCompressProtocol(opts.routes, upstreamOrigin) !== "marker");
-        storeEffectiveCcr(session, opts.compress.injectTool && !pluginMode && storeChannelOk && resolvedCcrCfg?.enabled === true ? resolvedCcrCfg : undefined);
+        // [review #1273] The plugin arm MUST gate on the BASE config because that
+        // is the only source the manifest reads (handlePluginManifest sees
+        // opts.compress.ccr, never the route/model-scoped merge). Route-scoped
+        // enablement without a base-level enabled flag would otherwise arm the
+        // store and emit placeholders while the manifest never advertised
+        // acp_retrieve — the model would see "→ acp_retrieve(...)" with no
+        // retrieval channel (silent loss). Route-scoped-only enablement stays
+        // proxy-mode-only (the proxy injects the tool itself, per-request).
+        const pluginCcrOk = !pluginMode || (ccrPluginWireOk(protocol) && opts.compress.ccr?.enabled === true);
+        storeEffectiveCcr(session, opts.compress.injectTool && pluginCcrOk && storeChannelOk && resolvedCcrCfg?.enabled === true ? resolvedCcrCfg : undefined);
         // [#1095] same channel/plugin-mode gating as CCR: image_full's restore
         // round-trip needs a tool channel on this wire; without one the model
         // could request originals it never gets back (silent-loss trap).
@@ -2546,6 +2566,12 @@ async function prepareAnthropic(
         // decision + recipe; originals cached for the image_full restore channel).
         // Deterministic encode ⇒ re-runs are byte-stable for the prefix cache.
         await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, upstreamOrigin), log });
+        // [#1271] plugin mode: acp_retrieve ran via the tool API; ride the full original
+        // back on this forward as a request-only trailing message (ephemeral, never persisted).
+        if (pluginMode && ccrEnabled(session)) {
+            const retrInj = drainPendingRetrievals(session);
+            if (retrInj.length > 0) processedMessages = [...processedMessages, ...retrInj];
+        }
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
         if (sysNotes.length > 0) {
             rebuiltMessages = [...rebuiltMessages, ...sysNotes.map((text) => ({ role: "user" as const, content: text }))];
@@ -2723,6 +2749,12 @@ async function prepareOpenai(
         // [#1095] arrival-time image downscale (see prepareAnthropic) — one
         // deterministic encode per fingerprint; byte-stable re-runs.
         await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, billingUpstream ?? upstreamOrigin), log });
+        // [#1271] plugin mode: acp_retrieve ran via the tool API; ride the full original
+        // back on this forward as a request-only trailing message (ephemeral, never persisted).
+        if (pluginMode && ccrEnabled(session)) {
+            const retrInj = drainPendingRetrievals(session);
+            if (retrInj.length > 0) processedMessages = [...processedMessages, ...retrInj];
+        }
         rebuiltMessages = systemToUser(hardenOpenaiAssistantContent(coreToOpenai(processedMessages as BiliMessage[])));
 
         // ONLY the static compress prompt goes into the system message — the
