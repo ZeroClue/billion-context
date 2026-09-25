@@ -12,6 +12,7 @@ import {
 import { isProxyToolFor } from "../src/absorb.ts";
 import { mergeCompress, applyCompressSettings } from "../src/compress-settings.ts";
 import { parseCompressSettings } from "../src/config.ts";
+import { RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES } from "../src/compress-tool.ts";
 import { executeProxyTool, type LoopCtx } from "../src/loop/core.ts";
 import { handlePluginManifest } from "../src/plugin.ts";
 import {
@@ -93,10 +94,63 @@ test("executeRule: maxRules cap from config limits", () => {
     assert.match(executeRule({ rule: "three" }, ctx), /^rule limit reached \(2\)/);
 });
 
+test("executeRule: delete removes one rule by id and returns Removed with its text", () => {
+    const { session, ctx } = makeRuleCtx();
+    assert.equal(executeRule({ rule: "keep me" }, ctx), "Recorded rule1: keep me");
+    assert.equal(executeRule({ rule: "drop me" }, ctx), "Recorded rule2: drop me");
+    assert.equal(executeRule({ delete: "rule2" }, ctx), "Removed rule2: drop me");
+    assert.deepEqual(session.state.rules, [{ id: "rule1", text: "keep me" }]);
+    assert.equal(executeRule({}, ctx), "1. [rule1] keep me");
+});
+
+test("executeRule: delete trims the id and passes unknown ids through verbatim", () => {
+    const { session, ctx } = makeRuleCtx();
+    assert.equal(executeRule({ rule: "target" }, ctx), "Recorded rule1: target");
+    assert.equal(executeRule({ delete: "  rule9  " }, ctx), 'no rule with id "rule9" \u2014 list current rules first (omit the text argument).');
+    assert.deepEqual(session.state.rules, [{ id: "rule1", text: "target" }], "failed delete must not mutate state");
+    assert.equal(executeRule({ delete: "  rule1 " }, ctx), "Removed rule1: target");
+    assert.equal(session.state.rules?.length, 0);
+});
+
+test("executeRule: clear removes all rules and reports the count; empty clear is honest", () => {
+    const { session, ctx } = makeRuleCtx();
+    executeRule({ rule: "one" }, ctx);
+    executeRule({ rule: "two" }, ctx);
+    assert.equal(executeRule({ clear: true }, ctx), "Cleared 2 rule(s).");
+    assert.deepEqual(session.state.rules, []);
+    assert.equal(executeRule({}, ctx), "No rules recorded.");
+    assert.equal(executeRule({ clear: true }, ctx), "No rules to clear.");
+});
+
+test("executeRule: delete/clear are mutually exclusive with each other and with rule", () => {
+    const { session, ctx } = makeRuleCtx();
+    executeRule({ rule: "survivor" }, ctx);
+    const conflict = "Use one operation per call: record (rule), remove one (delete), remove all (clear: true), or list (no arguments).";
+    assert.equal(executeRule({ delete: "rule1", clear: true }, ctx), conflict);
+    assert.equal(executeRule({ delete: "rule1", rule: "new" }, ctx), conflict);
+    assert.equal(executeRule({ clear: true, rule: "new" }, ctx), conflict);
+    assert.deepEqual(session.state.rules, [{ id: "rule1", text: "survivor" }], "conflicting calls must not mutate state");
+    // Non-string delete / non-true clear are ignored, same convention as non-string rule.
+    assert.equal(executeRule({ delete: true }, ctx), "1. [rule1] survivor");
+    assert.equal(executeRule({ clear: false }, ctx), "1. [rule1] survivor");
+});
+
+test("acp_rule schemas document rule/delete/clear on every wire shape", () => {
+    type ToolShape = { input_schema?: { properties?: Record<string, { description?: string }> }; parameters?: { properties?: Record<string, { description?: string }> }; function?: { parameters?: { properties?: Record<string, { description?: string }> } } };
+    for (const tool of [RULE_TOOL, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, RULE_TOOL_GOOGLE] as ToolShape[]) {
+        const props = tool.input_schema?.properties ?? tool.parameters?.properties ?? tool.function?.parameters?.properties;
+        assert.ok(props, "acp_rule carries a parameter schema");
+        for (const key of ["rule", "delete", "clear"]) {
+            assert.ok(typeof props[key]?.description === "string" && props[key].description.length > 0, `param ${key} documented`);
+        }
+    }
+});
+
 test("executeProxyTool: routes acp_rule through executeRule when enabled, unknown tool otherwise", () => {
     const { session, ctx } = makeRuleCtx();
     const loopCtx: LoopCtx = { core: createCore(), config: ctx.config, messages: [], session, log: () => {} };
     assert.equal(executeProxyTool(RULE_TOOL_NAME, { rule: "via loop" }, loopCtx), "Recorded rule1: via loop");
+    assert.equal(executeProxyTool(RULE_TOOL_NAME, { delete: "rule1" }, loopCtx), "Removed rule1: via loop");
 
     const offSession = makeSession();
     const offCtx: LoopCtx = { core: createCore(), config: defaultConfig(200000), messages: [], session: offSession, log: () => {} };
