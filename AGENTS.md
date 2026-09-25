@@ -1,7 +1,7 @@
 <!-- agents-version: v1.0 (2026-09-25) -->
 # billion-context fork (`bili`) — working spec index
 
-`billion-context` (npm, CLI `bili`/`bili-proxy`) is a context-compression proxy for AI agents: it sits between an agent client and its upstream LLM API, injecting acp-kernel's compression pipeline so long conversations fold into reversible, prefix-cache-friendly summaries. This checkout is a **local fork** of the public third-party upstream `ranxianglei/billion-context`, carrying fork features (English dashboard, metrics API + SQLite analytics, OpenCode V2 plugin) on local trunk `main`, synced monthly from `upstream/master`. There is no `origin` remote.
+`billion-context` (npm, CLI `bili`/`bili-proxy`) is a context-compression proxy for AI agents: it sits between an agent client and its upstream LLM API, injecting acp-kernel's compression pipeline so long conversations fold into reversible, prefix-cache-friendly summaries. This checkout is a **local fork** of the public third-party upstream `ranxianglei/billion-context`, carrying fork features (English dashboard, metrics API + SQLite analytics, OpenCode V2 plugin) on local trunk `main`, synced monthly from `upstream/master`; the fork's own work is published at `origin` = `ZeroClue/billion-context`.
 
 ## Lazy-loaded references — read ONLY when the trigger applies
 
@@ -49,7 +49,7 @@
 2. NEVER run `npm publish` (CI publishes on release-PR merge) — no `NPM_ALLOW_DANGEROUS=1`, no pack workarounds.
 3. NEVER force-push to `master`/`main` or rewrite published history.
 4. NEVER print secrets (GitHub PAT, API keys, session tokens); mask secret values in all logs.
-5. NEVER push anywhere without an explicit user utterance naming the remote — there is no `origin`, and `upstream` is a third-party PUBLIC repo (authed here as ZeroClue; owner is ranxianglei).
+5. NEVER push to `upstream` (third-party PUBLIC repo, owner ranxianglei) — and never push to `origin` (the ZeroClue fork) without an explicit user utterance naming the remote.
 6. NEVER edit `package.json` `"version"` outside `*_release-v*` branches; a release commit changes ONLY version (+ lockfile drift), message `release v{VERSION}`.
 7. acp-kernel stays EXACT-pinned (`0.0.80`); bump only after the new version is live on npm (`npm view acp-kernel version`).
 8. Kernel contract: message ids and ref numbers (`mNNNNN`) are NEVER reused within a session — never prune/repack `session.state.messageRefs` in ways that could re-issue a freed number. Full contract: `docs/reference/architecture.md`.
@@ -58,9 +58,9 @@
 
 ## Git rules
 
-- Model: local trunk `main`; `upstream` = third-party public `ranxianglei/billion-context` (default branch `master`). Fork branches: `upstream-sync` (integration), `upstream-baseline` (fork point), `fork-changes`. Monthly sync per `UPSTREAM_SYNC.md`; preserve fork features: English dashboard, metrics API, SQLite analytics, OpenCode V2 plugin. (Docker support is no longer in the tree; `:8800`/`:8801` proxy containers are runtime state, not repo content.)
+- Model: local trunk `main` (pushed to `origin` = `ZeroClue/billion-context`, the fork remote); `upstream` = third-party public `ranxianglei/billion-context` (default branch `master`, NEVER pushed to). Fork branches: `upstream-sync` (integration), `upstream-baseline` (fork point), `fork-changes`. Monthly sync per `UPSTREAM_SYNC.md`; preserve fork features: English dashboard, metrics API, SQLite analytics, OpenCode V2 plugin. (Docker support is no longer in the tree; `:8800`/`:8801` proxy containers are runtime state, not repo content.)
 - Visibility: **public upstream** — assume anything pushed is readable forever, even after deletion or history rewrite. `.env*` never committed; audit diffs for real-world identifiers before any push.
-- PRs target upstream `master` via the `gh` CLI (authed as ZeroClue) — but this clone has no `origin` and ZeroClue has no fork of the repo, so ask the user where the head branch lives before attempting a PR. NEVER merge. PAT+curl fallback recipe: `docs/reference/release-workflow.md`.
+- PR flow: push the feature branch to `origin` (with explicit user approval), then `gh pr create --repo ranxianglei/billion-context --base master --head <branch>` (gh authed as ZeroClue). NEVER merge. PAT+curl fallback recipe: `docs/reference/release-workflow.md`.
 - Handoff docs are tracked: `docs/handoff-*.md` committed; older ones `git mv`-ed into `docs/archive/handoffs/` — never deleted.
 - Commit prefixes (from git log): `feat:` `fix:` `refactor:` `test:` `docs:` `release:` `sync:` `handoff:` `profile:`.
 

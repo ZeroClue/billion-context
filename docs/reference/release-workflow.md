@@ -35,11 +35,11 @@ gh pr create --repo ranxianglei/billion-context --base master --head <branch> \
   --title "fix: short summary" --body-file /tmp/pr-body.md
 ```
 
-> Caveat (fork state, verified 2026-09-25): this clone has no `origin` remote and
-> ZeroClue has no fork of the repo, so `--head <branch>` has nowhere to live yet.
-> Before opening a PR, ask the user: create a fork under ZeroClue, or push the
-> branch to upstream directly if the user has collaborator access. Never push
-> without an explicit user utterance.
+> Fork state (updated 2026-09-25): `origin` = `ZeroClue/billion-context` (public
+> fork of upstream, created user-directed; `main` pushed and tracking it). Push
+> the feature branch to `origin` — with explicit user approval — then open the PR
+> with `--head <branch>` (gh resolves the head on the ZeroClue fork). NEVER push
+> to `upstream`.
 
 Fallback if `gh` is unavailable/unauthed (same credential the git helper uses —
 token stays in a shell variable, never printed):
