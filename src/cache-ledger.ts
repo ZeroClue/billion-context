@@ -108,6 +108,10 @@ export function getCacheLedger(session: Session): CacheLedger {
 }
 
 function pushFold(led: CacheLedger, f: Omit<LedgerFold, "seq" | "T" | "hPct" | "requestsAfter" | "k">): void {
+    // Freeze k = samples since each open fold (#1286): samples arrive in
+    // order, so at this instant the count equals the batch-path
+    // turnsToNextFold window (f.at < s.at <= nextFold.at); requestsAfter
+    // keeps growing afterward to the full post-fold total.
     for (const open of led.folds) {
         if (open.k === null) open.k = open.requestsAfter;
     }
@@ -177,7 +181,11 @@ export function recordCacheSample(session: Session, s: { at: number; input: numb
         led.consumedFoldSeq = Math.max(led.consumedFoldSeq, hi);
     }
     const hitPct = s.input > 0 ? round1((s.cached / s.input) * 100) : 0;
-    for (const f of pendRefs) {
+    // #1286: turn counting is decoupled from compRepay attribution — the
+    // consumedFoldSeq gate above applies to the pending list only. Every
+    // elapsed fold counts EVERY later sample, matching buildCacheReport's
+    // full post-fold requestsAfter window.
+    for (const f of led.folds) {
         if (f.at <= s.at) {
             f.requestsAfter += 1;
             if (f.hPct === null) f.hPct = hitPct;
