@@ -548,6 +548,30 @@ export function apply(ctx: PluginContext): void {
         return false;
     };
 
+    // #1290: the isModelApiUrl gate (native-intercept) returns BEFORE the
+    // takeover gate above, so a URL that is not a recognized model endpoint
+    // (e.g. a third-party plugin's custom wire such as commandcode's
+    // POST /alpha/generate) went direct with ZERO signal — contradicting the
+    // #1158 promise. Surface each distinct unrouted endpoint once per process
+    // through the durable channel GUI hosts need (persistClientEvent), bounded
+    // like gateRefusals above.
+    const unroutedEndpoints = new Set<string>();
+    state.onUnroutedModelUrl = (rawUrl) => {
+        let key: string;
+        try {
+            const u = new URL(rawUrl);
+            key = `${u.origin}${u.pathname}`;
+        } catch {
+            key = rawUrl.split("?")[0];
+        }
+        if (unroutedEndpoints.has(key)) return;
+        if (unroutedEndpoints.size >= 256) return;
+        unroutedEndpoints.add(key);
+        const line = `bili-native-dsh: request sent DIRECT (uncompressed) — ${key} is not a recognized model endpoint, so bili did not route it through the proxy. bili only compresses known protocol paths (/chat/completions, /v1/messages, /responses, …); a custom-wire endpoint needs its own support.`;
+        console.error(line);
+        persistClientEvent(line);
+    };
+
     state.headersFor = (_url) => {
         maybeRetry(ctx);
         if (!register.toolsReady) return undefined;

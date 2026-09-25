@@ -53,6 +53,14 @@ export interface NativeInterceptState {
     readyTimeoutMs?: number;
     /** Test/observability hook: every dispatched decision. */
     onDispatch?: (url: string, action: "rewrite" | "direct" | "self" | "retry") => void;
+    /** #1290: observability hook — fired for every request the fetch patch lets
+     *  through WITHOUT routing because its URL is not a recognized model endpoint
+     *  (isModelApiUrl miss). Such requests never reach a bili proxy, so without
+     *  this their "went direct (uncompressed)" outcome was completely silent —
+     *  #1158's logging promise only covered the attribution gate below. Called
+     *  per request; hosts dedup once-per-process-per-endpoint like takeoverGate.
+     *  Undefined hosts stay silent. */
+    onUnroutedModelUrl?: (url: string) => void;
 }
 
 const INTERCEPT_FLAG = "__biliNativeFetchIntercept";
@@ -92,6 +100,20 @@ export function isModelApiUrl(url: string): boolean {
         if (segments[0] === "bili") return false;
         const pathname = u.pathname.replace(/\/+$/, "");
         return MODEL_API_SUFFIX.test(pathname);
+    } catch {
+        return false;
+    }
+}
+
+/** True when the URL addresses bili's own control plane (`/__bili/*`,
+ *  `/__acp/*`, or a `/bili/<protocol>/<url>` tunnel) — expected direct
+ *  traffic, not an unrecognized endpoint (#1290): reporting it as "not a
+ *  recognized model endpoint" would flag bili's own requests. */
+function isBiliControlUrl(url: string): boolean {
+    if (url.includes("/__bili/") || url.includes("/__acp/")) return true;
+    try {
+        const segments = new URL(url).pathname.split("/").filter((s) => s.length > 0);
+        return segments[0] === "bili";
     } catch {
         return false;
     }
@@ -399,7 +421,10 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 return orig(makeTarget(routedTarget), init);
             }
         }
-        if (!isModelApiUrl(url)) return orig(input, init);
+        if (!isModelApiUrl(url)) {
+            if (!isBiliControlUrl(url)) state.onUnroutedModelUrl?.(url);
+            return orig(input, init);
+        }
         // #1117: URL shape alone cannot claim a request — every model call in
         // the process hits the same endpoints. When the host supplies an
         // attribution gate, an unattributed caller keeps its original URL and
