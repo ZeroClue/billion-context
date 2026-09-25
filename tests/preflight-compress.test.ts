@@ -104,7 +104,12 @@ test("e2e: model switch to a smaller window → preflight compresses before forw
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-big": { context: 400_000 }, "claude-small": { context: 10_600 } } } },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        compress: { injectTool: true, injectNudge: true },
+        // CCR pinned off: these tests pin preflight mechanics (payload-size and
+        // model-switch triggers, recent-window retention) against exact token
+        // budgets; the default-on acp_retrieve tool schema legitimately shifts
+        // that arithmetic by a few hundred tokens. CCR-on interplay with the
+        // cascade is covered by e2e-compress-cascade.test.ts.
+        compress: { injectTool: true, injectNudge: true, ccr: { enabled: false } },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
@@ -211,7 +216,12 @@ test("e2e: no preflight when the context fits the (small) model window", async (
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-big": { context: 400_000 }, "claude-small": { context: 260_000 } } } },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        compress: { injectTool: true, injectNudge: true },
+        // CCR pinned off: these tests pin preflight mechanics (payload-size and
+        // model-switch triggers, recent-window retention) against exact token
+        // budgets; the default-on acp_retrieve tool schema legitimately shifts
+        // that arithmetic by a few hundred tokens. CCR-on interplay with the
+        // cascade is covered by e2e-compress-cascade.test.ts.
+        compress: { injectTool: true, injectNudge: true, ccr: { enabled: false } },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
@@ -289,7 +299,12 @@ test("e2e: fresh session (lastInputTokens=0) whose raw history overflows the win
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-small": { context: 10_600 } } } },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        compress: { injectTool: true, injectNudge: true },
+        // CCR pinned off: these tests pin preflight mechanics (payload-size and
+        // model-switch triggers, recent-window retention) against exact token
+        // budgets; the default-on acp_retrieve tool schema legitimately shifts
+        // that arithmetic by a few hundred tokens. CCR-on interplay with the
+        // cascade is covered by e2e-compress-cascade.test.ts.
+        compress: { injectTool: true, injectNudge: true, ccr: { enabled: false } },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
@@ -421,7 +436,12 @@ test("e2e: CJK stable session switch → preflight compresses (CJK-aware token a
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-big": { context: 400_000 }, "claude-small": { context: WINDOW } } } },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        compress: { injectTool: true, injectNudge: true },
+        // CCR pinned off: these tests pin preflight mechanics (payload-size and
+        // model-switch triggers, recent-window retention) against exact token
+        // budgets; the default-on acp_retrieve tool schema legitimately shifts
+        // that arithmetic by a few hundred tokens. CCR-on interplay with the
+        // cascade is covered by e2e-compress-cascade.test.ts.
+        compress: { injectTool: true, injectNudge: true, ccr: { enabled: false } },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
