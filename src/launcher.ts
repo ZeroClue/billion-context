@@ -230,6 +230,10 @@ export interface LauncherDeps {
      *  <origin>/__bili/watcher; 409 (daemon proxy) is silent, any failure
      *  warns and degrades to the single-owner watchdog behavior. */
     registerWatcher?: (origin: string, pid: number) => Promise<void>;
+    /** #1292: simulated OS for spawn planning and platform-gated arg
+     *  construction — tests drive win32 paths from a POSIX host. Defaults
+     *  to process.platform. */
+    platform?: NodeJS.Platform;
 }
 
 export function isLaunchClient(value: string): value is ClientName {
@@ -1242,6 +1246,22 @@ export function buildClaudePluginEnv(origin: string, directUrl: boolean, baseEnv
     if (!directUrl) return baseEnv;
     const upstream = baseEnv.BILI_CLAUDE_UPSTREAM?.trim() || "https://api.anthropic.com";
     return { ...baseEnv, ANTHROPIC_BASE_URL: wrapUpstream(origin, upstream) };
+}
+
+/** #1292: native-install ANTHROPIC_BASE_URL override as --settings args.
+ *  On Windows every claude launch rides a .cmd shim through cmd.exe, which
+ *  strips embedded quotes (#679) — an inline settings JSON arrives quoteless
+ *  and claude dies with "Invalid JSON provided to --settings". There the same
+ *  object goes via a temp file whose path carries no quotes (same fix class
+ *  as codex's #681 overlay); claude accepts a file path for --settings with
+ *  identical precedence to the inline string. POSIX keeps the inline form —
+ *  no shell re-parses argv there. */
+export function buildClaudeSettingsArg(platform: NodeJS.Platform, override: string): { clientArgs: string[]; tmpFile?: string } {
+    const payload = JSON.stringify({ env: { ANTHROPIC_BASE_URL: override } });
+    if (platform !== "win32") return { clientArgs: ["--settings", payload] };
+    const tmpFile = path.join(os.tmpdir(), `bili-claude-settings-${Date.now()}.json`);
+    fs.writeFileSync(tmpFile, payload);
+    return { clientArgs: ["--settings", tmpFile], tmpFile };
 }
 
 /** Codex: -c inline overrides for the bili MCP server only.
@@ -3467,7 +3487,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         }
         if (injectMcp && codexConversationId) {
             const inj = prepareCodexMcpInjection({
-                platform: process.platform,
+                platform: deps.platform ?? process.platform,
                 codexHome: resolveCodexHome(process.env),
                 origin,
                 conversationId: codexConversationId,
@@ -3521,7 +3541,9 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             const override = wrapUpstream(origin, relay);
             env.ANTHROPIC_BASE_URL = override;
             env.BILLION_CONTEXT_PROXY = origin;
-            clientArgs = ["--settings", JSON.stringify({ env: { ANTHROPIC_BASE_URL: override } }), ...clientArgs];
+            const settingsArg = buildClaudeSettingsArg(deps.platform ?? process.platform, override);
+            if (settingsArg.tmpFile) tmpFiles.push(settingsArg.tmpFile);
+            clientArgs = [...settingsArg.clientArgs, ...clientArgs];
             console.error(`bili: claude native install detected — overriding its static ANTHROPIC_BASE_URL with this launcher's proxy (${override}); the SessionStart hook stays dormant for this session.`);
         }
         if (injectMcp) {
@@ -3538,6 +3560,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     try {
         code = await runClient(command, [...prefixArgs, ...effectiveClientArgs], env, {
             spawnImpl: deps.spawnImpl,
+            platform: deps.platform,
         });
     } catch (err) {
         console.error(`bili: failed to launch ${params.client}: ${err instanceof Error ? err.message : String(err)}`);
