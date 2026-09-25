@@ -376,7 +376,7 @@ test("e2e CCR v2 streaming: range restore rides the re-request with pair integri
     }
 });
 
-test("e2e CCR v2 default-on: no ccr config at any level still arms the session through the real server path (#1207)", async () => {
+test("e2e CCR v2 opt-in: no ccr config at any level leaves the session unarmed — range restore refuses (#1207 owner decision)", async () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const captured: string[] = [];
@@ -387,18 +387,17 @@ test("e2e CCR v2 default-on: no ccr config at any level still arms the session t
         const msgs = Array.from({ length: 20 }, (_, i) => ({ role: i % 2 === 0 ? "user" : "assistant", content: `Historical detail ${i}. ${"y".repeat(2000)}` }));
         const res = await fetch(url, {
             method: "POST",
-            headers: { "content-type": "application/json", "x-acp-session": "ccr-v2-e2e-default-on", "anthropic-version": "2023-06-01" },
+            headers: { "content-type": "application/json", "x-acp-session": "ccr-v2-e2e-opt-in", "anthropic-version": "2023-06-01" },
             body: JSON.stringify({ model: "claude-test", max_tokens: 1000, stream: true, system: [{ type: "text", text: "SYS ANCHOR", cache_control: { type: "ephemeral" } }], messages: msgs }),
         });
         const sse = await res.text();
         assert.ok(res.ok, `client turn failed: HTTP ${res.status}: ${sse}`);
         assert.equal(captured.length, 3, "initial request + one re-request per executed tool");
-        // The arming fix (#1179 default-on at server.ts resolvedCcrCfg) is what
-        // lets the range decompress succeed with NO ccr key in any config
-        // level — without it the ack would be "requires CCR" and nothing would
-        // be restored.
-        assert.match(captured[2]!, /restored 3 item\(s\)/, "range restore ack present (session armed by default)");
-        assert.match(captured[2]!, /Historical detail 2\./, "restored span text rides the re-request");
+        // [#1207 owner decision] CCR is opt-in on every lane: with no ccr key
+        // at any level the session never arms, so the range restore ack is the
+        // "requires CCR" refusal instead of restored content.
+        assert.ok(!/restored 3 item\(s\)/.test(captured[2]!), "no restore without explicit opt-in");
+        assert.match(captured[2]!, /requires CCR/, "range restore refused: session unarmed by default");
     } finally {
         await closeAll();
     }

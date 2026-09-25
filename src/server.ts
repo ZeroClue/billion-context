@@ -1384,15 +1384,12 @@ async function handle(
                 windowShrinkReason = "operator";
             }
             const compressCfg = resolveCompress(opts.routes, embeddedUrl, model, opts.compress);
-            // [#1179 default-on / #1207 review] `resolveCompress` returns the
-            // RAW three-level merge — the unset-means-enabled default lives in
-            // `applyCompressSettings`, which this arming path bypasses. Without
-            // re-applying it here, a config with no `ccr` at any level leaves
-            // resolvedCcrCfg undefined and the session NEVER arms: "on by
-            // default in proxy mode" would be dead at its only enforcement
-            // point (kernelConfig already gets the default via
-            // resolveRequestConfig — only this stamp was raw).
-            resolvedCcrCfg = compressCfg.ccr ?? { enabled: true };
+            // [#1207 owner decision] CCR is opt-in on every lane: the raw
+            // three-level merge IS the arming decision — no `ccr` key at any
+            // level leaves resolvedCcrCfg undefined and the session never
+            // arms. Turn it on only by setting compress.ccr.enabled=true at
+            // some config level, after local verification.
+            resolvedCcrCfg = compressCfg.ccr;
         resolvedImageCompressionCfg = compressCfg.imageCompression;
             reqPrompts = resolveCompressPrompts(compressCfg);
             const surfaceRes = resolveCompressSurfaceDetailed(compressCfg);

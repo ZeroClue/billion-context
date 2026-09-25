@@ -84,9 +84,10 @@ test("applyCompressSettings: maps ccr onto kernel CcrConfig with DEFAULT_CCR_CON
     const base = defaultConfig(200000);
     const out = applyCompressSettings(base, 200_000, { ccr: { enabled: true, minToolTokens: 200 } });
     assert.deepEqual(out.ccr, { ...DEFAULT_CCR_CONFIG, minToolTokens: 200, enabled: true });
-    // absent block → default-on (#1179): enabled flips to true, fields inherit base/kernel defaults
+    // absent block → stays off (#1207 opt-in): no default-on flip, base.ccr
+    // carries through untouched
     const defaulted = applyCompressSettings(base, 200_000, {});
-    assert.deepEqual(defaulted.ccr, { ...DEFAULT_CCR_CONFIG, enabled: true });
+    assert.ok(!defaulted.ccr?.enabled, "unset ccr resolves to off (#1207 opt-in)");
     // explicit false still wins (opt-out preserved)
     const off = applyCompressSettings(base, 200_000, { ccr: { enabled: false } });
     assert.equal(off.ccr?.enabled, false);
@@ -108,9 +109,16 @@ test("integration: kernel processTurn ID-references the oversized tool result (c
     assert.equal(turn.messages.find((m) => m.id === "a-tc")!.text, JSON.stringify({ command: "npm run build" }));
 });
 
-test("integration: ccr default-on arms the kernel store node with no explicit config", () => {
-    const cfg = applyCompressSettings(defaultConfig(200000), 200_000, {});
-    assert.equal(cfg.ccr?.enabled, true, "unset ccr resolves to on (#1179)");
+test("integration: ccr stays inert with no explicit config; explicit enable arms the kernel store node", () => {
+    const disarmed = applyCompressSettings(defaultConfig(200000), 200_000, {});
+    assert.ok(!disarmed.ccr?.enabled, "unset ccr → off (#1207 opt-in)");
+    const inert = turnWith(disarmed);
+    const res0 = inert.messages.find((m) => m.role === "tool" && m.toolCallId === "call_1")!;
+    assert.equal(res0.text, BIG_TEXT, "no placeholder without explicit opt-in");
+    assert.equal(Object.keys(inert.contentStore.byRef).length, 0);
+
+    const cfg = applyCompressSettings(defaultConfig(200000), 200_000, { ccr: { enabled: true } });
+    assert.equal(cfg.ccr?.enabled, true, "explicit enable arms");
     const msgs: CoreMessage[] = [
         { id: "u1", role: "user", contentType: "text", text: "run a big build" },
         { id: "a-tc", role: "assistant", contentType: "tool-call", toolName: "bash", toolCallId: "call_1", text: JSON.stringify({ command: "npm run build" }) },
