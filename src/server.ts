@@ -151,6 +151,12 @@ export function warnDroppedOpenaiParts(parsed: unknown, sessionId: string, log: 
     log("warn", `[${sessionId}] wire codec will drop ${report.count} non-user content part(s) with unrecognized type(s) [${report.types.join(", ")}] (first at message #${report.firstIndex}) — kernel 0.0.85+ preserves all user-message parts (DeepSeek Files API refs included, #1205/#1188), but parts riding system/assistant/tool messages still reduce to text-only`);
 }
 
+// #1284: upstream targets already warned about a "not a model conversation →
+// relaying verbatim" verdict — misrouted third-party endpoints can retry in
+// tight loops. Bounded FIFO, same shape as warnedWireDropKeys.
+const NON_CONVERSATION_RELAY_WARN_CAP = 4096;
+const nonConversationRelayWarned = new Set<string>();
+
 // #1073: a forward-proxy-style (absolute-form) request whose authority IS this
 // instance's own listening endpoint — e.g. a health prober configured with our
 // port as its http_proxy asking for http://127.0.0.1:<self-port>/__bili/health.
@@ -1221,17 +1227,29 @@ async function handle(
     })();
     // #806: a parseable body missing the conversation field used to crash the
     // kernel's conversation-signal fingerprint (body.messages.find on undefined —
-    // top-level arrays included) and surface as an opaque 502. Reject it with the
-    // 400 the real upstream would return instead. Unparseable bodies stay on the
-    // raw-forward path (upstream rejects them itself).
+    // top-level arrays included) and surface as an opaque 502; #806 answered that
+    // with a 400. #1284 showed the 400 is the wrong verdict for the common case:
+    // the native fetch patch claims by URL SHAPE alone (isModelApiUrl), which
+    // cannot tell a model endpoint from any other API ending in /messages or
+    // /chat/completions — a dsh plugin writing single-message records to
+    // .../sessions/<id>/messages died with an unretryable 400 before ever
+    // reaching its own upstream. The proxy is the only layer that sees both URL
+    // and body, so the body is the deciding signal: not a model conversation ⇒
+    // relay verbatim, exactly like the unparseable-body path — the upstream
+    // rejects its own API contract. (#806's crash cannot recur: a verbatim
+    // forward never enters the kernel.)
     if ((protocol === "anthropic" || protocol === "openai") && parsed !== null) {
         const p = typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
         if (!p || !Array.isArray(p.messages)) {
-            log("warn", `[${protocol}] rejected malformed body (no "messages" array): ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")}`);
-            res.writeHead(400, { "content-type": "application/json" });
-            res.end(JSON.stringify(protocol === "anthropic"
-                ? { type: "error", error: { type: "invalid_request_error", message: 'request body must include a "messages" array' } }
-                : { error: { message: 'request body must include a "messages" array', type: "invalid_request_error", param: null, code: null } }));
+            const relayKey = `${upstreamOrigin}${urlPath}`;
+            if (!nonConversationRelayWarned.has(relayKey)) {
+                nonConversationRelayWarned.add(relayKey);
+                if (nonConversationRelayWarned.size > NON_CONVERSATION_RELAY_WARN_CAP) {
+                    nonConversationRelayWarned.delete(nonConversationRelayWarned.values().next().value as string);
+                }
+                log("warn", `[${protocol}] body has no "messages" array — not a model conversation; relaying verbatim to ${maskUrlsInText(upstreamOrigin)} instead of rejecting (#1284) — ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")}`);
+            }
+            await forward(req, res, opts, bodyBuffer, null, core, config, log, route, instanceId, undefined);
             return;
         }
     }
