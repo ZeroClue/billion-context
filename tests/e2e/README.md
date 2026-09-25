@@ -70,9 +70,13 @@ prints codex version, dist path, and an upstream `/models` probe.
 
 `.github/workflows/ci-e2e.yml` runs the suite on `workflow_dispatch` with
 `E2E_UPSTREAM_URL` / `E2E_UPSTREAM_KEY` from repository secrets, against the
-repo's own `dist` (i.e. whatever is on master at dispatch time). The forge
-phase is enabled via a repository variable `E2E_FORGE` so it can be turned on
-once interception ships.
+repo's own `dist` (i.e. whatever is on master at dispatch time). It also
+auto-runs on PRs whose diff touches the request-pipeline hot files
+(`src/server.ts`, `src/server/**`, `src/loop/**`, `src/agent/**`, adapters/
+stream/persist, `tests/e2e/**`, `package-lock.json`); events without secret
+access (fork PRs) skip the run gracefully with a notice instead of failing.
+The forge phase is enabled via the dispatch input `forge` (which sets the
+`E2E_FORGE` env var) so it can be turned on once interception ships.
 
 ---
 
