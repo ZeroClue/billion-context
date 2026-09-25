@@ -1,0 +1,91 @@
+name: Bug 报告 / Bug report
+description: 报告 billion-context (bili) 的问题 —— 请尽量填全环境字段,它们直接决定排查速度
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢报告!下面带 **\*** 的字段是排查刚需(版本/使用方式/客户端/系统/上游),
+        缺了往往只能来回猜。贴日志前请删掉 API key 等敏感值。
+
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述 *
+      description: 发生了什么、期望是什么、怎么触发的(复现步骤按序写)。如果是压缩相关,请注明压缩前后各发生了什么。
+      placeholder: |
+        1. 用 xxx 启动 …
+        2. 会话到 … 之后
+        3. 看到 …(贴报错原文)
+    validations:
+      required: true
+
+  - type: input
+    id: bili-version
+    attributes:
+      label: bili 版本 *
+      description: "`bili --version` 的输出。若不是最新版,请先升级到最新再确认仍复现。"
+      placeholder: "0.1.148"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: 使用方式 *
+      options:
+        - 代理模式(客户端手动把 base URL 指到 bili)
+        - 启动器(bili pi / bili codex / bili dsh / bili kimi …)
+        - 插件 native(bili plugin install …,宿主进程内运行)
+        - MITM 模式(bili start --mitm)
+        - 其他 / 不确定
+    validations:
+      required: true
+
+  - type: input
+    id: client
+    attributes:
+      label: 客户端及版本 *
+      description: 具体客户端 + 版本号 —— 如 pi 0.83.6 / opencode v2.x(注明 v1 还是 v2!)/ codex 0.147.0 / dsh / kimi / claude code / 其他
+      placeholder: "pi 0.83.6"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: 操作系统 *
+      description: 如 macOS 15 / Ubuntu 24.04 / Windows 11(注明是否 WSL2)
+      placeholder: "Ubuntu 24.04"
+    validations:
+      required: true
+
+  - type: input
+    id: upstream
+    attributes:
+      label: 上游与模型 *
+      description: 提供方 + 模型 + 上下文窗口(若知道)—— 如 sglang · qwen3.8-27b · 262k / api.openai.com · gpt-5。窗口声明与真实上限不符是常见根因,请如实填。
+      placeholder: "sglang, qwen3.8-27b, 262k"
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: 压缩相关配置(可选)
+      description: ~/.config/billion-context/ 里非默认的部分(ccr / absorb / rules / compress 阈值 / nudge 等),只贴改过的。
+      render: yaml
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志片段(强烈建议)
+      description: ~/.local/state/billion-context/ 下 bili 日志里复现时段的片段(先删密钥)。压缩相关 bug 请带上折叠/Excluded/preflight 相关行。
+      render: text
+
+  - type: textarea
+    id: acp-state
+    attributes:
+      label: /acp 或 acp_status 输出(可选)
+      description: 问题现场的上下文状态输出(Usage/累计/块列表),对压缩类问题非常关键。
+      render: text
