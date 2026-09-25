@@ -667,22 +667,22 @@ after that succeeded was the Windows fix shipped in a follow-up release.
     **acp-kernel**, not this repo (see §2 "Kernel Contract"). This repo only
     consumes them faithfully. Codifying the kernel-side spec is a separate
     acp-kernel change — deferred; cross-repo work stays manual for now.
- - **Symptom ≠ mechanism.** Before attributing a bug to bili's mechanism, verify
-   against upstream logs — repeated-compression logs may be an upstream rate-limit
-   retry illusion, not over-compression (#282).
- - **Wire-constraint ledger only grows (#1304).** Every upstream rejection or
-   validation constraint discovered in production or provider docs (e.g. #1299:
-   Anthropic rejects top-level `oneOf`/`allOf`/`anyOf` in `tools[].input_schema`)
-   becomes a PERMANENT entry in the wire-contract suite — `tests/wire-contract.test.ts`
-   (`WIRE_RULES`, with provenance citing where the constraint was learned) plus
-   enforcement in the matching validation-parity fake upstream
-   (`tests/wire-contract-fakes.ts`) — INSIDE THE FIXING PR. The ledger never
-   shrinks without owner sign-off. Golden schema snapshots
-   (`tests/golden/wire-contract/*.json`) change only via explicit regeneration
-   (`node --import tsx scripts/update-wire-contract-goldens.ts`) with the
-   justification stated in the PR. A pin bump or tool-surface change that trips
-   a gate is a stop-the-line signal, not something to loosen.
- - **Honest output.** Never emit misleading messages for degenerate states
+- **Symptom ≠ mechanism.** Before attributing a bug to bili's mechanism, verify
+  against upstream logs — repeated-compression logs may be an upstream rate-limit
+  retry illusion, not over-compression (#282).
+- **Wire-constraint ledger only grows (#1304).** Every upstream rejection or
+  validation constraint discovered in production or provider docs (e.g. #1299:
+  Anthropic rejects top-level `oneOf`/`allOf`/`anyOf` in `tools[].input_schema`)
+  becomes a PERMANENT entry in the wire-contract suite — `tests/wire-contract.test.ts`
+  (`WIRE_RULES`, with provenance citing where the constraint was learned) plus
+  enforcement in the matching validation-parity fake upstream
+  (`tests/wire-contract-fakes.ts`) — INSIDE THE FIXING PR. The ledger never
+  shrinks without owner sign-off. Golden schema snapshots
+  (`tests/golden/wire-contract/*.json`) change only via explicit regeneration
+  (`node --import tsx scripts/update-wire-contract-goldens.ts`) with the
+  justification stated in the PR. A pin bump or tool-surface change that trips
+  a gate is a stop-the-line signal, not something to loosen.
+- **Honest output.** Never emit misleading messages for degenerate states
   (#155: export claimed "original conversation" for a 0-block session).
 - **Logs.** Mask secret values in all logs; separate trace/debug/info; keep
   debug-on by default during bug-convergence phases (#247).
