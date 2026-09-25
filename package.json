@@ -1,6 +1,6 @@
 {
   "name": "billion-context",
-  "version": "0.1.139",
+  "version": "0.1.148",
   "description": "Context-compression proxy that lets AI coding agents run for days — billions of tokens through one context window. Sits between any agent (Claude Code, Codex, Cursor, Aider, …) and its model API, folding consumed conversation into reversible, prefix-cache-friendly summaries. Zero per-agent code: just point your base URL at the proxy.",
   "type": "module",
   "main": "dist/index.js",
@@ -14,7 +14,7 @@
     "bili-proxy": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && node scripts/check-dist-import-annotations.mjs",
     "registry:snapshot": "node scripts/update-registry-snapshot.mjs",
     "codex-models:snapshot": "node scripts/update-codex-models-snapshot.mjs",
     "typecheck": "tsc --noEmit --project tsconfig.build.json",
@@ -54,7 +54,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/node-forge": "^1.3.14",
-    "acp-kernel": "0.0.84",
+    "acp-kernel": "0.0.88",
     "fzstd": "0.1.1",
     "jsonc-parser": "^3.3.1",
     "node-forge": "^1.4.0",
@@ -89,5 +89,8 @@
     "bundle": {
       "patch": "./dsh.bundle.patch.yml"
     }
+  },
+  "optionalDependencies": {
+    "sharp": "^0.35.4"
   }
 }

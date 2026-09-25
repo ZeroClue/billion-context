@@ -1,4 +1,4 @@
-import { DEFAULT_ABSORB_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type AbsorbConfig, type Config, type PackSurface, type Prompts } from "acp-kernel";
+import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, DEFAULT_IMAGE_COMPRESSION_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type ImageCompressionConfig, type PackSurface, type Prompts } from "acp-kernel";
 import * as path from "node:path";
 import { findRoute, type CompressSettings, type ProviderRoutes } from "./config.js";
 import { configDir } from "./paths.js";
@@ -59,8 +59,11 @@ export function mergeCompress(
     // like `prompts`: a model-level minToolTokens must not discard a
     // provider-level excludeTools.
     const absorbLevels = [global?.absorb, provider?.absorb, model?.absorb].filter(Boolean) as NonNullable<CompressSettings["absorb"]>[];
+    const ccrLevels = [global?.ccr, provider?.ccr, model?.ccr].filter(Boolean) as NonNullable<CompressSettings["ccr"]>[];
+    const imageCompressionLevels = [global?.imageCompression, provider?.imageCompression, model?.imageCompression].filter(Boolean) as NonNullable<CompressSettings["imageCompression"]>[];
     const reasoningLevels = [global?.reasoning, provider?.reasoning, model?.reasoning].filter(Boolean) as NonNullable<CompressSettings["reasoning"]>[];
     const reasoningGuardLevels = [global?.reasoningGuard, provider?.reasoningGuard, model?.reasoningGuard].filter(Boolean) as NonNullable<CompressSettings["reasoningGuard"]>[];
+    const outputSteeringLevels = [global?.outputSteering, provider?.outputSteering, model?.outputSteering].filter(Boolean) as NonNullable<CompressSettings["outputSteering"]>[];
     return {
         modelContextLimit: pick("modelContextLimit"),
         outputHeadroomMaxPct: pick("outputHeadroomMaxPct"),
@@ -76,6 +79,8 @@ export function mergeCompress(
         prompts: promptLevels.length > 0 ? Object.assign({}, ...promptLevels) : undefined,
         acknowledgePromptsRisk: pick("acknowledgePromptsRisk"),
         absorb: absorbLevels.length > 0 ? Object.assign({}, ...absorbLevels) : undefined,
+        ccr: ccrLevels.length > 0 ? Object.assign({}, ...ccrLevels) : undefined,
+        imageCompression: imageCompressionLevels.length > 0 ? Object.assign({}, ...imageCompressionLevels) : undefined,
         rules: pick("rules"),
 
 stripImages: pick("stripImages"),
@@ -86,6 +91,7 @@ stripImages: pick("stripImages"),
         // discard a provider-level `drop: false`.
         reasoning: reasoningLevels.length > 0 ? Object.assign({}, ...reasoningLevels) : undefined,
         reasoningGuard: reasoningGuardLevels.length > 0 ? Object.assign({}, ...reasoningGuardLevels) : undefined,
+        outputSteering: outputSteeringLevels.length > 0 ? Object.assign({}, ...outputSteeringLevels) : undefined,
         promptPack: pick("promptPack"),
     };
 }
@@ -210,7 +216,20 @@ export function hasCompressSettings(s: CompressSettings): boolean {
   *    fully). Absent `s.absorb` leaves `base.absorb` untouched — the feature
   *    stays off unless some level enables it.
   *  - `rules` → `rules = { enabled }` (kernel RuleFeatureConfig; limits stay
-  *    at kernel defaults). Absent `s.rules` leaves `base.rules` untouched. */
+  *    at kernel defaults). Absent `s.rules` leaves `base.rules` untouched.
+  *  - `ccr` → `ccr` (kernel CcrConfig, acp-kernel >= 0.0.84; the kernel runs
+  *    the ccr-store node inside processTurn between prune and absorb).
+  *    Unset fields inherit DEFAULT_CCR_CONFIG. CCR is opt-in on every lane
+  *    (#1207 owner decision): absent `s.ccr` leaves `base.ccr` untouched —
+  *    the feature stays off until some level sets `enabled: true` and it has
+  *    been verified locally. Host arming (server.ts) further gates it behind
+  *    the retrieve tool channel, so plugin mode / no-channel wires stay
+  *    inert regardless.
+   *  - `imageCompression` → `imageCompression` (kernel ImageCompressionConfig,
+   *    acp-kernel >= 0.0.84; #1095 pre-compression of image blocks). Unset
+   *    fields inherit DEFAULT_IMAGE_COMPRESSION_CONFIG. Absent
+   *    `s.imageCompression` leaves `base.imageCompression` untouched — the
+   *    feature stays off unless some level enables it. */
 export function applyCompressSettings(base: Config, limit: number, s: CompressSettings): Config {
     const nudge = { ...base.nudge };
     const truncate = { ...base.truncate };
@@ -237,6 +256,30 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
             excludeTools: s.absorb.excludeTools ?? [...d.excludeTools],
         };
     }
+    // #1207 owner decision: CCR is opt-in on every lane — no default-on
+    // else-branch; an unset `s.ccr` leaves `base.ccr` untouched (off).
+    let ccr: CcrConfig | undefined;
+    if (s.ccr !== undefined) {
+        const d = DEFAULT_CCR_CONFIG;
+        ccr = {
+            enabled: s.ccr.enabled === true,
+            toolName: s.ccr.toolName ?? d.toolName,
+            minToolTokens: s.ccr.minToolTokens ?? d.minToolTokens,
+            excludeTools: s.ccr.excludeTools ?? [...d.excludeTools],
+            maxHeadChars: s.ccr.maxHeadChars ?? d.maxHeadChars,
+        };
+    }
+    let imageCompression: ImageCompressionConfig | undefined;
+    if (s.imageCompression !== undefined) {
+        const d = DEFAULT_IMAGE_COMPRESSION_CONFIG;
+        imageCompression = {
+            enabled: s.imageCompression.enabled === true,
+            minTokens: s.imageCompression.minTokens ?? d.minTokens,
+            maxDimension: s.imageCompression.maxDimension ?? d.maxDimension,
+            quality: s.imageCompression.quality ?? d.quality,
+            format: s.imageCompression.format ?? d.format,
+        };
+    }
     return {
         ...base,
         modelContextLimit: limit,
@@ -252,6 +295,8 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         protectedLatestTools: s.protectedLatestTools ?? base.protectedLatestTools,
         protectedTools: s.protectedTools ?? base.protectedTools,
         ...(absorb !== undefined ? { absorb } : {}),
+        ...(ccr !== undefined ? { ccr } : {}),
+        ...(imageCompression !== undefined ? { imageCompression } : {}),
         ...(s.rules !== undefined ? { rules: { enabled: s.rules === true } } : {}),
     };
 }
@@ -269,8 +314,9 @@ function parsePercent(v: number | string): number {
  *  context window (the caller handles the async registry lookup), this merges
  *  global → provider → model compress settings and applies them onto `base`,
  *  returning the tuned Config (or `base` unchanged when nothing is configured
- *  and the limit is unchanged). This is the exact function the proxy calls for
- *  every request, extracted so the three-level cascade is testable end-to-end
+ *  and the limit is unchanged — CCR is opt-in, so an unset `ccr` never forces
+ *  a fresh config). This is the exact function the proxy calls for every
+ *  request, extracted so the three-level cascade is testable end-to-end
  *  without spinning up the HTTP server. */
 export function resolveRequestConfig(
     base: Config,

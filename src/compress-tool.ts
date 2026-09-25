@@ -13,6 +13,16 @@
 import {
     parseCompressArgs,
     ABSORB_TOOL_OPENAI,
+    DECOMPRESS_TOOL,
+    DECOMPRESS_TOOL_GOOGLE,
+    DECOMPRESS_TOOL_NAME,
+    DECOMPRESS_TOOL_OPENAI,
+    DECOMPRESS_TOOL_RESPONSES,
+    IMAGE_FULL_TOOL,
+    IMAGE_FULL_TOOL_NAME,
+    IMAGE_FULL_TOOL_OPENAI,
+    IMAGE_FULL_TOOL_RESPONSES,
+    RETRIEVE_TOOL_NAME,
     RULE_TOOL_NAME,
     SEARCH_CONTEXT_TOOL,
     SEARCH_CONTEXT_TOOL_GOOGLE,
@@ -118,11 +128,35 @@ export const BILI_SEARCH_CONTEXT_TOOL_GOOGLE = {
     parameters: withConversationId(SEARCH_CONTEXT_TOOL_GOOGLE.parameters),
 };
 
-export const BILI_ACP_TOOLS_ANTHROPIC = ACP_TOOLS_ANTHROPIC.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL : t));
-export const BILI_ACP_TOOLS_OPENAI = ACP_TOOLS_OPENAI.map((t) => (t.function.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_OPENAI : t));
-export const BILI_ACP_TOOLS_RESPONSES = ACP_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t));
-export const BILI_ACP_TOOLS_GOOGLE = ACP_TOOLS_GOOGLE.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_GOOGLE : t));
-export const BILI_ACP_READONLY_TOOLS_RESPONSES = ACP_READONLY_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t));
+// #1179 CCR v2: host-side range-restore extension of decompress. Optional
+// startId/endId (mNNNNN refs) restore only the block's messages inside that
+// span instead of the whole block. Served unconditionally on every wire + the
+// plugin manifest (one definition, no drift — same rule as conversation_id
+// above); execution is gated on CCR being armed for the session
+// (resolveDecompressRange fails explicitly when it is not).
+const DECOMPRESS_RANGE_PARAM_START = {
+    type: "string",
+    description: "Optional mNNNNN message ref, inclusive lower bound of a sub-range of this block. With endId, restores only that span instead of the whole block (requires CCR: compress.ccr.enabled).",
+};
+const DECOMPRESS_RANGE_PARAM_END = {
+    type: "string",
+    description: "Optional mNNNNN message ref, inclusive upper bound. Used together with startId.",
+};
+
+function withRangeParams(schema: JsonSchemaObject): JsonSchemaObject {
+    return { ...schema, properties: { ...schema.properties, startId: DECOMPRESS_RANGE_PARAM_START, endId: DECOMPRESS_RANGE_PARAM_END } };
+}
+
+export const BILI_DECOMPRESS_TOOL = { name: DECOMPRESS_TOOL.name, description: DECOMPRESS_TOOL.description, input_schema: withRangeParams(DECOMPRESS_TOOL.input_schema) };
+export const BILI_DECOMPRESS_TOOL_OPENAI = { type: "function" as const, function: { name: DECOMPRESS_TOOL_OPENAI.function.name, description: DECOMPRESS_TOOL_OPENAI.function.description, parameters: withRangeParams(DECOMPRESS_TOOL_OPENAI.function.parameters) } };
+export const BILI_DECOMPRESS_TOOL_RESPONSES = { type: "function" as const, name: DECOMPRESS_TOOL_RESPONSES.name, description: DECOMPRESS_TOOL_RESPONSES.description, parameters: withRangeParams(DECOMPRESS_TOOL_RESPONSES.parameters) };
+export const BILI_DECOMPRESS_TOOL_GOOGLE = { name: DECOMPRESS_TOOL_GOOGLE.name, description: DECOMPRESS_TOOL_GOOGLE.description, parameters: withRangeParams(DECOMPRESS_TOOL_GOOGLE.parameters) };
+
+export const BILI_ACP_TOOLS_ANTHROPIC = ACP_TOOLS_ANTHROPIC.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL : t));
+export const BILI_ACP_TOOLS_OPENAI = ACP_TOOLS_OPENAI.map((t) => (t.function.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_OPENAI : t.function.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_OPENAI : t));
+export const BILI_ACP_TOOLS_RESPONSES = ACP_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_RESPONSES : t));
+export const BILI_ACP_TOOLS_GOOGLE = ACP_TOOLS_GOOGLE.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_GOOGLE : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_GOOGLE : t));
+export const BILI_ACP_READONLY_TOOLS_RESPONSES = ACP_READONLY_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_RESPONSES : t));
 
 // The kernel ships no Responses-format absorb const (the four ACP tools have
 // *_RESPONSES variants; absorb is host-registered opt-in). Synthesize it in
@@ -148,6 +182,44 @@ export const RULE_TOOL = { name: RULE_TOOL_NAME, description: RULE_TOOL_DESCRIPT
 export const RULE_TOOL_OPENAI = { type: "function" as const, function: { name: RULE_TOOL_NAME, description: RULE_TOOL_DESCRIPTION, parameters: RULE_PARAM_SCHEMA } };
 export const RULE_TOOL_RESPONSES = { type: "function" as const, name: RULE_TOOL_NAME, description: RULE_TOOL_DESCRIPTION, parameters: RULE_PARAM_SCHEMA };
 export const RULE_TOOL_GOOGLE = { name: RULE_TOOL_NAME, description: RULE_TOOL_DESCRIPTION, parameters: RULE_PARAM_SCHEMA };
+
+// #1097: acp_retrieve — resolve a stored ID-referenced message back to its full
+// original. Kernel-owned tool (RETRIEVE_TOOL_NAME); synthesized in all four
+// wire shapes here so every injection point (wire helpers, plugin manifest)
+// serves one definition. Takes a single `ref` (the mNNNNN id printed in the
+// [acp-stored] placeholder). Read-only with respect to context: the fetched content
+// rides the ephemeral tool-result channel and consumes no message ref.
+const RETRIEVE_TOOL_DESCRIPTION = "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.";
+const RETRIEVE_PARAM_SCHEMA = {
+    type: "object" as const,
+    properties: {
+        ref: { type: "string", description: "The stored message id to retrieve (an mNNNNN ref from an [acp-stored] placeholder)." },
+    },
+    required: ["ref"],
+};
+export { RETRIEVE_TOOL_NAME };
+/** Wire tool shapes for the retrieve tool; name follows the session's resolved
+ *  `ccr.toolName` (default acp_retrieve) so registration, dispatch, and the
+ *  kernel placeholder hint all agree. */
+export function retrieveToolsFor(name: string) {
+    return {
+        anthropic: { name, description: RETRIEVE_TOOL_DESCRIPTION, input_schema: RETRIEVE_PARAM_SCHEMA },
+        openai: { type: "function" as const, function: { name, description: RETRIEVE_TOOL_DESCRIPTION, parameters: RETRIEVE_PARAM_SCHEMA } },
+        responses: { type: "function" as const, name, description: RETRIEVE_TOOL_DESCRIPTION, parameters: RETRIEVE_PARAM_SCHEMA },
+        google: { name, description: RETRIEVE_TOOL_DESCRIPTION, parameters: RETRIEVE_PARAM_SCHEMA },
+    };
+}
+
+// #1095: image_full (restore original-resolution images for a previously
+// downscaled message). Kernel-owned tool; the kernel ships anthropic/openai/
+// responses shapes — synthesize the missing Google variant in its flat shape
+// so every injection point serves one definition.
+export { IMAGE_FULL_TOOL, IMAGE_FULL_TOOL_OPENAI, IMAGE_FULL_TOOL_RESPONSES };
+export const IMAGE_FULL_TOOL_GOOGLE = {
+    name: IMAGE_FULL_TOOL_OPENAI.function.name,
+    description: IMAGE_FULL_TOOL_OPENAI.function.description,
+    parameters: IMAGE_FULL_TOOL_OPENAI.function.parameters,
+};
 
 export function parseCompressInput(input: unknown, callId?: string) {
     const parsed = parseCompressArgs(input, { callId });

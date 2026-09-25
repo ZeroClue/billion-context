@@ -5,13 +5,15 @@ import type { ServerResponse } from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { acquireInFlight, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
-import { ABSORB_TOOL, ABSORB_TOOL_NAME, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_CONVERSATION_ID_PARAM, SEARCH_CONTEXT_TOOL_NAME } from "./compress-tool.js";
-import { effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
-import { effectiveRulesConfig } from "./rules-feature.js";
+import { ABSORB_TOOL, ABSORB_TOOL_NAME, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_CONVERSATION_ID_PARAM, SEARCH_CONTEXT_TOOL_NAME, retrieveToolsFor } from "./compress-tool.js";
+import { absorbEnabled, effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
+import { effectiveRulesConfig, rulesEnabled } from "./rules-feature.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsMarkerLineText, containsRenderTagText, createMarkerLineFilter, createTagEchoFilter, mayStartMarkerLine, mayStartRenderTag, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
+import { ccrEnabled, contentStoreOf, retrieveToolName } from "./store.js";
+import { imageUsageSuffix } from "./image-compress.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
 import { warnCacheCollapse } from "./cache-warn.js";
@@ -528,24 +530,34 @@ function withSearchContextConversationDescription(tools: unknown[]): unknown[] {
     });
 }
 
-export function handlePluginManifest(res: import("node:http").ServerResponse): void {
+export function handlePluginManifest(res: import("node:http").ServerResponse, config: Config): void {
+    // #1192: hosts register whatever the manifest serves verbatim (pi/omp/dsh/
+    // opencode native plugins, MCP shims), so advertising an opt-in tool this
+    // proxy's config leaves disabled guarantees a rejected call the moment the
+    // model uses it. Advertise absorb/acp_rule only when base-config enabled;
+    // per-request provider/model overrides may still differ (conservative: the
+    // manifest never advertises what the base config disables) and per-session
+    // enablement stays enforced at execution (isProxyToolFor / executeProxyTool).
+    const absorbOn = absorbEnabled(config);
+    const rulesOn = rulesEnabled(config);
+    // [#1271] acp_retrieve is advertised only while the base config enables CCR (same
+    // #1192 conservative rule as absorb/acp_rule). The proxy wires it on the anthropic/
+    // openai lanes in plugin mode; the responses wire is deliberately NOT advertised —
+    // that proxy disarms CCR there, so advertising would break #1192.
+    const ccrOn = config.ccr?.enabled === true;
+    const ccrName = config.ccr?.toolName ?? RETRIEVE_TOOL_NAME;
+    const ccrTools = ccrOn ? retrieveToolsFor(ccrName) : undefined;
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         ok: true,
         protocolVersion: PLUGIN_PROTOCOL_VERSION,
         proxy: "billion-context",
         version: VERSION,
-        // Absorb and acp_rule are advertised alongside the four ACP tools.
-        // Both are host-registered opt-in (not in the kernel's
-        // ACP_TOOL_NAMES), so the manifest must list them explicitly.
-        // Per-session enablement is enforced at execution (isProxyToolFor /
-        // executeProxyTool), not here — the manifest has no request context to
-        // know which route will win.
-        toolNames: [...PROXY_TOOL_NAMES, ABSORB_TOOL_NAME, RULE_TOOL_NAME],
+        toolNames: [...PROXY_TOOL_NAMES, ...(absorbOn ? [ABSORB_TOOL_NAME] : []), ...(rulesOn ? [RULE_TOOL_NAME] : []), ...(ccrOn ? [ccrName] : [])],
         tools: {
-            anthropic: withSearchContextConversationDescription([...BILI_ACP_TOOLS_ANTHROPIC, ABSORB_TOOL, RULE_TOOL].map(withConversationIdParam)),
-            openai: withSearchContextConversationDescription([...BILI_ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI, RULE_TOOL_OPENAI].map(withConversationIdParam)),
-            responses: withSearchContextConversationDescription([...BILI_ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES, RULE_TOOL_RESPONSES].map(withConversationIdParam)),
+            anthropic: withSearchContextConversationDescription([...BILI_ACP_TOOLS_ANTHROPIC, ...(absorbOn ? [ABSORB_TOOL] : []), ...(rulesOn ? [RULE_TOOL] : []), ...(ccrTools ? [ccrTools.anthropic] : [])].map(withConversationIdParam)),
+            openai: withSearchContextConversationDescription([...BILI_ACP_TOOLS_OPENAI, ...(absorbOn ? [ABSORB_TOOL_OPENAI] : []), ...(rulesOn ? [RULE_TOOL_OPENAI] : []), ...(ccrTools ? [ccrTools.openai] : [])].map(withConversationIdParam)),
+            responses: withSearchContextConversationDescription([...BILI_ACP_TOOLS_RESPONSES, ...(absorbOn ? [ABSORB_TOOL_RESPONSES] : []), ...(rulesOn ? [RULE_TOOL_RESPONSES] : [])].map(withConversationIdParam)),
         },
         headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER, maxOutput: PLUGIN_MAX_OUTPUT_HEADER, model: PLUGIN_MODEL_HEADER, instructionsMutable: PLUGIN_INSTRUCTIONS_MUTABLE_HEADER },
         toolEndpoint: "/__bili/plugin/tool",
@@ -596,8 +608,62 @@ function resolveConversation(conversationId: string): { session: Session | undef
     return { session, entry };
 }
 
+/** #1192: model-facing explanation for an opt-in tool the host registered but
+ *  this session's effective config has disabled. Returns undefined when the
+ *  name is not one of the known opt-in tools (a truly unknown tool keeps the
+ *  generic 400 with its allowed list). */
+function disabledOptionalToolNote(tool: string, session: Session, config: Config): string | undefined {
+    const absorbName = effectiveAbsorbConfig(session, config)?.toolName ?? ABSORB_TOOL_NAME;
+    if (tool === absorbName) return `${tool} is not enabled on this bili proxy (compress.absorb.enabled is not true) — nothing was absorbed.`;
+    if (tool === RULE_TOOL_NAME) return `${tool} is not enabled on this bili proxy (compress.rules.enabled is not true) — nothing was recorded.`;
+    if (!ccrEnabled(session) && tool === retrieveToolName(session)) return `${tool} is not enabled on this bili proxy (compress.ccr.enabled is not true) — nothing was retrieved.`;
+    return undefined;
+}
+
 /** Context-level visibility for plugin UIs (status bars / slash commands):
  *  the same usage the nudge decision sees, keyed by conversation id. */
+// #1218: last chain/content-fallback verdict per conversation. A session
+// judged an external chain is passed through WITHOUT creating local state,
+// so /acp's no-session answer must be able to say WHY there is no session
+// instead of the misleading armed-idle notice. Keyed by the conversation id
+// the request carried (client header value or anonymous pfa id); `at` is
+// refreshed on every passthrough; bounded FIFO like the warn-once set it
+// replaces (server.ts).
+export interface ChainVerdict {
+    at: number;
+    kind: string;
+    protocol: string;
+}
+const chainVerdicts = new Map<string, ChainVerdict>();
+export const WARNED_CHAIN_SESSION_CAP = 4096;
+/** Records a passthrough verdict; returns true when this is the FIRST verdict
+ *  for the session (drives the once-per-session [chain] warn in server.ts). */
+export function recordChainVerdict(sessionId: string, kind: string, protocol: string): boolean {
+    const first = !chainVerdicts.has(sessionId);
+    chainVerdicts.set(sessionId, { at: Date.now(), kind, protocol });
+    if (chainVerdicts.size > WARNED_CHAIN_SESSION_CAP) {
+        chainVerdicts.delete(chainVerdicts.keys().next().value as string);
+    }
+    return first;
+}
+export function chainVerdictFor(conversationId: string): ChainVerdict | undefined {
+    return chainVerdicts.get(conversationId);
+}
+export function _resetChainVerdictsForTest(): void {
+    chainVerdicts.clear();
+}
+export function _chainVerdictMapForTest(): Map<string, ChainVerdict> {
+    return chainVerdicts;
+}
+
+/** #1218: the /acp panel rendered when a conversation is being passed through
+ *  unprocessed. Every /acp surface (pi / dsh / opencode) displays `panel`
+ *  verbatim, so the server renders the verdict once and all clients show it
+ *  without agent-side changes. */
+function chainPassthroughPanel(v: ChainVerdict): string {
+    return `⚠️ billion-context: this conversation is being PASSED THROUGH UNPROCESSED — judged an external bili chain by the content fallback (evidence: ${v.kind}, protocol ${v.protocol}). No local compression session exists, so compression is silently disabled for this conversation. Last passthrough: ${new Date(v.at).toISOString()}. If this is your own client, disable the content fallback (chainContentDetection=false, env BILI_CHAIN_CONTENT=0); see the [chain] warn in the bili log.`;
+}
+
 export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false): void {
     const { session: resolvedSession, entry } = resolveConversation(conversationId);
     let session = resolvedSession;
@@ -620,6 +686,17 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         }
     }
     if (!session) {
+        // #1218: a chain/content-fallback verdict for THIS conversation means
+        // requests ARE arriving — passed through unprocessed — so the
+        // armed-idle notice would mislead ("no model request yet" is false).
+        // Answer 200 with a renderable panel; `phase` exposes the state for
+        // programmatic consumers.
+        const verdict = chainVerdictFor(conversationId);
+        if (verdict !== undefined) {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, conversationId, phase: "chain-passthrough", chain: verdict, panel: chainPassthroughPanel(verdict) }));
+            return;
+        }
         // Runtime-info protocol (#955): no session exists yet, but the client
         // may have reported its model config at bootstrap — answer from the
         // agent-keyed runtime table so /acp works pre-first-request. Clients
@@ -653,12 +730,14 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
             // #833: base kernelConfig carries no file/provider/model compress
             // settings — render from the session's last resolved Config so the
             // panel matches actual injection behavior.
+            const pluginCfg = effectiveConfig(session, deps.config);
             nudge = deps.core.processTurn({
                 messages,
                 state: session.state,
-                config: effectiveConfig(session, deps.config),
+                config: ccrEnabled(session) ? pluginCfg : { ...pluginCfg, ccr: undefined },
                 tokenCount: session.stats.lastInputTokens,
                 renderTags: "none",
+                contentStore: contentStoreOf(session),
             }).nudge;
         }
     } catch {
@@ -769,6 +848,17 @@ export async function handlePluginTool(
     // Absorb/rules enablement is per-session (last resolved config), so the
     // gate needs the session — it runs after the lookup above.
     if (!isProxyToolFor(tool, session, deps.config)) {
+        // #1192: a known opt-in tool disabled by this session's effective config
+        // (registered from a manifest served while it was enabled) answers with
+        // model-facing text on the same channel executeRule/executeAbsorb use
+        // for failures — a hard 400 would surface as an unfixable red error card.
+        const note = disabledOptionalToolNote(tool, session, deps.config);
+        if (note !== undefined) {
+            deps.log("info", `[${session.id}] [plugin] ${tool} called but disabled — replied with explanation`);
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, result: note }));
+            return;
+        }
         const allowed = [...PROXY_TOOL_NAMES];
         const absorb = effectiveAbsorbConfig(session, deps.config);
         if (absorb?.enabled === true) allowed.push(absorb.toolName ?? ABSORB_TOOL_NAME);
@@ -946,7 +1036,7 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
         const hit = sample.cachedTokens === undefined ? undefined : Math.round((100 * (sample.cachedTokens ?? 0)) / total);
         const foldNew = session.stats.pendingFoldUsage === true;
         if (foldNew) session.stats.pendingFoldUsage = false;
-        loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} cached=${sample.cachedTokens ?? "n/a"}${hit === undefined ? "" : ` (cache hit ${hit}%)`}${foldNew ? " fold=new" : ""}`);
+        loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} cached=${sample.cachedTokens ?? "n/a"}${hit === undefined ? "" : ` (cache hit ${hit}%)`}${foldNew ? " fold=new" : ""}${imageUsageSuffix(session)}`);
         recordCacheSample(session, { at: Date.now(), input: total, cached: sample.cachedTokens ?? 0, output: sample.outputTokens });
     }
     if (sample.outputTokens !== undefined) session.stats.outputTokens += sample.outputTokens;

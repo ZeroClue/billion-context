@@ -33,14 +33,70 @@ export function artifactSeedHit(body: Buffer): boolean {
 
 /** Verify which ACP artifact family is actually present in the request.
  *  `parsed` is the already-parsed body (null when unparseable — then only
- *  the tag check can fire). Returns null when neither family is present. */
+ *  the legacy whole-buffer tag check can fire). Returns null when neither
+ *  family is present.
+ *
+ *  #1197: the tags family scans HISTORY message content only. bili's
+ *  compression artifacts (render tags, the re-voiced acp_summary, plugin
+ *  compress tool results) always live in history items — never in the
+ *  system/developer/instructions section. Tag-shaped text there is
+ *  client-authored context (AGENTS.md/CLAUDE.md/README quoting the wire
+ *  format — the billion-context repo itself carries literal examples) and
+ *  is not chain evidence. */
 export function detectAcpArtifacts(body: Buffer, parsed: unknown): AcpArtifactKind | null {
-    if (body.includes("\x3cacp ") && ACP_TAG_RE.test(body.toString("utf8"))) return "tags";
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        // ACP_TAG_RE matches the JSON-escaped form (tokens=\"…\") because it
+        // was born scanning the raw wire buffer; re-encode the parsed history
+        // text so both paths share one regex.
+        const encoded = JSON.stringify(historyTextOf(parsed as Record<string, unknown>));
+        if (encoded.includes("\x3cacp ") && ACP_TAG_RE.test(encoded)) return "tags";
+    } else if (body.includes("\x3cacp ") && ACP_TAG_RE.test(body.toString("utf8"))) {
+        return "tags";
+    }
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         const names = historyToolCallNames(parsed as Record<string, unknown>);
         if (names.has("acp_status") && names.has("search_context")) return "tool-history";
     }
     return null;
+}
+
+/** Text of HISTORY items only (messages/input/contents), excluding
+ *  system/developer-role messages; the top-level system / instructions
+ *  fields are never visited. Mirrors the container walk of
+ *  historyToolCallNames. */
+function historyTextOf(parsed: Record<string, unknown>): string {
+    const parts: string[] = [];
+    const container = Array.isArray(parsed.messages) ? parsed.messages
+        : Array.isArray(parsed.input) ? parsed.input
+        : Array.isArray(parsed.contents) ? parsed.contents
+        : null;
+    if (container) {
+        for (const item of container) collectHistoryText(item, parts);
+    }
+    return parts.join("\n");
+}
+
+function collectHistoryText(item: unknown, out: string[]): void {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return;
+    const it = item as Record<string, unknown>;
+    if (it.role === "system" || it.role === "developer") return;
+    const content = it.content;
+    if (typeof content === "string") out.push(content);
+    else if (Array.isArray(content)) {
+        for (const block of content) {
+            if (block && typeof block === "object" && !Array.isArray(block) && typeof (block as Record<string, unknown>).text === "string") {
+                out.push((block as Record<string, unknown>).text as string);
+            }
+        }
+    }
+    const parts = it.parts;
+    if (Array.isArray(parts)) {
+        for (const part of parts) {
+            if (part && typeof part === "object" && !Array.isArray(part) && typeof (part as Record<string, unknown>).text === "string") {
+                out.push((part as Record<string, unknown>).text as string);
+            }
+        }
+    }
 }
 
 /** Collect tool names invoked in HISTORY items only: OpenAI

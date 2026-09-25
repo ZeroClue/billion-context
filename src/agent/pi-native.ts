@@ -21,8 +21,8 @@ import os from "node:os";
 import path from "node:path";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { createBiliPlugin } from "./pi.js";
-import { markNativeHost, nativeBootstrapGate, nativeProxyScriptPath, singleFlight } from "./native-bootstrap.js";
-import { installNativeFetchIntercept, type NativeInterceptState } from "./native-intercept.js";
+import { markNativeHost, nativeBootstrapGate, nativeProxyScriptPath, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
+import { installNativeFetchIntercept, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { fetchStatus } from "./shared.js";
 
 // Shared plumbing lives in native-bootstrap.ts (side-effect-free — importing
@@ -93,7 +93,7 @@ const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(
 async function bootstrap(): Promise<string | undefined> {
     try {
         const handle = await ensureProxyRunning(
-            { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false },
+            { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false, lane: "pi" },
             { scriptPath: nativeProxyScriptPath() },
         );
         const origin = handle.origin;
@@ -115,6 +115,11 @@ if (nativeActive) markNativeHost(process.env, "pi");
 if (process.env.NODE_TEST_CONTEXT === undefined && nativeActive) {
     const start = singleFlight(bootstrap);
     state.respawn = start;
+    // #1243: the factory's before_provider_headers reads the proxy base from
+    // BILLION_CONTEXT_PROXY, which bootstrap() writes asynchronously — a
+    // one-shot's single header event fires before that. Publish the ready
+    // promise so the reader can await the writer instead of racing it.
+    setNativeOriginWaiter({ wait: () => readyOrigin(state) });
     state.onGiveUp = () => {
         // We wrote BILLION_CONTEXT_PROXY at successful bootstrap. If the proxy
         // dies mid-session and the respawn fails, traffic goes direct — clear

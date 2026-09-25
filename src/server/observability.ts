@@ -43,6 +43,20 @@ export function logUnrecognizedPath(log: (level: string, msg: string) => void, u
     }
 }
 
+// #1290: instance-level view of the map above — surfaced at /__bili/stats
+// (unrecognizedPaths) and in the /acp status report so "this path never got
+// compressed" is visible in a status face, not just 3 transient stderr warns.
+export type UnrecognizedPathStats = { total: number; paths: Record<string, number> };
+export function getUnrecognizedPathStats(): UnrecognizedPathStats {
+    const paths: Record<string, number> = {};
+    let total = 0;
+    for (const [path, n] of unrecognizedPathCounts) {
+        paths[path] = n;
+        total += n;
+    }
+    return { total, paths };
+}
+
 // Model-enumeration endpoints clients probe at startup (omp's openai-models-list
 // discovery). Expected passthroughs, not unknown protocols — #393: exempt from
 // the warn-level "unrecognized path" log.

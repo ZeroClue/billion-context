@@ -214,7 +214,7 @@ for k in ("BILLION_CONTEXT_ATTACH", "BILLION_CONTEXT_PROXY", "BILI_NATIVE_HERMES
           "ALL_PROXY", "all_proxy", "HERMES_CA_BUNDLE"):
     os.environ.pop(k, None)
 
-RECORDED = {"tool": [], "runtime_info": []}
+RECORDED = {"tool": [], "runtime_info": [], "watcher": []}
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -246,6 +246,10 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/__bili/plugin/runtime-info":
             RECORDED["runtime_info"].append(body)
             self._send({"ok": True})
+        elif self.path == "/__bili/watcher":
+            RECORDED["watcher"].append(body)
+            code = int(os.environ.get("BC_WATCHER_STATUS") or "200")
+            self._send({"ok": code == 200, "watchers": len(RECORDED["watcher"])}, code)
         else:
             self._send({"error": "not found"}, 404)
 
@@ -299,7 +303,7 @@ elif SCENARIO == "no-sidecar":
 elif SCENARIO == "spawn-fail":
     install_sidecar(True)
     mod.register(ctx)
-elif SCENARIO == "attach":
+elif SCENARIO.startswith("attach"):
     install_sidecar(False)
     os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
     ca_dir = os.path.join(os.environ["XDG_DATA_HOME"], "billion-context", "ca")
@@ -340,12 +344,14 @@ out.update({
     "toolsets": sorted({t["toolset"] for t in ctx.tools.values()}),
     "middlewares": sorted(ctx.middlewares.keys()),
     "hooks": sorted(ctx.hooks.keys()),
+    "pid": os.getpid(),
     "env_https_proxy": os.environ.get("HTTPS_PROXY"),
     "env_https_proxy_lc": os.environ.get("https_proxy"),
     "env_ca_bundle": os.environ.get("HERMES_CA_BUNDLE"),
     "marker_left": os.path.exists(os.path.join(os.environ["XDG_STATE_HOME"], "billion-context", "proxy-starting")),
     "tool_calls": RECORDED["tool"],
     "runtime_info": RECORDED["runtime_info"],
+    "watcher_calls": RECORDED["watcher"],
 })
 server.shutdown()
 print(json.dumps(out))
@@ -354,6 +360,7 @@ print(json.dumps(out))
 interface DriverOut {
     scenario: string;
     origin: string;
+    pid: number;
     tools_registered: string[];
     toolsets: string[];
     middlewares: string[];
@@ -364,6 +371,7 @@ interface DriverOut {
     marker_left?: boolean;
     tool_calls: Array<Record<string, unknown>>;
     runtime_info: Array<Record<string, unknown>>;
+    watcher_calls: Array<Record<string, unknown>>;
     round1_none?: boolean;
     req_unmutated?: boolean;
     first_headers?: Record<string, string> | null;
@@ -420,6 +428,33 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.tool_result, "compressed 3 blocks");
         assert.deepEqual(out!.tool_calls, [{ conversationId: "sess-1", tool: "compress", args: {} }]);
         assert.deepEqual(out!.runtime_info, [{ agent: "hermes", model: "test-model", maxOutput: 4096, source: "hermes-native" }]);
+        // #1199: an attaching session registers its host pid so the shared proxy
+        // outlives the first (spawning) owner's exit.
+        assert.deepEqual(out!.watcher_calls, [{ pid: out!.pid }], "attached session registers its host pid as a watchdog owner");
+    });
+
+    test("attach to a daemon proxy: 409 watcher refusal is silent and the session still starts", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("attach-daemon", { BC_WATCHER_STATUS: "409" });
+        assert.ok(out, err);
+        assert.deepEqual(out!.tools_registered, ["acp_status", "compress", "decompress"]);
+        assert.equal(out!.env_https_proxy, out!.origin);
+        assert.equal(out!.watcher_calls.length, 1, "registration was attempted");
+    });
+
+    test("attach with a failing watcher endpoint: registration failure never blocks session start", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("attach-watcher-fail", { BC_WATCHER_STATUS: "500" });
+        assert.ok(out, err);
+        assert.deepEqual(out!.tools_registered, ["acp_status", "compress", "decompress"]);
+        assert.equal(out!.env_https_proxy, out!.origin);
+        assert.equal(out!.watcher_calls.length, 1, "registration was attempted before failing open");
     });
 
     for (const [scenario, extraEnv] of [

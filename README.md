@@ -72,6 +72,10 @@ An opt-in fifth tool, `absorb` (`compress.absorb.enabled: true` — see [CONFIGU
 
 An opt-in sixth tool, `acp_rule` (`compress.rules: true` — see [CONFIGURATION.md](CONFIGURATION.md)), records **persistent principle-level reminders**: a short rule recorded by the model (user-emphasized lessons, behaviors to remember, major pitfalls hit) is hard-protected from compression — the call and its result stay in context across every fold — and omitting the argument lists the recorded rules ([ranxianglei/billion-context-pi#433](https://github.com/ranxianglei/billion-context-pi/issues/433)).
 
+The seventh tool, `acp_retrieve` (opt-in on every lane — set `compress.ccr.enabled: true` at any level, after local verification; plugin lanes require the explicit global `true` so the manifest advertises the tool, #1271/#1273 — see [CONFIGURATION.md](CONFIGURATION.md)), backs the **content-addressed message store** (built-in CCR, #1097/#1179): oversized tool results are **ID-referenced at arrival instead of force-distilled** — the wire keeps a byte-stable placeholder and the original goes into a per-session content-store envelope (hash-deduped), retrievable on demand via one cheap tool call. V2 makes folds lossless too: covered originals are stored when a fold lands, `decompress` restores ranges (`startId`/`endId` refs) instead of whole blocks, and `search_context` hits carry the covered `mNNNNN` refs so you can fetch exactly what you need. Lossless by default: a retrieve not made costs nothing but the call; a detail distilled away by absorb is gone for good. Scope: proxy mode, plus plugin lanes on the anthropic + openai wires when explicitly enabled (`acp_retrieve` is advertised in the plugin manifest then, #1271); responses marker/text routes and google in plugin mode stay disarmed because no request-only round-trip channel exists there (silent loss, #1097).
+
+An opt-in tool, `image_full` (`compress.imageCompression.enabled: true` — see [CONFIGURATION.md](CONFIGURATION.md)), backs **image pre-compression** (#1095): screenshot-like images in tool results are downscaled once at arrival — the kernel decides routing and recipe, the host encodes via optional `sharp` — cutting billed pixels before they enter the wire (providers bill by pixel area; halving dimensions cuts billed tokens ~4×). Non-screenshot images pass through byte-identical. Lossy by nature: when the model can't read details it calls `image_full` with the message's ref to restore the original resolution for the rest of the session — no proxy-side storage needed, since the client's own history still carries the original bytes (it never saw the shrunk form). Default off.
+
 A sibling protection knob, `compress.protectedLatestTools` (see [CONFIGURATION.md](CONFIGURATION.md)), keeps the **latest** snapshot of a cumulative tool (a client's todo/task list, e.g. `["todo_list", "TodoWrite"]`) un-compressible while older instances fold normally — so the agent never loses its live task list to a fold (#639). Its full-history counterpart `compress.protectedTools` hard-excludes **every** instance of a tool — for independent-content results no later result supersedes (e.g. opencode/pi `skill` loads); protecting all instances of a chatty or cumulative-snapshot tool grows context without bound (#639), so keep it to low-frequency, high-value tools.
 
 ### Two compression modes — who executes `compress`
@@ -157,7 +161,7 @@ Pick by your client:
 | **pi** | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) (in-process extension) |
 | **opencode** (1.x / 2.x) | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili opencode` (launcher) or `bili plugin install opencode` (native, no launcher); standalone [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) remains usable on 1.x. Full guide: [OpenCode](#opencode) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili omp` (built-in plugin) or `bili plugin install omp` (self-spawning native plugin, no launcher) |
-| **dsh** | `bili dsh` (launcher — full native plugin via `--patch`: tools, session-bound `/acp`, fetch intercept) or `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context` (one unified lane — pnpm-installs the package into each profile so dsh mounts the bundled patch layer; the bili form just drives dsh's own channel per profile and migrates legacy managed blocks) |
+| **dsh** | `bili dsh` (launcher — full native plugin via `--patch`: tools, session-bound `/acp` + `/acp-cache`, fetch intercept) or `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context` (one unified lane — pnpm-installs the package into each profile so dsh mounts the bundled patch layer; the bili form just drives dsh's own channel per profile and migrates legacy managed blocks) |
 | **kimi** | `bili plugin install kimi` (self-spawning native plugin, no launcher — Kimi Code ≥ 2.0.0; per-session routing block in `~/.kimi-code/config.toml`) or `bili kimi` (launcher, cert-MITM) or `/bili/` prefix |
 | **hermes** | `bili plugin install hermes` (self-spawning native plugin, no launcher — Python plugin, #958) or `bili hermes` (launcher, cert-MITM) |
 | **zcode** (Z.ai / bigmodel coding plan) | `bili plugin install zcode` (self-spawning native plugin, no launcher — per-session routing block in the bigmodel provider store, #1145) or cert-MITM through the GUI's Settings → Network (HTTP proxy + CA path) or `/bili/` prefix |
@@ -249,7 +253,7 @@ overwrites that copy in place:
 | global `bili` | npm global (`npm i -g billion-context`) | `bili update` / background auto-update |
 | **pi** | pi's package manager (npm form) | **`pi update`** — bili never overwrites it |
 | **opencode** | opencode's plugin dir | **opencode's plugin manager** — bili never overwrites it |
-| **dsh** | each profile's pnpm store | global bili self-update re-runs dsh's plugin channel per profile (or `dsh plugin add billion-context@latest`); pnpm's hardlinked store must never be copied over in place |
+| **dsh** | each profile's pnpm store | a periodic check re-runs dsh's plugin channel per profile — driven by the global bili self-update **or by the profile copy's own proxy** when the global isn't running (dsh-market installs, #1196); manual: `dsh plugin add billion-context@latest`. pnpm's hardlinked store must never be copied over in place |
 | omp / claude / codex / kimi / zcode | no copy — entries point at the global bili install | they update together with the global copy |
 | **hermes** | `~/.hermes/plugins/billion-context/` (copied files + `bili.json` sidecar pointing at the global dist) | **`bili plugin update hermes`** re-copies the files; the sidecar tracks the global install |
 
@@ -273,6 +277,26 @@ Opt-out envs: `BILI_NATIVE_PI=0`, `BILI_NATIVE_OMP=0`,
 `BILI_NATIVE_OPENCODE=0`, `BILI_NATIVE_DSH=0`, `BILI_NATIVE_KIMI=0`,
 `BILI_NATIVE_HERMES=0`, `BILI_NATIVE_ZCODE=0`. Full
 mechanics: [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md).
+
+Reuse is identity-based (#1225): an existing proxy is attached only when it
+runs the **same code** (sha256 of the entry script, recorded in the
+instance file) and its **lane is compatible** — each launcher declares its
+client's lane, two *different declared* lanes never share, and an instance
+without a lane (manual `bili start`) stays shareable by every client.
+Instances written before #1225 carry no code fingerprint and are therefore
+never attached: a rebuilt or updated install always starts a fresh proxy on
+the next launch, so fixes take effect immediately instead of silently
+serving stale code.
+
+Attach discovery is lane-aware across **all** live instances (#1232): the
+launcher probes every live entry in the instance registry, not just the
+single instance file (last-writer-wins — under concurrent multi-client use
+it can point at another client's proxy). Among compatible candidates the
+newest instance with the launcher's own declared lane wins; an instance
+without a lane (manual `bili start`) remains shareable by every client.
+The `another bili instance is running` warning (#394) is lane-aware too: it
+fires for same-lane or lane-less coexistence, but stays silent between two
+*different* declared lanes, whose session files are disjoint.
 
 **Runtime-info protocol (#955).** A native plugin reads the model config
 the client itself will use and pushes it to the proxy (per-request headers
@@ -346,7 +370,7 @@ bili claude                           # launch claude through the proxy
 bili omp                              # pi-style, file-free (#535): env + extension registerProvider + compaction cancel, real ~/.omp untouched
 bili opencode                         # OpenCode (1.x & 2.x): full guide in the [OpenCode](#opencode) section below
 bili hermes                           # file-free (#535): hermes proxy env (HTTPS_PROXY + HERMES_CA_BUNDLE) — https via CONNECT MITM, http via absolute-form forward proxy; real ~/.hermes untouched
-bili dsh                              # deepseek-harness: full native plugin injected via --patch (#941) — compress/decompress/acp_status registered as real dsh tools, requests stamped with the dsh session id (plugin mode), /acp session-bound; non-loopback upstreams ride proxy envs (https MITM, http absolute-form), loopback keeps the overlay DSH_HOME (~/.dsh-bili) rewrite (#535), built-in deepseek route via DEEPSEEK_BASE_URL; dsh native auto-compaction disabled (compaction-basic auto:false)
+bili dsh                              # deepseek-harness: full native plugin injected via --patch (#941) — compress/decompress/acp_status registered as real dsh tools, requests stamped with the dsh session id (plugin mode), /acp + /acp-cache session-bound; non-loopback upstreams ride proxy envs (https MITM, http absolute-form), loopback keeps the overlay DSH_HOME (~/.dsh-bili) rewrite (#535), built-in deepseek route via DEEPSEEK_BASE_URL; dsh native auto-compaction disabled (compaction-basic auto:false)
 bili codebuddy                        # Tencent CodeBuddy Code CLI: CODEBUDDY_BASE_URL /bili/ rewrite (OpenAI chat completions wire), budget aligned via CODEBUDDY_AUTO_COMPACT_WINDOW; real ~/.codebuddy untouched
 bili qoder                            # qoder: model endpoint is hardcoded https (no /bili/ rewrite possible) — cert-MITM via HTTPS_PROXY + NODE_EXTRA_CA_CERTS, default model hosts whitelisted (#653)
 bili trae                             # Trae CLI (ByteDance, closed Go binary, no base-URL override) — cert-MITM via HTTPS_PROXY + SSL_CERT_FILE, model host from TRAE_CLI_API_HOST or the default enterprise gateway (#655)
@@ -438,12 +462,17 @@ Two lanes, same plugin (#941):
   `billion-context/dsh`, the profile resolved a pre-bundle copy from a stale
   package-metadata cache (#953) — re-add pinned: `dsh plugin --profile
   <name> add billion-context@latest`.
-- **Auto-update keeps profiles in lockstep:** after a global self-update,
-  bili scans `~/.dsh/profiles/*/package.json` and brings any registry-pinned
-  `billion-context` dependency back to the new global version, so the loaded
-  plugin and the proxy never drift apart again (#953); profiles pinned to a
-  local source are left alone. The refresh is best-effort and never fails the
-  update itself.
+- **Auto-update keeps profiles in lockstep:** the refresh has two triggers —
+  after a global self-update, AND from the **profile copy's own proxy** when
+  its periodic check sees a newer registry version (so dsh plugin-market
+  users with no global bili running still refresh, #1196). Both scan
+  `~/.dsh/profiles/*/package.json` and bring any registry-pinned
+  `billion-context` dependency to the target version (the new global version
+  for the global trigger, registry-latest for the self trigger), always
+  through dsh's own `plugin add` channel — never an in-place copy — so the
+  loaded plugin and the proxy never drift apart again (#953); profiles
+  pinned to a local source are left alone. The refresh is best-effort,
+  retries next cycle on failure, and never fails the update or the proxy.
  - **Reported: zero proxy traffic for some transports under profile install
    (#1158, under investigation):** sessions served by some of dsh's
    `llm-pi-ai`-layer transports show NO model request ever reaching the proxy
@@ -666,6 +695,18 @@ This failure mode is now loud instead of silent:
 
 To actually compress such a client: add its model domain to `"mitm".domains` in `billion-context.json` (e.g. `"mitm": { "domains": ["copilot.tencent.com"] }`) or via `BILI_MITM_DOMAINS`, restart bili, and make the client trust bili's root CA (`NODE_EXTRA_CA_CERTS=~/.local/share/billion-context/ca/root-ca.pem` for Node-based clients, or the client's own CA-path setting). The `/bili/` prefix trick does not apply here — there is no URL to change. Details: [CONFIGURATION.md → MITM](CONFIGURATION.md#mitm-transparent-proxy-login-clients).
 
+### An unrecognized endpoint goes direct and nothing compresses (#1290)
+
+bili only compresses requests whose path matches a known wire protocol (`/chat/completions`, `/llm_raw_chat`, `/v1/messages`, `/responses`, …). A request to any other path — e.g. a third-party plugin's **custom wire** such as Command Code's Go plan posting to `/alpha/generate` — is relayed byte-for-byte and **never compressed**. There is no config seam to declare an arbitrary new wire today; adding one is a separate feature, not a switch you can flip.
+
+That outcome is now loud instead of silent (#1290):
+
+- the client-side fetch hook logs each distinct unrouted endpoint once per process (`…is not a recognized model endpoint, so bili did not route it through the proxy…`);
+- `unrecognizedPaths` (per-path counts) in `curl -s http://localhost:8787/__bili/stats` (loopback-only);
+- an `UNRECOGNIZED PATHS (instance-level)` section in `acp_status` output while such requests exist.
+
+If you expected compression at such an endpoint, use the provider's standard protocol endpoint instead (Command Code's Provider plan posts to `/provider/v1/chat/completions`, which bili does compress); a genuinely custom wire needs its own support.
+
 ## OpenCode
 
 One bundled plugin serves **both** OpenCode generations: the agent file keeps
@@ -772,6 +813,29 @@ an `/acp` slash command — rendered as a synthetic non-model message,
 panel-first like the `acp_status` tool; on older shapes the registration
 stays inert. Note `opencode run` mode dispatches no slash commands at all
 (they pass through to the model) — use the TUI.
+
+The same seam carries `/acp-cache` (#1146) — the human entry point to the
+prompt-cache reconciliation report (identical output to the `acp_cache` tool):
+pi/omp register it natively (`/acp-cache [full]` for the every-line listing);
+opencode V1 renders it as an ignored message the proxy strips from model
+context before it reaches the wire; opencode V2 as a synthetic message (report
+visible up to ~8 KB); dsh (both lanes) shows the default summary ledger — dsh's
+command API passes no arguments, so there is no `full`. Legacy opencode-acp
+sessions (#920) get an explicit unavailable notice instead (their traffic
+bypasses this proxy's compression state). Claude Code has no in-process command
+API: `bili plugin install claude` writes a model-mediated
+`commands/acp-cache.md` markdown command whose prompt drives the `acp_cache`
+MCP tool and pastes the report back verbatim. codex/kimi/hermes expose no
+user-typable command seam — ask the model to call its `acp_cache` tool directly.
+
+The same seam carries `/acp-rule` (#1251) — the human entry point to the
+persistent-rules feature (identical output to the `acp_rule` tool): pi/omp
+register it natively — bare `/acp-rule` lists every recorded rule, and
+`/acp-rule <text>` records one directly (as if the model had called it). The
+wrapped transcript message is stripped from model context by content signature
+like the cache report — recorded rules reach the model every turn via the
+system-prompt injection anyway. delete/clear subcommands land with #1178;
+other lanes get it in follow-up work.
 
 ### Legacy opencode-acp sessions (#920)
 
@@ -1095,8 +1159,13 @@ compressed (no folded blocks) with its newest request body ≤
 `BILI_SESSION_GC_MAX_TOKENS` tokens (default 1M; unrecorded legacy files use
 `contextTokens`) — so deletion loses nothing but bytes: resuming rebuilds the
 context from the client's own history at the cost of one cold rebuild.
-Compressed sessions are never deleted (their summaries cannot be rebuilt
-losslessly). Every deletion is audit-logged individually, plus one summary
+CCR content stores (#1097) live next to their session file as
+`<hash>.content-store.json` and follow the same lifecycle (#1180): a store is
+deleted together with its session file, an orphaned store (session file
+already gone) is swept once past the age gate, and the store's token footprint
+(unique-content counted with the kernel's CJK-aware `defaultCountTokens` — the
+same estimator as `rawInputTokens`) counts toward the size ceiling above. Compressed
+sessions are never deleted (their summaries cannot be rebuilt losslessly). Every deletion is audit-logged individually, plus one summary
 line per non-empty sweep. Live sessions, unreadable files, and encrypted
 files are handled conservatively (decoded via `BILI_ENCRYPTION_KEY` before
 judging). Details in [CONFIGURATION.md](CONFIGURATION.md#environment-variables).

@@ -9,6 +9,7 @@ import { resolveOutputHeadroomCap } from "./util.js";
 import { parseCompatRoles } from "./compat-roles.js";
 import type { ImageBillingMode } from "./image-tokens.js";
 import type { ReasoningGuardConfig } from "./reasoning-guard.js";
+import type { OutputSteeringConfig } from "./output-steering.js";
 
 export function safeReadJson(path: string): unknown {
     try {
@@ -224,6 +225,57 @@ export type CompressSettings = {
          *  the client's own tool names or the agent will call its own tool. */
         toolName?: string;
     };
+    /** [#1097] Kernel CCR content store (kernel `Config.ccr`, acp-kernel
+     *  0.0.84). When `enabled`, oversized tool results (>= minToolTokens) are
+     *  ID-referenced at arrival by the kernel's ccr-store node (prune →
+     *  ccr-store → absorb): the wire keeps a deterministic `[acp-stored` …
+     *  placeholder and the original goes into the session's kernel
+     *  `MessageContentStore`, retrievable via the injected retrieve tool.
+     *  Lossless by default — a retrieve not made costs one cheap tool call,
+     *  whereas a distilled-away detail is gone for good. ID-reference wins
+     *  over absorb (kernel ordering). Off unless explicitly enabled at some
+     *  level. Merged sub-field-wise across the three levels like `absorb`. */
+    ccr?: {
+        /** Enable CCR for this scope. Absent/false = off (kernel semantics). */
+        enabled?: boolean;
+        /** Tool results smaller than this many tokens stay verbatim
+         *  (kernel default 4000). */
+        minToolTokens?: number;
+        /** Tool-name patterns (glob suffix allowed) never CCR-stored
+         *  (kernel default: none). */
+        excludeTools?: string[];
+        /** Rename the retrieve tool (default "acp_retrieve"). Must stay unique
+         *  against the client's own tool names. */
+        toolName?: string;
+        /** Max characters for the placeholder head/command preview (kernel
+         *  default 96). */
+        maxHeadChars?: number;
+    };
+    /** [#1095] Image pre-compression (kernel `Config.imageCompression`,
+     *  acp-kernel >= 0.0.84). When `enabled`, screenshot-like images in tool
+     *  results are downscaled ONCE at arrival before entering the wire
+     *  (kernel routing decision + recipe, host executes with optional `sharp`);
+     *  non-screenshot originals pass through byte-identical. Lossy by nature —
+     *  backstopped by the injected `image_full` tool: the model requests the
+     *  original resolution for a ref and it applies for the rest of the
+     *  session (originals cached in memory). Off unless explicitly enabled at
+     *  some level; disabled ⇒ byte-identical pass-through. Merged sub-field-wise
+     *  across the three levels like `absorb`/`ccr`. */
+    imageCompression?: {
+        /** Enable image pre-compression for this scope. Absent/false = off
+         *  (byte-identical pass-through). */
+        enabled?: boolean;
+        /** Only route images whose token estimate >= this (kernel default
+         *  512). */
+        minTokens?: number;
+        /** Longest side (px) of the downsample recipe (kernel default 1280). */
+        maxDimension?: number;
+        /** Lossy encode quality 1-100 of the downsample recipe (kernel
+         *  default 80). */
+        quality?: number;
+        /** Encode format of the downsample recipe (kernel default "webp"). */
+        format?: "webp" | "jpeg" | "png";
+    };
     /** Persistent rule reminders (kernel `Config.rules`, acp-kernel >= 0.0.70).
      *  When `enabled`, an `acp_rule` tool is injected (or advertised in the
      *  plugin manifest): passing a short `rule` records a principle-level
@@ -269,6 +321,14 @@ export type CompressSettings = {
      *  across the three levels like `absorb`/`reasoning`; off unless enabled at some
      *  level. See src/reasoning-guard.ts. */
     reasoningGuard?: ReasoningGuardConfig;
+     /** [#1093] Output-side compression levers — verbosity steering (a conciseness
+      *  directive appended to the system-prompt tail) and effort routing (clamp an
+      *  already-sent effort field down on mechanical continuation turns). Resolved
+      *  through this same three-level cascade; sub-fields are validated by the
+      *  kernel's resolveOutputSteeringConfig at resolution time (an out-of-range value
+      *  falls back to its default with a warning rather than rejecting the whole block).
+      *  Off unless enabled at some level. See src/output-steering.ts. */
+    outputSteering?: Partial<OutputSteeringConfig>;
 };
 export type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
@@ -1010,6 +1070,57 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
             if (ok) out.absorb = cleaned;
         }
     }
+    if ("ccr" in obj && obj.ccr !== undefined) {
+        const c = obj.ccr;
+        if (!c || typeof c !== "object" || Array.isArray(c)) {
+            ok = false;
+        } else {
+            const co = c as Record<string, unknown>;
+            const cleaned: NonNullable<CompressSettings["ccr"]> = {};
+            for (const key of ["enabled", "minToolTokens", "excludeTools", "toolName", "maxHeadChars"] as const) {
+                if (!(key in co)) continue;
+                const v = co[key];
+                if (key === "enabled") {
+                    if (typeof v !== "boolean") { ok = false; continue; }
+                    cleaned.enabled = v;
+                } else if (key === "minToolTokens" || key === "maxHeadChars") {
+                    if (typeof v !== "number" || !Number.isFinite(v)) { ok = false; continue; }
+                    cleaned[key] = v;
+                } else if (key === "excludeTools") {
+                    if (!Array.isArray(v) || v.some((x) => typeof x !== "string")) { ok = false; continue; }
+                    cleaned.excludeTools = [...v] as string[];
+                } else {
+                    if (typeof v !== "string" || v.trim().length === 0) { ok = false; continue; }
+                    cleaned.toolName = v.trim();
+                }
+            }
+            if (ok) out.ccr = cleaned;
+        }
+    }
+    if ("imageCompression" in obj && obj.imageCompression !== undefined) {
+        const c = obj.imageCompression;
+        if (!c || typeof c !== "object" || Array.isArray(c)) {
+            ok = false;
+        } else {
+            const co = c as Record<string, unknown>;
+            const cleaned: NonNullable<CompressSettings["imageCompression"]> = {};
+            for (const key of ["enabled", "minTokens", "maxDimension", "quality", "format"] as const) {
+                if (!(key in co)) continue;
+                const v = co[key];
+                if (key === "enabled") {
+                    if (typeof v !== "boolean") { ok = false; continue; }
+                    cleaned.enabled = v;
+                } else if (key === "minTokens" || key === "maxDimension" || key === "quality") {
+                    if (typeof v !== "number" || !Number.isFinite(v)) { ok = false; continue; }
+                    cleaned[key] = v;
+                } else {
+                    if (v !== "webp" && v !== "jpeg" && v !== "png") { ok = false; continue; }
+                    cleaned.format = v;
+                }
+            }
+            if (ok) out.imageCompression = cleaned;
+        }
+    }
     if ("prompts" in obj && obj.prompts !== undefined) {
         const prompts = obj.prompts;
         if (!prompts || typeof prompts !== "object" || Array.isArray(prompts)) {
@@ -1057,6 +1168,16 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
                 }
             }
             if (ok) out.reasoningGuard = cleaned;
+        }
+    }
+    if ("outputSteering" in obj && obj.outputSteering !== undefined) {
+        const os = obj.outputSteering;
+        if (!os || typeof os !== "object" || Array.isArray(os)) {
+            ok = false;
+        } else {
+            // Shape-guard only: sub-field validation is the kernel resolver's job at
+            // resolution time, so one out-of-range value can't nuke the whole block.
+            out.outputSteering = os as Partial<OutputSteeringConfig>;
         }
     }
     if (!ok) return undefined;

@@ -221,6 +221,39 @@ test("instance registry: registers, warns on a second live instance, prunes dead
     }
 });
 
+test("instance registry: #394 warning is lane-aware — cross-lane silent, same-lane and wildcard warn (#1232)", () => {
+    const st = tmpStateDir();
+    const warnings: string[] = [];
+    setLogCapture((_level, msg) => warnings.push(msg));
+    try {
+        registerInstanceAndWarn(
+            { instanceId: "a", pid: process.pid, port: 1, origin: "http://127.0.0.1:1", startedAt: 1, lane: "pi" },
+            (msg) => warnings.push(msg),
+        );
+        assert.equal(warnings.length, 0);
+        registerInstanceAndWarn(
+            { instanceId: "b", pid: process.pid, port: 2, origin: "http://127.0.0.1:2", startedAt: 2, lane: "codex" },
+            (msg) => warnings.push(msg),
+        );
+        assert.equal(warnings.length, 0, "different declared lanes are legitimate concurrent use");
+        registerInstanceAndWarn(
+            { instanceId: "c", pid: process.pid, port: 3, origin: "http://127.0.0.1:3", startedAt: 3, lane: "pi" },
+            (msg) => warnings.push(msg),
+        );
+        assert.equal(warnings.length, 1, "same-lane coexistence warns once (against a)");
+        assert.match(warnings[0], /another bili instance is running/);
+        assert.match(warnings[0], /lane "pi"/);
+        registerInstanceAndWarn(
+            { instanceId: "d", pid: process.pid, port: 4, origin: "http://127.0.0.1:4", startedAt: 4 },
+            (msg) => warnings.push(msg),
+        );
+        assert.equal(warnings.length, 4, "no-lane (wildcard) overlaps every live instance, incl. legacy markers");
+    } finally {
+        setLogCapture(null);
+        st.restore();
+    }
+});
+
 test("instance registry folds a live legacy instances.json entry read-only (no rewrite)", () => {
     const st = tmpStateDir();
     const warnings: string[] = [];

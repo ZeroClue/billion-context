@@ -1,5 +1,9 @@
 import {
     collectBlockContent,
+    parseBoundary,
+    retrieveByRef,
+    retrievedMessageId,
+    type CompressionBlock,
     type CompressionCore,
     type CompressionState,
     type Config,
@@ -8,8 +12,9 @@ import {
 import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { preCompactionArchiveOf, peekSession, findSessionByCanonicalId, type Session } from "./session.js";
+import { markDirty, preCompactionArchiveOf, peekSession, findSessionByCanonicalId, type Session } from "./session.js";
 import { getStore } from "./persist.js";
+import { ccrEnabled, contentStoreOf } from "./store.js";
 
 /** Bounded retention for large-decompress temp files. Each decompress with
  *  body > 10000 writes one file under tmpdir(); the reaper unlinks oldest past
@@ -84,6 +89,9 @@ export function resolveDecompress(
     if (archived[blockId] !== undefined) {
         return `[decompress FAILED: block ${blockId} is a pre-compaction archive — its content was in the history BEFORE the client's native compaction and is no longer reachable (replaced by the client's compaction summary). decompress is unavailable for archived blocks.]`;
     }
+    if (typeof args.startId === "string" || typeof args.endId === "string") {
+        return resolveDecompressRange(args, ctx, block);
+    }
 
     const full = args.full === true;
     const cached = ctx.session.blockContents.get(blockId);
@@ -110,7 +118,7 @@ export function resolveDecompress(
     if (outPath) {
         try {
             mkdirSync(dirname(outPath), { recursive: true });
-            writeFileSync(outPath, body, "utf8");
+            writeFileSync(outPath, body, { encoding: "utf8", mode: 0o600 });
             trackedTempFiles.push({ path: outPath, mtimeMs: Date.now() });
             reapTempFiles();
             return `${header}\nContent (${body.length} chars) written to: ${outPath}\nUse the read tool to access it.`;
@@ -119,6 +127,142 @@ export function resolveDecompress(
         }
     }
     return `${header}\n${body}`;
+}
+
+type CoveredRefs = { raws: Array<{ raw: string; num: number }>; text: string };
+
+function refNum(ref: string): number | null {
+    const b = parseBoundary(ref);
+    return b && b.kind === "message" ? b.numericId : null;
+}
+
+function coveredMessages(state: CompressionState, block: CompressionBlock): CoveredRefs | null {
+    const byRaw = state.messageRefs.byRaw;
+    const raws: Array<{ raw: string; num: number }> = [];
+    for (const raw of block.effectiveMessageIds) {
+        const ref = byRaw[raw];
+        if (!ref) continue;
+        const num = refNum(ref);
+        if (num === null) continue;
+        raws.push({ raw, num });
+    }
+    if (raws.length === 0) return null;
+    raws.sort((a, z) => a.num - z.num);
+    const runs: Array<[number, number]> = [];
+    for (const { num } of raws) {
+        const last = runs[runs.length - 1];
+        if (last && num === last[1] + 1) last[1] = num;
+        else runs.push([num, num]);
+    }
+    const fmtRun = ([a, z]: [number, number]) => (a === z ? `m${String(a).padStart(5, "0")}` : `m${String(a).padStart(5, "0")}–m${String(z).padStart(5, "0")}`);
+    const head = runs.slice(0, 5);
+    const shownCount = head.reduce((n, [a, z]) => n + (z - a + 1), 0);
+    const rest = raws.length - shownCount;
+    return { raws, text: head.map(fmtRun).join(", ") + (rest > 0 ? ` …+${rest} more` : "") };
+}
+
+/** #1179 CCR v2: the message refs a block covers, as compact span text
+ *  ("m00044–m00097") plus count — or null when no individual refs are
+ *  resolvable (older blocks whose raw ids left the map). */
+export function coveredRefSpan(state: CompressionState, block: CompressionBlock): { text: string; count: number } | null {
+    const cov = coveredMessages(state, block);
+    return cov ? { text: cov.text, count: cov.raws.length } : null;
+}
+
+// #1179 CCR v2: range-level restore — return ONLY the block's messages whose
+// refs fall within [startId, endId]. The content rides the ephemeral retrieval
+// channel: ack now, full text queued as a request-only injection (same id/role
+// shape as acp_retrieve injections, structurally excluded from fold space),
+// never cached in blockContents. Gated on CCR being armed for the session.
+function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx, block: CompressionBlock): string {
+    const startRaw = typeof args.startId === "string" ? args.startId.trim() : "";
+    const endRaw = typeof args.endId === "string" ? args.endId.trim() : "";
+    if (!startRaw || !endRaw) return "[decompress FAILED: startId and endId must be given together]";
+    if (!ccrEnabled(ctx.session)) {
+        // [#1207 review F3] Plugin mode structurally never arms CCR (the agent
+        // owns its folds; bili never executes them) — the generic "enable
+        // compress.ccr.enabled" advice is unsatisfiable there and would send
+        // the model chasing a config that cannot help.
+        if (typeof ctx.session.metadata.pluginAgent === "string") {
+            return "[decompress FAILED: range restore (startId/endId) is proxy-mode only — plugin mode owns its folds natively]";
+        }
+        return "[decompress FAILED: range restore (startId/endId) requires CCR — enable compress.ccr.enabled]";
+    }
+    const sb = parseBoundary(startRaw);
+    const eb = parseBoundary(endRaw);
+    if (!sb || sb.kind !== "message" || !eb || eb.kind !== "message") {
+        return `[decompress FAILED: startId/endId must be mNNNNN message refs (got "${startRaw}", "${endRaw}") — block ids (bN) are not valid here]`;
+    }
+    if (sb.numericId > eb.numericId) return `[decompress FAILED: startId ${startRaw} is after endId ${endRaw} — swap them]`;
+    const state = ctx.session.state;
+    const cov = coveredMessages(state, block);
+    if (!cov) return `[decompress FAILED: ${block.blockId} has no per-message coverage recorded (older block) — use plain decompress {blockId} for the whole block]`;
+    const pickedSet = new Set(cov.raws.filter(({ num }) => num >= sb.numericId && num <= eb.numericId).map(({ raw }) => raw));
+    if (pickedSet.size === 0) return `[decompress FAILED: ${block.blockId} covers no messages in ${startRaw}–${endRaw} (its coverage is ${cov.text})]`;
+    const parts: string[] = [];
+    let restoredFromStore = 0;
+    // [#1283] Per-ref source selection supersedes the all-or-nothing fallback
+    // ([#1207 review F1]): store entries are immutable originals (append-only,
+    // first write wins, refs never reissued), so the store wins whenever it has
+    // the ref and the exec-time view is only the fallback (pre-CCR folds have
+    // no entries). The old zero-items gate assumed view/store mutual exclusion
+    // per ref that nothing enforces — a covered ref left visible in the view
+    // contributed its view text, which for arrival-stored refs is the 📦
+    // placeholder, not the original, and a partially visible span silently
+    // dropped the missing refs. Iterating coverage in num order keeps the span
+    // deterministic across both sources.
+    const store = contentStoreOf(ctx.session);
+    const viewById = new Map<string, CoreMessage>();
+    for (const m of ctx.compressMessages ?? ctx.messages) {
+        if (pickedSet.has(m.id)) viewById.set(m.id, m);
+    }
+    for (const { raw, num } of cov.raws) {
+        if (!pickedSet.has(raw)) continue;
+        const r = retrieveByRef(store, `m${String(num).padStart(5, "0")}`);
+        if (r.ok) {
+            parts.push(r.entry.toolName ? `[${r.entry.toolName} • stored]\n${r.text}` : `[${r.entry.kind} • stored]\n${r.text}`);
+            restoredFromStore++;
+            continue;
+        }
+        const m = viewById.get(raw);
+        if (!m) continue;
+        parts.push(m.toolName && m.contentType !== "text" ? `[${m.role} • ${m.toolName}]\n${m.text ?? ""}` : `[${m.role}]\n${m.text ?? ""}`);
+    }
+    if (parts.length === 0) {
+        return `[decompress FAILED: originals for ${startRaw}–${endRaw} are neither in this request's view nor in the content store (pre-CCR fold) — whole-block decompress may still work from cache]`;
+    }
+    const header = `[Block ${block.blockId} content — ${startRaw}–${endRaw} — ${parts.length} item(s)]`;
+    let injText: string;
+    const body = parts.join("\n\n");
+    if (body.length > 10000) {
+        const safeBlockId = block.blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
+        // [#1207 review F4] Span in the filename (two spans of one block in the
+        // same millisecond must not clobber each other) and 0600 (folded
+        // conversation content is not world-readable on multi-user hosts).
+        const outPath = join(tmpdir(), `acp-decompress-${safeBlockId}-${startRaw}-${endRaw}-${Date.now()}.txt`);
+        try {
+            mkdirSync(dirname(outPath), { recursive: true });
+            writeFileSync(outPath, body, { encoding: "utf8", mode: 0o600 });
+            trackedTempFiles.push({ path: outPath, mtimeMs: Date.now() });
+            reapTempFiles();
+            injText = `${header}\nContent (${body.length} chars) written to: ${outPath}\nUse the read tool to access it.`;
+        } catch (e) {
+            injText = `${header}\n[Failed to write to ${outPath}: ${String(e)}]\n${safePrefix(body, 4000)}...`;
+        }
+    } else {
+        injText = `${header}\n${body}`;
+    }
+    // [#1207 review F5] A client retry re-executes this path; the injection id
+    // is deterministic, so dedupe on it — retries re-ack without queueing a
+    // duplicate full-text message or inflating rangeRestores.
+    const injId = retrievedMessageId(`range_${block.blockId}_${startRaw}-${endRaw}`);
+    if (!ctx.session.pendingRetrievals.some((p) => p.id === injId)) {
+        ctx.session.pendingRetrievals.push({ id: injId, role: "system", contentType: "text", text: injText });
+        ctx.session.stats.rangeRestores = (ctx.session.stats.rangeRestores ?? 0) + 1;
+    }
+    markDirty(ctx.session);
+    ctx.log(`[acp-decompress-range] ${block.blockId} ${startRaw}–${endRaw}: restored ${parts.length} item(s)${restoredFromStore ? ` (${restoredFromStore} from content store)` : ""} via ephemeral injection`);
+    return `[decompress ${block.blockId} ${startRaw}–${endRaw}: restored ${parts.length} item(s) — full content follows]`;
 }
 
 // Back off a cut that lands between the two halves of a surrogate pair, so the
@@ -155,7 +299,12 @@ export function executeSearchContext(
     const lines = blocks.map((b) => {
         const topic = b.topic ?? "(no topic)";
         const preview = b.summary.length > 200 ? safePrefix(b.summary, 200) + "..." : b.summary;
-        return `${b.blockId} (T${b.tier}) "${topic}"\n  ${preview}`;
+        // #1179 CCR v2: covered message-ref span(s) — connect block space to
+        // store space so the model can target acp_retrieve / range decompress
+        // at individual messages instead of whole blocks.
+        const span = coveredRefSpan(state, b);
+        const spanNote = span ? ` [${span.text} · ${span.count} msgs]` : "";
+        return `${b.blockId} (T${b.tier}) "${topic}"${spanNote}\n  ${preview}`;
     });
     const note = foreignSessionId
         ? `\n\n[Read-only search of historical session ${foreignSessionId}. Block ids are per-session namespaces — decompress acts on the current session only. For bulk content use bili export ${foreignSessionId} [--full].]`

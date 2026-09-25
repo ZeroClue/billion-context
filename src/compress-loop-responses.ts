@@ -10,6 +10,7 @@ import { parseCompressInput, PROXY_TOOL_NAMES, MUTATING_PROXY_TOOLS, COMPRESS_TO
 import { log as loggerLog } from "./logger.js";
 import { applyRanges } from "./stream.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
+import { ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
 import { buildVisibilityMarker } from "./compress-loop.js";
 import { hoistTrappedToolItems, type ToolPairItem } from "./tool-pair-order.js";
 import { MAX_LOOP_ROUNDS } from "./loop/index.js";
@@ -103,6 +104,9 @@ function executeProxyTool(
     }
     if (toolName === "acp_cache") {
         return handleAcpCache(ctx.session, args);
+    }
+    if (ccrEnabled(ctx.session) && toolName === retrieveToolName(ctx.session)) {
+        return executeRetrieve(args, ctx.session);
     }
     return `[Unknown proxy tool: ${toolName}]`;
 }
@@ -220,6 +224,11 @@ export async function compressLoopResponsesJson(
             const result = await withSessionLock(ctx.session, () => executeProxyTool(call.name, args, ctx));
             ctx.log(`[acp-proxy: responses JSON ${call.name} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
             if (ctx.visibilityMarkers !== false) inputItems.push({ type: "message", role: "developer", content: buildVisibilityMarker(call.name, result) });
+        }
+        // #1097: retrieval injections ride the re-request after their ack —
+        // coreToResponses re-voices system as developer, so mirror that here.
+        for (const injection of drainPendingRetrievals(ctx.session)) {
+            inputItems.push({ type: "message", role: "developer", content: [{ type: "output_text", text: injection.text }] });
         }
         requestBody.input = hoistTrappedToolItems(inputItems as ToolPairItem[]);
         const result = await fetchWithRetry(requestOptions.url, {

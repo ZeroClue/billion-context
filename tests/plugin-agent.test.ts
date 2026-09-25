@@ -9,7 +9,7 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { proxyBaseFromUrl, proxyBaseFromEnv, detectProxyBase, fetchManifest, forwardTool, fetchStatus } from "../src/agent/shared.ts";
-import { wrapCacheReport } from "../src/acp-panel.ts";
+import { wrapCacheReport, wrapRuleReport } from "../src/acp-panel.ts";
 import biliPlugin, { createBiliPlugin } from "../src/agent/pi.ts";
 import ompPlugin from "../src/agent/omp.ts";
 import { pluginInstall, pluginRemove, pluginStatusAll, PLUGIN_AGENTS, selfPackageRoot, pickPluginKey, detectOpencodeMajor, piEntryFor, PI_NPM_ENTRY, isPiEntry, claudeNativeInstalled } from "../src/plugin-install.ts";
@@ -215,6 +215,8 @@ async function flush(): Promise<void> {
     await new Promise((r) => setTimeout(r, 20));
 }
 
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
 // Windows CI runners can take seconds on a cold loopback connect, so a fixed
 // 20ms flush races the manifest fetch. Poll for registration instead.
 async function waitForTools(pi: FakePi, count: number, timeoutMs = 15000): Promise<void> {
@@ -338,11 +340,12 @@ test("pi extension registers manifest tools and stamps headers when proxied", as
         biliPlugin(pi as never);
         // The header is only stamped once tools are registered, so register
         // first (a real session does this via session_start before the first
-        // provider request; a one-shot -p run races it and rides wire mode).
+        // provider request; launcher-mode -p wins that race via the load-time
+        // manifest prime — #1217, covered by the dedicated test below).
         await pi.events.get("session_start")!({}, fakeCtx(proxy));
         await waitForTools(pi, 2);
         const headers: Record<string, string> = {};
-        pi.events.get("before_provider_headers")!({ headers }, fakeCtx(proxy));
+        await pi.events.get("before_provider_headers")!({ headers }, fakeCtx(proxy));
         assert.equal(headers["x-bili-plugin"], "pi");
         assert.equal(headers["x-bili-plugin-conversation"], "sess-42");
         assert.equal(headers["x-bili-plugin-context-window"], "1000000");
@@ -361,18 +364,39 @@ test("pi extension registers manifest tools and stamps headers when proxied", as
     }
 });
 
-test("before_provider_headers does not claim plugin mode until tools are registered", async () => {
+test("#1214: before_provider_headers awaits tool registration — one-shot (-p) first request claims plugin mode", async () => {
     const proxy = await startFakeProxy();
     try {
         const pi = makeFakePi();
         biliPlugin(pi as never);
-        const early: Record<string, string> = {};
-        pi.events.get("before_provider_headers")!({ headers: early }, fakeCtx(proxy));
-        assert.deepEqual(early, {});
+        // The -p shape: NO session_start prewarm — the one and only request
+        // dispatches at boot. pi's runner awaits async handlers, so awaiting
+        // the handler mirrors the real host; the stamp must already carry
+        // the full plugin-ownership header set on the FIRST fire.
+        const headers: Record<string, string> = {};
+        await pi.events.get("before_provider_headers")!({ headers }, fakeCtx(proxy));
+        assert.equal(headers["x-bili-plugin"], "pi");
+        assert.equal(headers["x-bili-plugin-conversation"], "sess-42");
+        assert.equal(headers["x-bili-plugin-context-window"], "1000000");
+        assert.equal(pi.tools.length, 2, "tools registered before the request could leave");
+        // Subsequent fires stay stamped (cached registration, no re-fetch).
+        const again: Record<string, string> = {};
+        await pi.events.get("before_provider_headers")!({ headers: again }, fakeCtx(proxy));
+        assert.equal(again["x-bili-plugin"], "pi");
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("before_provider_headers stamps after a session_start prewarm too", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
         await pi.events.get("session_start")!({}, fakeCtx(proxy));
         await waitForTools(pi, 2);
         const late: Record<string, string> = {};
-        pi.events.get("before_provider_headers")!({ headers: late }, fakeCtx(proxy));
+        await pi.events.get("before_provider_headers")!({ headers: late }, fakeCtx(proxy));
         assert.equal(late["x-bili-plugin"], "pi");
         assert.equal(late["x-bili-plugin-conversation"], "sess-42");
     } finally {
@@ -380,9 +404,153 @@ test("before_provider_headers does not claim plugin mode until tools are registe
     }
 });
 
+test("#1217: launcher-mode manifest fetch is primed at extension load time", async () => {
+    // Correctness of the -p first-request stamp under ANY latency is #1228's
+    // awaited ownership claim; this prime is the latency half: the manifest
+    // fetch must be IN FLIGHT before any event fires (load time, not
+    // session_start), so that awaited claim resolves without waiting on the
+    // network RTT. omp has no header hook at all — for it the prime is the
+    // only way round 1 can carry plugin headers. Assert on observed request
+    // arrival, not wall-clock margins.
+    const manifest = JSON.stringify({ tools: { anthropic: [
+        { name: "compress", description: "c", input_schema: { type: "object", properties: {} } },
+        { name: "acp_status", description: "s", input_schema: { type: "object", properties: {} } },
+    ] } });
+    let manifestHits = 0;
+    const server = http.createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") {
+            manifestHits++;
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(manifest);
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+        const ctx = { sessionManager: { getSessionId: () => "sess-42" }, model: { contextWindow: 1000000, baseUrl: "https://api.example.com/v1" } };
+        await withEnv({ BILLION_CONTEXT_PROXY: origin }, async () => {
+            const pi = makeFakePi();
+            createBiliPlugin("pi")(pi as never);
+            const deadline = Date.now() + 5000;
+            while (manifestHits === 0 && Date.now() < deadline) await sleep(5);
+            assert.ok(manifestHits >= 1, "manifest fetch must already be in flight before any event (load-time prime)");
+            await pi.events.get("session_start")!({}, ctx);
+            await waitForTools(pi, 2);
+            const headers: Record<string, string> = {};
+            await pi.events.get("before_provider_headers")!({ headers }, ctx);
+            assert.equal(headers["x-bili-plugin"], "pi");
+            assert.equal(headers["x-bili-plugin-conversation"], "sess-42");
+            assert.equal(pi.tools.length, 2);
+        });
+    } finally {
+        server.close();
+    }
+});
+
+test("#1217: a failed manifest prime falls back to the event-time fetch and retry throttle", async () => {
+    // A failed prime must degrade to the EXISTING event-time path: one
+    // fallback fetch, then retry-throttled. With #1228's awaited claim, round
+    // 1 rides wire mode while throttled, and the next awaited event performs
+    // the recovery fetch and stamps in the same call. The first two requests
+    // always fail and later ones succeed, so settlement is detected by
+    // observed request arrival — never by wall-clock margins.
+    let manifestRequests = 0;
+    const server = http.createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") {
+            manifestRequests++;
+            if (manifestRequests > 2) {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ tools: { anthropic: [
+                    { name: "compress", description: "c", input_schema: { type: "object", properties: {} } },
+                    { name: "acp_status", description: "s", input_schema: { type: "object", properties: {} } },
+                ] } }));
+                return;
+            }
+            res.writeHead(404);
+            res.end("{}");
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+        const ctx = { sessionManager: { getSessionId: () => "sess-42" }, model: { contextWindow: 1000000, baseUrl: "https://api.example.com/v1" } };
+        await withEnv({ BILLION_CONTEXT_PROXY: origin }, async () => {
+            const pi = makeFakePi();
+            createBiliPlugin("pi", { retryIntervalMs: 500 })(pi as never);
+            // Request #1 = the failed load-time prime; request #2 = the
+            // event-time fallback fetch kicked off by session_start. Wait
+            // until BOTH are observed at the still-failing server, then drain.
+            await pi.events.get("session_start")!({}, ctx);
+            const settleDeadline = Date.now() + 5000;
+            while (manifestRequests < 2 && Date.now() < settleDeadline) await sleep(5);
+            assert.ok(manifestRequests >= 2, "failed prime must fall through to the event-time fetch");
+            await flush();
+            assert.equal(pi.tools.length, 0, "two failed fetches → no tools yet");
+            // Round 1 while throttled: the awaited claim finds retryAt armed →
+            // NO third request, NO stamp — graceful wire-mode degradation.
+            const round1: Record<string, string> = {};
+            await pi.events.get("before_provider_headers")!({ headers: round1 }, ctx);
+            assert.deepEqual(round1, {}, "throttled round 1 rides wire mode");
+            assert.equal(manifestRequests, 2, "throttle window makes no extra fetches");
+            // Recovery: once the throttle expires, the next awaited event does
+            // exactly one recovery fetch and stamps in the same call.
+            let stamped: Record<string, string> | undefined;
+            const recoverDeadline = Date.now() + 5000;
+            while (!stamped && Date.now() < recoverDeadline) {
+                const h: Record<string, string> = {};
+                await pi.events.get("before_provider_headers")!({ headers: h }, ctx);
+                if (h["x-bili-plugin"] === "pi") stamped = h;
+                else await sleep(10);
+            }
+            assert.ok(stamped !== undefined, "recovery fetch succeeds once the throttle expires");
+            assert.equal(stamped["x-bili-plugin-conversation"], "sess-42");
+            assert.equal(pi.tools.length, 2);
+            assert.equal(manifestRequests, 3, "recovery is a single fetch, not a storm");
+        });
+    } finally {
+        server.close();
+    }
+});
+
+test("#1217: kill switch suppresses the load-time manifest prime", async () => {
+    let manifestHits = 0;
+    const server = http.createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") {
+            manifestHits++;
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ tools: { anthropic: [] } }));
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: origin, BILLION_CONTEXT_PLUGIN: "0" }, async () => {
+            const pi = makeFakePi();
+            createBiliPlugin("pi")(pi as never);
+            await sleep(50);
+            assert.equal(manifestHits, 0, "BILLION_CONTEXT_PLUGIN=0 must keep the plugin fully inert at load time");
+        });
+    } finally {
+        server.close();
+    }
+});
+
 test("before_provider_headers stays silent when the manifest fetch keeps failing", async () => {
     // Graceful degradation: a dead manifest endpoint means the plugin never
     // claims ownership, so the session rides the proxy's wire mode forever.
+    // #1214: the handler must RESOLVE (bounded await), never throw.
     const server = http.createServer((req, res) => {
         res.writeHead(404);
         res.end("{}");
@@ -398,7 +566,7 @@ test("before_provider_headers stays silent when the manifest fetch keeps failing
         await flush();
         assert.equal(pi.tools.length, 0);
         const headers: Record<string, string> = {};
-        pi.events.get("before_provider_headers")!({ headers }, fakeCtx(origin));
+        await pi.events.get("before_provider_headers")!({ headers }, fakeCtx(origin));
         assert.deepEqual(headers, {});
     } finally {
         server.close();
@@ -829,6 +997,125 @@ test("/acp-cache reports a proxy-side failure via notify error (#800)", async ()
     }
 });
 
+function startRuleProxy(result: string | undefined, error?: string): Promise<{ origin: string; calls: Array<{ conversationId: string; tool: string; args: Record<string, unknown> }>; close(): Promise<void> }> {
+    const calls: Array<{ conversationId: string; tool: string; args: Record<string, unknown> }> = [];
+    const server = http.createServer((req, res) => {
+        if (req.url === "/__bili/plugin/tool" && req.method === "POST") {
+            let body = "";
+            req.on("data", (c) => (body += c));
+            req.on("end", () => {
+                const data = JSON.parse(body) as { conversationId: string; tool: string; args?: Record<string, unknown> };
+                calls.push({ conversationId: data.conversationId, tool: data.tool, args: data.args ?? {} });
+                res.writeHead(200, { "content-type": "application/json" });
+                if (error !== undefined) res.end(JSON.stringify({ ok: false, error }));
+                else res.end(JSON.stringify({ ok: true, result }));
+            });
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    return new Promise((resolve) => {
+        server.listen(0, "127.0.0.1", () => {
+            resolve({
+                origin: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+                calls,
+                close: () => new Promise<void>((r) => server.close(() => r())),
+            });
+        });
+    });
+}
+
+test("/acp-rule forwards acp_rule with empty args and persists the wrapped list via sendMessage (#1251)", async () => {
+    const proxy = await startRuleProxy("rule1: always run typecheck");
+    try {
+        const sent: Array<{ customType: string; content: string; display: boolean }> = [];
+        const notes: string[] = [];
+        const pi = { ...makeFakePi(), sendMessage: (m: { customType: string; content: string; display: boolean }) => sent.push(m) };
+        createBiliPlugin()(pi as never);
+        const cmd = pi.commands.get("acp-rule");
+        assert.ok(cmd, "acp-rule command should be registered");
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-rules" },
+            model: { baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (msg: string) => notes.push(msg) },
+        };
+        await cmd!.handler("", ctx);
+        assert.deepEqual(proxy.calls, [{ conversationId: "sess-rules", tool: "acp_rule", args: {} }], "no-arg list forwards empty args");
+        assert.equal(sent.length, 1, "one custom message sent");
+        assert.equal(notes.length, 0, "notify must not fire when sendMessage is available");
+        assert.equal(sent[0]!.customType, "bili-acp-rule");
+        assert.equal(sent[0]!.display, true);
+        assert.equal(sent[0]!.content, wrapRuleReport("rule1: always run typecheck"));
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("/acp-rule forwards the text as { rule } to record a rule (#1251)", async () => {
+    const proxy = await startRuleProxy("Recorded rule2: prefer pnpm");
+    try {
+        const sent: Array<{ customType: string; content: string }> = [];
+        const pi = { ...makeFakePi(), sendMessage: (m: { customType: string; content: string }) => sent.push(m) };
+        createBiliPlugin()(pi as never);
+        const cmd = pi.commands.get("acp-rule")!;
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-rules-add" },
+            model: { baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (_msg: string) => {} },
+        };
+        await cmd.handler("  prefer pnpm  ", ctx);
+        assert.deepEqual(proxy.calls, [{ conversationId: "sess-rules-add", tool: "acp_rule", args: { rule: "prefer pnpm" } }], "trimmed text forwarded as { rule }");
+        assert.equal(sent[0]!.customType, "bili-acp-rule");
+        assert.equal(sent[0]!.content, wrapRuleReport("Recorded rule2: prefer pnpm"));
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("/acp-rule falls back to raw-text notify when the host has no sendMessage (#1251)", async () => {
+    const proxy = await startRuleProxy("No rules recorded.");
+    try {
+        const notes: string[] = [];
+        const pi = makeFakePi();
+        createBiliPlugin()(pi as never);
+        const cmd = pi.commands.get("acp-rule")!;
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-rules-notify" },
+            model: { baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (msg: string) => notes.push(msg) },
+        };
+        await cmd.handler("", ctx);
+        assert.equal(notes.length, 1, "notify fallback fires");
+        assert.equal(notes[0], "No rules recorded.");
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("/acp-rule warns with an enablement hint when the proxy reports the feature disabled (#1251)", async () => {
+    const proxy = await startRuleProxy("acp_rule is not enabled on this bili proxy (compress.rules.enabled is not true) — nothing was recorded.");
+    try {
+        const sent: Array<{ customType: string }> = [];
+        const notes: Array<{ msg: string; type?: string }> = [];
+        const pi = { ...makeFakePi(), sendMessage: (m: { customType: string }) => sent.push(m) };
+        createBiliPlugin()(pi as never);
+        const cmd = pi.commands.get("acp-rule")!;
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-rules-off" },
+            model: { baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (msg: string, type?: string) => notes.push({ msg, type }) },
+        };
+        await cmd.handler("", ctx);
+        assert.equal(sent.length, 0, "no transcript message when disabled");
+        assert.equal(notes.length, 1);
+        assert.equal(notes[0]!.type, "warning");
+        assert.match(notes[0]!.msg, /compress\.rules\.enabled/);
+    } finally {
+        await proxy.close();
+    }
+});
+
 test("omp entry reports x-bili-plugin: omp without env vars", async () => {
     const proxy = await startFakeProxy();
     try {
@@ -838,7 +1125,7 @@ test("omp entry reports x-bili-plugin: omp without env vars", async () => {
             await pi.events.get("session_start")!({}, fakeCtx(undefined));
             await waitForTools(pi, 2);
             const headers: Record<string, string> = {};
-            pi.events.get("before_provider_headers")!({ headers }, fakeCtx(undefined));
+            await pi.events.get("before_provider_headers")!({ headers }, fakeCtx(undefined));
             assert.equal(headers["x-bili-plugin"], "omp");
         });
         await withEnv({ BILLION_CONTEXT_PLUGIN_AGENT: "omp", BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
@@ -847,7 +1134,7 @@ test("omp entry reports x-bili-plugin: omp without env vars", async () => {
             await pi.events.get("session_start")!({}, fakeCtx(undefined));
             await waitForTools(pi, 2);
             const headers: Record<string, string> = {};
-            pi.events.get("before_provider_headers")!({ headers }, fakeCtx(undefined));
+            await pi.events.get("before_provider_headers")!({ headers }, fakeCtx(undefined));
             assert.equal(headers["x-bili-plugin"], "omp");
         });
         await withEnv({ BILLION_CONTEXT_PLUGIN_AGENT: undefined }, async () => {
@@ -857,7 +1144,7 @@ test("omp entry reports x-bili-plugin: omp without env vars", async () => {
             await pi.events.get("session_start")!({}, ctx);
             await waitForTools(pi, 2);
             const headers: Record<string, string> = {};
-            pi.events.get("before_provider_headers")!({ headers }, ctx);
+            await pi.events.get("before_provider_headers")!({ headers }, ctx);
             assert.equal(headers["x-bili-plugin"], "dsh");
         });
     } finally {
@@ -1430,6 +1717,29 @@ test("omp plugin identity-registers the conversation once tools are ready", asyn
     }
 });
 
+test("#1230: before_provider_request awaits identity registration — omp one-shot (-p) first dispatch claims plugin mode", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        ompPlugin(pi as never);
+        // The -p shape: NO session_start prewarm — the one and only request
+        // dispatches at boot. omp's runner awaits async handlers and sends the
+        // resolved payload, so by the time the handler RESOLVES the identity
+        // register must already have landed on the wire — the proxy binds the
+        // dispatching session into plugin mode instead of an anonymous pfa.
+        const out = await pi.events.get("before_provider_request")!({ type: "before_provider_request", payload: { model: "m", messages: [{ role: "user", content: "hi" }] } }, fakeCtx(proxy, "omp-sess-oneshot"));
+        assert.equal(pi.tools.length, 2, "tools registered before the request could leave");
+        assert.deepEqual(proxy.registers, [{ conversationId: "omp-sess-oneshot", agent: "omp", identity: true }], "identity register landed BEFORE the handler resolved");
+        assert.equal((out as Record<string, unknown>).prompt_cache_key, "omp-sess-oneshot", "payload still stamped with the omp session id");
+        // Subsequent fires stay cached (no re-register, no re-fetch).
+        const again = await pi.events.get("before_provider_request")!({ type: "before_provider_request", payload: { model: "m", messages: [{ role: "user", content: "hi" }] } }, fakeCtx(proxy, "omp-sess-oneshot"));
+        assert.deepEqual(proxy.registers, [{ conversationId: "omp-sess-oneshot", agent: "omp", identity: true }], "no duplicate register on the second fire");
+        assert.equal((again as Record<string, unknown>).prompt_cache_key, "omp-sess-oneshot");
+    } finally {
+        await proxy.close();
+    }
+});
+
 test("pi plugin does not identity-register (it stamps headers instead)", async () => {
     const proxy = await startFakeProxy();
     try {
@@ -1493,14 +1803,16 @@ test("omp before_provider_request stamps prompt_cache_key only for chat-completi
         createBiliPlugin("omp")(pi as never);
         return pi;
     };
-    const handler = (pi: FakePi, payload: unknown) =>
+    // #1230: the handler is async (it awaits tool registration); fakeCtx
+    // (undefined) keeps registerTools a no-op, so awaiting stays pure.
+    const handler = async (pi: FakePi, payload: unknown) =>
         pi.events.get("before_provider_request")!({ type: "before_provider_request", payload }, fakeCtx(undefined, sid));
 
     // chat payload (messages, no input, no max_tokens, no native pck) → stamped
     {
         const pi = mk();
         const payload = { model: "glm-4", messages: [{ role: "user", content: "hi" }] };
-        const out = handler(pi, payload) as Record<string, unknown>;
+        const out = await handler(pi, payload) as Record<string, unknown>;
         assert.equal(out.prompt_cache_key, sid, "chat payload stamped with the omp session id");
         assert.deepEqual(out.messages, payload.messages, "rest of the payload preserved");
         assert.equal(payload.prompt_cache_key, undefined, "original payload not mutated");
@@ -1509,20 +1821,20 @@ test("omp before_provider_request stamps prompt_cache_key only for chat-completi
     // providers use maxTokensField:"max_tokens") → stamped (#268)
     {
         const pi = mk();
-        const out = handler(pi, { model: "glm-4", messages: [{ role: "user", content: "hi" }], max_tokens: 4096, temperature: 0.7 }) as Record<string, unknown>;
+        const out = await handler(pi, { model: "glm-4", messages: [{ role: "user", content: "hi" }], max_tokens: 4096, temperature: 0.7 }) as Record<string, unknown>;
         assert.equal(out.prompt_cache_key, sid, "chat-completions payload WITH max_tokens stamped");
         assert.equal(out.max_tokens, 4096, "max_tokens preserved");
     }
     // native prompt_cache_key already present → not overridden
     {
         const pi = mk();
-        const out = handler(pi, { messages: [{ role: "user", content: "hi" }], prompt_cache_key: "native-pck" });
+        const out = await handler(pi, { messages: [{ role: "user", content: "hi" }], prompt_cache_key: "native-pck" });
         assert.equal(out, undefined, "native pck is not overridden");
     }
     // responses payload (input array) → untouched
     {
         const pi = mk();
-        const out = handler(pi, { input: [{ role: "user", content: "hi" }] });
+        const out = await handler(pi, { input: [{ role: "user", content: "hi" }] });
         assert.equal(out, undefined, "responses payload (input) untouched");
     }
     // anthropic wire shape (messages + max_tokens) → stamped too: the plugin
@@ -1531,34 +1843,34 @@ test("omp before_provider_request stamps prompt_cache_key only for chat-completi
     // forwarding to the real Anthropic (#268)
     {
         const pi = mk();
-        const out = handler(pi, { messages: [{ role: "user", content: "hi" }], max_tokens: 1024, system: "s" }) as Record<string, unknown>;
+        const out = await handler(pi, { messages: [{ role: "user", content: "hi" }], max_tokens: 1024, system: "s" }) as Record<string, unknown>;
         assert.equal(out.prompt_cache_key, sid, "anthropic wire shape stamped (proxy strips before forward)");
     }
     // no session id → untouched
     {
         const pi = mk();
-        const out = pi.events.get("before_provider_request")!({ type: "before_provider_request", payload: { messages: [{ role: "user", content: "hi" }] } }, fakeCtx(undefined, ""));
+        const out = await pi.events.get("before_provider_request")!({ type: "before_provider_request", payload: { messages: [{ role: "user", content: "hi" }] } }, fakeCtx(undefined, ""));
         assert.equal(out, undefined, "no session id → untouched");
     }
     // non-object payload → untouched
     {
         const pi = mk();
-        assert.equal(handler(pi, "not an object"), undefined, "non-object payload untouched");
-        assert.equal(handler(pi, null), undefined, "null payload untouched");
-        assert.equal(handler(pi, [1, 2, 3]), undefined, "array payload untouched");
+        assert.equal(await handler(pi, "not an object"), undefined, "non-object payload untouched");
+        assert.equal(await handler(pi, null), undefined, "null payload untouched");
+        assert.equal(await handler(pi, [1, 2, 3]), undefined, "array payload untouched");
     }
     // no messages array → untouched
     {
         const pi = mk();
-        assert.equal(handler(pi, { model: "x" }), undefined, "no messages → untouched");
-        assert.equal(handler(pi, { messages: "nope" }), undefined, "non-array messages → untouched");
+        assert.equal(await handler(pi, { model: "x" }), undefined, "no messages → untouched");
+        assert.equal(await handler(pi, { messages: "nope" }), undefined, "non-array messages → untouched");
     }
 });
 
 test("pi agent never stamps prompt_cache_key (it stamps headers instead)", async () => {
     const pi = makeFakePi();
     createBiliPlugin("pi")(pi as never);
-    const out = pi.events.get("before_provider_request")!({ type: "before_provider_request", payload: { messages: [{ role: "user", content: "hi" }] } }, fakeCtx(undefined, "pi-uuid"));
+    const out = await pi.events.get("before_provider_request")!({ type: "before_provider_request", payload: { messages: [{ role: "user", content: "hi" }] } }, fakeCtx(undefined, "pi-uuid"));
     assert.equal(out, undefined, "pi agent never stamps the body");
 });
 
@@ -1579,12 +1891,10 @@ test("#957: omp reports runtime-info via before_provider_request (omp has no hea
         const ctxA = { ...fakeCtx(proxy, "omp-rt-1"), model: { id: "omp-rt-model-a", contextWindow: 200000, maxTokens: 32768, ...baseModel } };
         const ctxB = { ...fakeCtx(proxy, "omp-rt-1"), model: { id: "omp-rt-model-b", contextWindow: 128000, maxTokens: 16384, ...baseModel } };
         await pi.events.get("session_start")!({}, ctxA);
-        // tools not ready yet → round 1 rides wire mode, no report. The
-        // manifest fetch cannot complete inside this synchronous block, so
-        // toolsReady is provably false here.
-        await pi.events.get("before_provider_request")!({}, ctxA);
-        assert.equal(proxy.runtimeInfos.length, 0, "no report before toolsReady");
-        await waitForTools(pi, 2);
+        // #1230: the request handler awaits tool registration, so by the time
+        // round 1's handler resolves the tools are ready and the report rides
+        // the FIRST request (previously round 1 left before toolsReady flipped
+        // and reported nothing — a race artifact, not a policy).
         await pi.events.get("before_provider_request")!({}, ctxA);
         await waitForRuntimeInfoCount(proxy, 1);
         assert.deepEqual(proxy.runtimeInfos[0], {

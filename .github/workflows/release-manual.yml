@@ -89,6 +89,9 @@ jobs:
           fi
 
       - name: Pre-flight gate
+        # keep the claude-native live e2e subtests in this pre-publish gate (#1248)
+        env:
+          ACP_TEST_CLAUDE_NATIVE: "1"
         run: |
           npm ci
           npm run typecheck

@@ -53,9 +53,33 @@ export interface NativeInterceptState {
     readyTimeoutMs?: number;
     /** Test/observability hook: every dispatched decision. */
     onDispatch?: (url: string, action: "rewrite" | "direct" | "self" | "retry") => void;
+    /** #1290: observability hook — fired for every request the fetch patch lets
+     *  through WITHOUT routing because its URL is not a recognized model endpoint
+     *  (isModelApiUrl miss). Such requests never reach a bili proxy, so without
+     *  this their "went direct (uncompressed)" outcome was completely silent —
+     *  #1158's logging promise only covered the attribution gate below. Called
+     *  per request; hosts dedup once-per-process-per-endpoint like takeoverGate.
+     *  Undefined hosts stay silent. */
+    onUnroutedModelUrl?: (url: string) => void;
 }
 
 const INTERCEPT_FLAG = "__biliNativeFetchIntercept";
+
+/** #1158 escape hatch: `BILI_RECLAIM_FETCH_PATCH=0` keeps the classic direct
+ *  install — a third-party re-arm (dsh-http-proxy refresh) then wins and
+ *  bili stops seeing model traffic (documented degradation, visible instead
+ *  of silently healed) for setups that NEED the third-party chain on top
+ *  (e.g. a socks egress bili's upstream proxying does not support). */
+function shouldReclaimFetchPatch(): boolean {
+    const raw = process.env.BILI_RECLAIM_FETCH_PATCH;
+    if (raw === undefined) return true;
+    return !/^(0|false|off|no)$/i.test(raw.trim());
+}
+
+/** #1158 self-heal: the property descriptor captured before we installed the
+ *  guarded accessor, so _resetForTest can restore a plain writable data
+ *  property. Undefined before the first install in a process. */
+let preInstallDesc: PropertyDescriptor | undefined;
 
 // Model-API endpoint suffixes across the wires bili proxies: Anthropic
 // `/v1/messages`, OpenAI chat `/v1/chat/completions` (and legacy
@@ -76,6 +100,20 @@ export function isModelApiUrl(url: string): boolean {
         if (segments[0] === "bili") return false;
         const pathname = u.pathname.replace(/\/+$/, "");
         return MODEL_API_SUFFIX.test(pathname);
+    } catch {
+        return false;
+    }
+}
+
+/** True when the URL addresses bili's own control plane (`/__bili/*`,
+ *  `/__acp/*`, or a `/bili/<protocol>/<url>` tunnel) — expected direct
+ *  traffic, not an unrecognized endpoint (#1290): reporting it as "not a
+ *  recognized model endpoint" would flag bili's own requests. */
+function isBiliControlUrl(url: string): boolean {
+    if (url.includes("/__bili/") || url.includes("/__acp/")) return true;
+    try {
+        const segments = new URL(url).pathname.split("/").filter((s) => s.length > 0);
+        return segments[0] === "bili";
     } catch {
         return false;
     }
@@ -286,6 +324,8 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
     const g = globalThis as Record<string, unknown>;
     if (g[INTERCEPT_FLAG] === true) return false;
     const orig = globalThis.fetch;
+    // Shared across every re-armed chain link (a re-arm replaces the chain
+    // top but must not forget what this process already learned).
     let warned = false;
     // Origins verified dead-and-replaced during a runtime recovery (#1130).
     // Launcher settings overlays bake the origin into request URLs, so after
@@ -293,7 +333,9 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
     // network again. Only ever contains origins we ourselves observed dying.
     const replacedOrigins = new Set<string>();
 
-    const patched = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const makeChain = (downstream: typeof globalThis.fetch) => {
+        const patched = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+        const orig = downstream;
         const url = fetchUrlOf(input);
         if (url === undefined) return orig(input, init);
         // Rebuild a Request-object input against a different target. A
@@ -379,7 +421,10 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 return orig(makeTarget(routedTarget), init);
             }
         }
-        if (!isModelApiUrl(url)) return orig(input, init);
+        if (!isModelApiUrl(url)) {
+            if (!isBiliControlUrl(url)) state.onUnroutedModelUrl?.(url);
+            return orig(input, init);
+        }
         // #1117: URL shape alone cannot claim a request — every model call in
         // the process hits the same endpoints. When the host supplies an
         // attribution gate, an unattributed caller keeps its original URL and
@@ -446,7 +491,50 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
         }
     };
 
-    globalThis.fetch = patched as typeof globalThis.fetch;
+        return patched as typeof globalThis.fetch;
+    };
+
+    // #1158 self-heal re-arm: dsh-http-proxy (0.1.3) re-applies by writing its
+    // module-load-time frozen originalFetch over globalThis.fetch, silently
+    // un-routing every model request away from bili while the session keeps
+    // working (observed live on Windows). Guard the property instead of
+    // trusting the assignment to survive: any third-party install becomes
+    // our downstream and model traffic keeps routing through bili.
+    const desc = Object.getOwnPropertyDescriptor(globalThis, "fetch");
+    let rearmCount = 0;
+    const REARM_LIMIT = 16;
+    const guard = desc === undefined || desc.configurable;
+    let top = makeChain(orig);
+    if (guard && shouldReclaimFetchPatch()) {
+        preInstallDesc = desc;
+        Object.defineProperty(globalThis, "fetch", {
+            configurable: true,
+            enumerable: desc?.enumerable ?? true,
+            get: () => top,
+            set: (v: unknown) => {
+                if (typeof v !== "function" || v === top) return;
+                // Visibility (#1158): an evict attempt used to be silent —
+                // log it so "un-routed by a third party" is diagnosable even
+                // when the heal itself is not wanted/limited away.
+                if (rearmCount < REARM_LIMIT) {
+                    console.warn(`[bili-native] third-party globalThis.fetch install detected (#1158) — re-chaining as downstream (evict attempt ${rearmCount + 1})`);
+                }
+                if (rearmCount >= REARM_LIMIT) {
+                    // A fighting patch (two self-healers) would loop forever;
+                    // past the limit stop guarding and let the winner stand.
+                    top = v as typeof globalThis.fetch;
+                    return;
+                }
+                rearmCount += 1;
+                top = makeChain(v as typeof globalThis.fetch);
+            },
+        });
+    } else {
+        // Non-configurable host property or reclaim disabled
+        // (BILI_RECLAIM_FETCH_PATCH=0): keep the classic direct install
+        // (no guard, the old behavior).
+        globalThis.fetch = top;
+    }
     g[INTERCEPT_FLAG] = true;
     return true;
 }
@@ -456,4 +544,9 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
 export function _resetForTest(): void {
     const g = globalThis as Record<string, unknown>;
     delete g[INTERCEPT_FLAG];
+    if (preInstallDesc !== undefined) {
+        const d = preInstallDesc;
+        preInstallDesc = undefined;
+        Object.defineProperty(globalThis, "fetch", { ...d, configurable: true });
+    }
 }
