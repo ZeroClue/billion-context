@@ -200,9 +200,13 @@ Rules:
 - Any Responses-compatible upstream works via `E2E_UPSTREAM_URL` /
   `E2E_UPSTREAM_KEY`; the provider is configured as `name = "OpenAI"` so codex
   stays on the remote compaction (V2) path — do not "fix" this.
-- CI (`.github/workflows/ci-e2e.yml`) is manual-dispatch only and needs repo
-  secrets `E2E_UPSTREAM_URL` / `E2E_UPSTREAM_KEY`; a hosted runner cannot
-  reach `127.0.0.1` upstreams.
+- CI (`.github/workflows/ci-e2e.yml`) auto-runs on PRs whose diff touches the
+  request-pipeline hot files (`src/server.ts`, `src/server/**`, `src/loop/**`,
+  `src/agent/**`, adapters/stream/persist, `tests/e2e/**`, `package-lock.json`
+  — an acp-kernel pin bump IS a pipeline change) plus manual dispatch for
+  anything else. It needs repo secrets `E2E_UPSTREAM_URL` / `E2E_UPSTREAM_KEY`;
+  a hosted runner cannot reach `127.0.0.1` upstreams, and events without
+  secret access (fork PRs) skip the run gracefully instead of failing.
 
 ### Code Quality
 
