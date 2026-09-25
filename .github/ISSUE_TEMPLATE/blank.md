@@ -1,4 +1,4 @@
 ---
-name: 空白模板 / Blank
-about: 自由格式提交 —— 仍建议附上 bili 版本、使用方式、客户端及版本、操作系统
+name: Blank template
+about: Free-form submission — still recommended to include bili version, usage mode, client and version, and OS
 ---

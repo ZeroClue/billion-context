@@ -1,30 +1,31 @@
-name: Bug 报告 / Bug report
-description: 报告 billion-context (bili) 的问题 —— 请尽量填全环境字段,它们直接决定排查速度
+name: Bug report
+description: Report a billion-context (bili) problem — please fill the environment fields, they directly determine triage speed
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        感谢报告!下面带 **\*** 的字段是排查刚需(版本/使用方式/客户端/系统/上游),
-        缺了往往只能来回猜。贴日志前请删掉 API key 等敏感值。
+        Thanks for reporting! Fields marked **\\*** are triage essentials
+        (version / mode / client / OS / upstream) — without them we can only
+        guess back and forth. Please scrub API keys and secrets from logs.
 
   - type: textarea
     id: description
     attributes:
-      label: 问题描述 *
-      description: 发生了什么、期望是什么、怎么触发的(复现步骤按序写)。如果是压缩相关,请注明压缩前后各发生了什么。
+      label: Description *
+      description: What happened, what you expected, and how to trigger it (ordered repro steps). For compression-related bugs, state what happened before and after the fold.
       placeholder: |
-        1. 用 xxx 启动 …
-        2. 会话到 … 之后
-        3. 看到 …(贴报错原文)
+        1. started … with …
+        2. after the conversation reached …
+        3. saw … (paste the exact error text)
     validations:
       required: true
 
   - type: input
     id: bili-version
     attributes:
-      label: bili 版本 *
-      description: "`bili --version` 的输出。若不是最新版,请先升级到最新再确认仍复现。"
+      label: bili version *
+      description: "Output of `bili --version`. If not on the latest release, please upgrade and confirm it still reproduces first."
       placeholder: "0.1.148"
     validations:
       required: true
@@ -32,21 +33,21 @@ body:
   - type: dropdown
     id: mode
     attributes:
-      label: 使用方式 *
+      label: Usage mode *
       options:
-        - 代理模式(客户端手动把 base URL 指到 bili)
-        - 启动器(bili pi / bili codex / bili dsh / bili kimi …)
-        - 插件 native(bili plugin install …,宿主进程内运行)
-        - MITM 模式(bili start --mitm)
-        - 其他 / 不确定
+        - Proxy mode (client manually points its base URL at bili)
+        - Launcher (bili pi / bili codex / bili dsh / bili kimi …)
+        - Plugin native (bili plugin install …, runs inside the host process)
+        - MITM mode (bili start --mitm)
+        - Other / not sure
     validations:
       required: true
 
   - type: input
     id: client
     attributes:
-      label: 客户端及版本 *
-      description: 具体客户端 + 版本号 —— 如 pi 0.83.6 / opencode v2.x(注明 v1 还是 v2!)/ codex 0.147.0 / dsh / kimi / claude code / 其他
+      label: Client and version *
+      description: The exact client + version — e.g. pi 0.83.6 / opencode v2.x (state v1 vs v2 explicitly!) / codex 0.147.0 / dsh / kimi / claude code / other
       placeholder: "pi 0.83.6"
     validations:
       required: true
@@ -54,8 +55,8 @@ body:
   - type: input
     id: os
     attributes:
-      label: 操作系统 *
-      description: 如 macOS 15 / Ubuntu 24.04 / Windows 11(注明是否 WSL2)
+      label: Operating system *
+      description: e.g. macOS 15 / Ubuntu 24.04 / Windows 11 (state whether WSL2)
       placeholder: "Ubuntu 24.04"
     validations:
       required: true
@@ -63,8 +64,8 @@ body:
   - type: input
     id: upstream
     attributes:
-      label: 上游与模型 *
-      description: 提供方 + 模型 + 上下文窗口(若知道)—— 如 sglang · qwen3.8-27b · 262k / api.openai.com · gpt-5。窗口声明与真实上限不符是常见根因,请如实填。
+      label: Upstream and model *
+      description: Provider + model + context window if known — e.g. sglang · qwen3.8-27b · 262k / api.openai.com · gpt-5. Declared-window-vs-real-limit mismatch is a known root-cause family; fill this in honestly.
       placeholder: "sglang, qwen3.8-27b, 262k"
     validations:
       required: true
@@ -72,20 +73,20 @@ body:
   - type: textarea
     id: config
     attributes:
-      label: 压缩相关配置(可选)
-      description: ~/.config/billion-context/ 里非默认的部分(ccr / absorb / rules / compress 阈值 / nudge 等),只贴改过的。
+      label: Compression-related config (optional)
+      description: Non-default parts of ~/.config/billion-context/ (ccr / absorb / rules / compress thresholds / nudge …) — only what you changed.
       render: yaml
 
   - type: textarea
     id: logs
     attributes:
-      label: 日志片段(强烈建议)
-      description: ~/.local/state/billion-context/ 下 bili 日志里复现时段的片段(先删密钥)。压缩相关 bug 请带上折叠/Excluded/preflight 相关行。
+      label: Log excerpt (strongly recommended)
+      description: Relevant bili log lines from ~/.local/state/billion-context/ around the repro window (scrub secrets first). For compression bugs include fold / Excluded / preflight lines.
       render: text
 
   - type: textarea
     id: acp-state
     attributes:
-      label: /acp 或 acp_status 输出(可选)
-      description: 问题现场的上下文状态输出(Usage/累计/块列表),对压缩类问题非常关键。
+      label: /acp or acp_status output (optional)
+      description: Context-state output at the moment of the problem (usage / cumulative tokens / block list) — decisive for compression issues.
       render: text
