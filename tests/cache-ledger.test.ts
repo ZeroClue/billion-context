@@ -99,6 +99,60 @@ test("incremental ledger closes the same identity as kernel batch", () => {
     assert.equal(f1.turnsToNextFold, 1);
 });
 
+test("incremental k spans ALL intermediate samples (parity with batch, #1286)", () => {
+    const session = makeSession();
+    withView20(session);
+    recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 0 });
+    // F1: S=12140, σ=1000 → breakevenTurns ≈ 2.5009 at the default {w:1,r:0.1,q:4}.
+    recordCacheFoldsFromBlocks(session, [block("b1", T0 + 1500, 12140, 4000, "m00010")], { V: 10000, Vp: 5000 });
+    recordCacheSample(session, { at: T0 + 2000, input: 10000, cached: 10000 });
+    recordCacheSample(session, { at: T0 + 2600, input: 10000, cached: 10000 });
+    recordCacheSample(session, { at: T0 + 3200, input: 10000, cached: 10000 });
+    recordCacheFoldsFromBlocks(session, [block("b2", T0 + 4000, 2000, 4000, "m00015")], { V: 10000, Vp: 8000 });
+
+    const rawSamples: CacheSample[] = [
+        { at: T0 + 1000, input: 10000, cached: 0 },
+        { at: T0 + 2000, input: 10000, cached: 10000 },
+        { at: T0 + 2600, input: 10000, cached: 10000 },
+        { at: T0 + 3200, input: 10000, cached: 10000 },
+    ];
+    const rawFolds: FoldEvent[] = [
+        { at: T0 + 1500, tokensCompressed: 12140, summaryTokens: 1000, firstFoldStartTokens: 4500, viewBefore: 10000, viewAfter: 5000 },
+        { at: T0 + 4000, tokensCompressed: 2000, summaryTokens: 1000, firstFoldStartTokens: 7000, viewBefore: 10000, viewAfter: 8000 },
+    ];
+
+    const inc = buildSessionCacheReport(session);
+    const batch = buildCacheReport(rawSamples, rawFolds);
+    assert.equal(inc.folds.length, batch.folds.length);
+    for (let i = 0; i < inc.folds.length; i++) {
+        const a = inc.folds[i]!;
+        const b = batch.folds[i]!;
+        for (const key of ["seq", "at", "S", "sigma", "Vprime", "hPct", "T", "requestsAfter", "savedSoFar", "turnsToNextFold", "netTokenDelta", "oneTimeCostUnits", "perTurnSavingUnits", "breakevenTurns", "paidBack"] as const) {
+            assert.deepEqual(a[key], b[key], `fold ${i} ${key}: incremental ${String(a[key])} !== batch ${String(b[key])}`);
+        }
+    }
+    for (const key of ["folds", "grossSaved", "repayCost", "summaryCost", "netTokens", "paidBackCount", "notPaidBackCount", "unobservedCount"] as const) {
+        assert.deepEqual(inc.economics[key], batch.economics[key], `economics.${key}`);
+    }
+
+    // Hand-computed expectations: before #1286 the incremental path froze
+    // F1.k at 1 (consumedFoldSeq gate ended its counting after one sample),
+    // making paidBack false even though cadence (3) passes breakeven (≈2.5).
+    const f1 = inc.folds.find((f) => f.seq === 1)!;
+    assert.equal(f1.requestsAfter, 3);
+    assert.equal(f1.turnsToNextFold, 3);
+    assert.equal(f1.hPct, 100);
+    assert.equal(f1.T, 0);
+    assert.ok(Math.abs(f1.breakevenTurns! - 2.5008976660682225) < 1e-9);
+    assert.equal(f1.paidBack, true);
+    assert.equal(f1.savedSoFar, (12140 - 1000) * 3);
+    const f2 = inc.folds.find((f) => f.seq === 2)!;
+    assert.equal(f2.turnsToNextFold, null);
+    assert.equal(f2.paidBack, null);
+    assert.equal(f2.requestsAfter, 0);
+    assert.equal(inc.totals.balanced, true);
+});
+
 test("cold-start miss lands in the ttl bucket; pure append is new content", () => {
     const session = makeSession();
     recordCacheSample(session, { at: T0 + 1000, input: 1000, cached: 0 });
