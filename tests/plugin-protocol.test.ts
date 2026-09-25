@@ -83,7 +83,14 @@ function compressToolScript(): string[] {
     ];
 }
 
-async function startHarness(scripts: string[][], kernelConfig?: Config): Promise<Harness> {
+async function startHarness(
+    scripts: string[][],
+    kernelConfig?: Config,
+    // #1278: the user-facing `compress` block (loadOptions → opts.compress), distinct
+    // from kernelConfig. Tests pass absorb/rules here to exercise the REAL path the
+    // file config takes, not the kernelConfig shortcut the pre-fix manifest read.
+    compress?: Partial<ProxyOptions["compress"]>,
+): Promise<Harness> {
     const captured: { body: string; headers: Record<string, string | string[] | undefined> }[] = [];
     let call = 0;
     const upstream = http.createServer((req, res) => {
@@ -124,7 +131,7 @@ async function startHarness(scripts: string[][], kernelConfig?: Config): Promise
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-test": { context: 400_000 } } } },
         modelContextLimit: 400_000,
         kernelConfig: kernelConfig ?? defaultConfig(400_000),
-        compress: { injectTool: true, injectNudge: true },
+        compress: { injectTool: true, injectNudge: true, ...compress },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
@@ -271,6 +278,45 @@ test("plugin manifest: absorb and acp_rule advertised when enabled in config", a
             assert.ok(listed.includes("acp_rule"), `${shape} has acp_rule`);
             assert.equal(listed.length, 7);
         }
+    } finally {
+        await h.close();
+    }
+});
+
+// #1278 (regression): the pre-fix manifest read opts.kernelConfig (kernel defaults),
+// so an absorb enabled in the user's GLOBAL compress block — where loadOptions puts
+// the file config — was never advertised. Pi then registered no callable tool for the
+// [ACP absorb] prompts the wire emits. Enabling via the global compress block (the real
+// path) must now advertise absorb on every wire shape.
+test("plugin manifest: absorb advertised when enabled in the global compress block", async () => {
+    const h = await startHarness([textScript()], undefined, { absorb: { enabled: true } });
+    try {
+        const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/manifest`);
+        assert.equal(resp.status, 200);
+        const manifest = (await resp.json()) as { toolNames: string[]; tools: Record<string, Array<Record<string, unknown>>> };
+        assert.deepEqual([...manifest.toolNames].sort(), ["absorb", "acp_cache", "acp_status", "compress", "decompress", "search_context"]);
+        for (const shape of ["anthropic", "openai", "responses"] as const) {
+            const listed = manifest.tools[shape]!.map((t) => {
+                const fn = t.function as { name?: unknown } | undefined;
+                return typeof t.name === "string" ? t.name : (typeof fn?.name === "string" ? fn.name : "");
+            });
+            assert.ok(listed.includes("absorb"), `${shape} has absorb`);
+            assert.equal(listed.length, 6);
+        }
+    } finally {
+        await h.close();
+    }
+});
+
+// #1278: an explicit global disable keeps absorb out of the manifest (guards against
+// flipping the logic to "advertise whenever an absorb key is present").
+test("plugin manifest: absorb omitted when the global compress block disables it", async () => {
+    const h = await startHarness([textScript()], undefined, { absorb: { enabled: false } });
+    try {
+        const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/manifest`);
+        assert.equal(resp.status, 200);
+        const manifest = (await resp.json()) as { toolNames: string[] };
+        assert.deepEqual([...manifest.toolNames].sort(), ["acp_cache", "acp_status", "compress", "decompress", "search_context"]);
     } finally {
         await h.close();
     }
